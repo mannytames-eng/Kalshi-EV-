@@ -1,0 +1,8 @@
+[build]
+builder = "nixpacks"
+
+[deploy]
+startCommand = "python3 kalshi_ev_ui.py"
+healthcheckPath = "/api/scan"
+healthcheckTimeout = 30
+restartPolicyType = "always"

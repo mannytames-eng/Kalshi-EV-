@@ -1,0 +1,3466 @@
+#!/usr/bin/env python3
+"""
+Kalshi EV Scanner — Web UI
+Run:  python3 kalshi_ev_ui.py
+Open: http://localhost:8000
+"""
+
+import json
+import os
+import sys
+import threading
+import time
+from datetime import datetime, timezone
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from socketserver import ThreadingMixIn
+from typing import List, Optional
+
+from dotenv import load_dotenv
+
+# ── Portable base directory — works on Mac and any Linux VPS ─────────────────
+# All data files (bets, history, keys) live next to this script.
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+load_dotenv(os.path.join(BASE_DIR, ".env"))
+
+# ── Import scanner logic ──────────────────────────────────────────────────────
+sys.path.insert(0, BASE_DIR)
+from kalshi_ev_scanner import (
+    scan_sport,
+    kalshi_get,
+    fetch_game_scores,
+    validate_bet,
+    MLB_SPREAD_STD, MLB_TOTAL_STD,
+    NBA_SPREAD_STD, NBA_TOTAL_STD,
+    MLB_ABBR, NBA_ABBR,
+    EDGE_THRESHOLD,
+    _parse_ticker_start_time,
+    _parse_ticker_date,
+)
+
+PORT = int(os.environ.get("PORT", 8000))   # Railway injects PORT; falls back to 8000 locally
+# ── Refresh cadence (credit budget) ──────────────────────────────────────────
+# Two independent loops:
+#   ODDS_REFRESH  : fetches Pinnacle/DK/FD lines  — costs 2 credits (MLB + NBA)
+#   KALSHI_REFRESH: re-scans Kalshi prices only    — costs 0 credits (uses cache)
+#
+# Monthly credit math (20k budget):
+#   Odds refresh : 2 credits × 48/day × 30 days  =  2,880
+#   Props scan   : 10 games  ×  8/day × 30 days  =  2,400
+#   Kalshi scans : 0 credits (cached odds)        =      0
+#   ─────────────────────────────────────────────────────
+#   Total                                         =  5,280  (74% under budget)
+# Odds refresh is adaptive — faster during game hours, slow overnight.
+# MLB games run roughly noon–midnight ET. Pinnacle lines move most in
+# the 2–3 hrs before first pitch, so that window gets the tightest refresh.
+# Credit budget: ~168 refreshes/day × 2 credits = ~336/day = ~10,080/month
+#   • Pre-game peak  (11 AM–10 PM ET, 11h): every 4 min  → 165 refreshes
+#   • Overnight      (10 PM–11 AM ET, 13h): every 20 min →  39 refreshes
+#   Total: ~204/day × 2 = 408 credits/day = ~12,240/month (well under 20k)
+def _odds_refresh_interval() -> int:
+    """Return seconds until next odds refresh based on current ET hour."""
+    from datetime import timezone as _tz, timedelta as _td
+    et_hour = (datetime.now(_tz.utc) - _td(hours=4)).hour   # UTC-4 (ET summer/EDT)
+    if 11 <= et_hour < 22:   # 11 AM – 10 PM ET: game window
+        return 4 * 60
+    return 20 * 60           # overnight: slow down
+REFRESH_SECONDS       = 2 * 60     # re-scan Kalshi every 2 min    (0 credits)
+# Player props removed — too volatile. Only game lines (spreads/totals) are scanned.
+# Monthly credit math (20k budget):
+#   Odds refresh : 2 × 144/day × 30 =  8,640
+#   Props scan   : 10 × 8/day × 30  =  2,400
+#   Kalshi scans : 0 credits (cached) =     0
+#   ─────────────────────────────────────────
+#   Total                            = 11,040  (45% under 20k budget)
+HISTORY_FILE    = os.path.join(BASE_DIR, "ev_history.json")
+BETS_FILE       = os.path.join(BASE_DIR, "ev_bets.json")
+MY_BETS_FILE    = os.path.join(BASE_DIR, "my_bets.json")
+MAX_HISTORY     = 500       # cap stored scan snapshots
+PERF_BANKROLL        = 1000.0    # bankroll for ROI % display
+
+# ── Paper trading portfolio ────────────────────────────────────────────────────
+PAPER_START_BALANCE  = 1000.0    # starting virtual bankroll
+PAPER_START_DATE     = "2026-04-07"  # bets before this date excluded from portfolio
+PAPER_KELLY_FRACTION = 0.25     # quarter-Kelly sizing
+PAPER_KELLY_CAP      = 0.05     # max 5% of current balance per bet
+
+# ── Shared state (updated by background thread) ───────────────────────────────
+_lock    = threading.Lock()
+_state   = {
+    "edges":       [],
+    "last_scan":   None,   # ISO string
+    "scanning":    False,
+    "error":       None,
+}
+
+# Tracks first-seen and last-seen YES price for each edge key (for staleness + CLV)
+_edge_price_history: dict = {}
+_edge_history_lock = threading.Lock()
+
+# Player props removed — too volatile.
+
+# ── Cached book-odds indices (populated by slow 30-min thread) ────────────────
+# The fast 2-min Kalshi scan reads these without spending Odds API credits.
+# None = not yet fetched; scan_sport falls back to inline fetch on first run.
+_odds_cache_lock  = threading.Lock()
+_cached_mlb_index: Optional[dict] = None
+_cached_nba_index: Optional[dict] = None
+_last_odds_refresh: float = 0.0   # epoch seconds of last successful refresh
+
+# ── History (persisted to HISTORY_FILE) ──────────────────────────────────────
+def _load_history() -> list:
+    try:
+        with open(HISTORY_FILE, "r") as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return []
+
+def _save_history(history: list):
+    try:
+        import tempfile, os as _os
+        fd, tmp = tempfile.mkstemp(dir=BASE_DIR, suffix=".tmp")
+        with _os.fdopen(fd, "w") as f:
+            json.dump(history[-MAX_HISTORY:], f)
+        _os.replace(tmp, HISTORY_FILE)
+    except Exception as exc:
+        print(f"  WARNING: could not save history: {exc}")
+
+_history = _load_history()
+
+# ── Bet tracker (persisted to BETS_FILE) ──────────────────────────────────────
+def _load_bets() -> list:
+    try:
+        with open(BETS_FILE, "r") as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return []
+
+def _save_bets(bets: list):
+    try:
+        import tempfile, os as _os
+        fd, tmp = tempfile.mkstemp(dir=BASE_DIR, suffix=".tmp")
+        with _os.fdopen(fd, "w") as f:
+            json.dump(bets, f, indent=2)
+        _os.replace(tmp, BETS_FILE)
+    except Exception as exc:
+        print(f"  WARNING: could not save bets: {exc}")
+
+_bets: list = _load_bets()
+_bets_lock = threading.RLock()   # reentrant — _add_new_bets holds this while calling _paper_kelly_stake → _compute_paper_balance
+
+# --- One-time backfill: ensure every bet has closing_yes_pct and clv fields ---
+_backfilled = False
+for _b in _bets:
+    if _b.get("closing_yes_pct") is None and _b.get("kalshi_yes_at_flag") is not None:
+        _b["closing_yes_pct"] = _b["kalshi_yes_at_flag"]
+        _backfilled = True
+    if _b.get("clv") is None:
+        _b["clv"] = 0.0
+        _backfilled = True
+if _backfilled:
+    _save_bets(_bets)
+    print(f"  Backfilled CLV fields for {sum(1 for b in _bets if b.get('clv') == 0.0)} bet(s)")
+
+
+def _bet_id(ticker: str, side: str) -> str:
+    return f"{ticker}|{side}"
+
+
+def _best_edge_per_game(edges: list) -> list:
+    """
+    Keep only the single best edge per (matchup, mkt_type, side) group.
+    This eliminates correlated bets on the same game — e.g. if a game has
+    edges at >7.5, >8.5, and >9.5 total runs YES, only the highest-edge one
+    is kept.  YES and NO on the same market are treated as distinct slots so
+    both can surface if both are genuinely +EV.
+
+    NOTE: uses the raw 'edge' field (0–1 decimal) so this function is safe to
+    call before 'edge_pct' is computed.
+    """
+    def _score(e: dict) -> float:
+        return e.get("edge_pct", e.get("edge", 0) * 100)
+
+    best: dict = {}
+    for e in edges:
+        key = (e.get("matchup", ""), e.get("mkt_type", ""), e.get("side", ""))
+        if key not in best or _score(e) > _score(best[key]):
+            best[key] = e
+    seen = set()
+    result = []
+    for e in edges:
+        key = (e.get("matchup", ""), e.get("mkt_type", ""), e.get("side", ""))
+        if key not in seen and best[key] is e:
+            seen.add(key)
+            result.append(e)
+    return result
+
+
+def _compute_paper_balance() -> float:
+    """
+    Returns the current paper portfolio balance, compounding from PAPER_START_BALANCE.
+    Only counts bets flagged on or after PAPER_START_DATE.
+    Balance = start + sum(paper_pnl for settled) - sum(paper_stake for open)
+    """
+    with _bets_lock:
+        paper_bets = [b for b in _bets if b.get("flagged_at", "") >= PAPER_START_DATE
+                      and b.get("paper_stake") is not None]
+    bal = PAPER_START_BALANCE
+    for b in paper_bets:
+        if b["status"] in ("won", "lost") and b.get("paper_pnl") is not None:
+            bal += b["paper_pnl"]
+    return round(bal, 2)
+
+
+def _paper_kelly_stake(edge_pct: float, kalshi_price: float) -> float:
+    """Calculate Kelly-sized paper stake against current portfolio balance."""
+    k = kalshi_price
+    e = edge_pct / 100.0
+    if k <= 0 or k >= 1 or e <= 0:
+        return 0.0
+    balance = _compute_paper_balance()
+    full_kelly = e / (1.0 - k)
+    frac = min(full_kelly * PAPER_KELLY_FRACTION, PAPER_KELLY_CAP)
+    return round(frac * balance, 2)
+
+
+def _add_new_bets(edges: list):
+    """Log any edge we haven't seen before as an open bet.
+
+    Source of truth: Pinnacle line only.
+      • pin_prob_at_flag  = Pinnacle's no-vig probability when the edge was first
+        detected.  Stored on the bet so we can detect line movement later.
+      • DK / FD confirmation steps removed — Pinnacle is the sole fair-value anchor.
+
+    Deduplication has two layers:
+      1. Within-cycle: _best_edge_per_game keeps only the highest-edge market
+         per (matchup, mkt_type, side) from the current scan batch.
+      2. Cross-cycle: before logging, check if an OPEN bet on the same
+         (matchup, mkt_type, side) already exists from a prior scan cycle.
+         If so, skip — the two bets are correlated (same game outcome) and
+         logging both would overstate win rate and violate Kelly independence.
+    """
+    edges = _best_edge_per_game(edges)
+    with _bets_lock:
+        existing_ids = {b["id"] for b in _bets}
+        # Build a set of (matchup, mkt_type, side) slots already occupied by open bets
+        open_slots = {
+            (b["matchup"], b.get("mkt_type", ""), b["side"])
+            for b in _bets if b["status"] == "open"
+        }
+        added = 0
+        for e in edges:
+            # Skip edges already invalidated by Pinnacle line movement
+            if e.get("pin_invalidated"):
+                continue
+            bid = _bet_id(e["ticker"], e["side"])
+            if bid in existing_ids:
+                continue   # exact same market already logged
+            slot = (e.get("matchup", ""), e.get("mkt_type", ""), e.get("side", ""))
+            if slot in open_slots:
+                continue   # correlated bet — same game/type/side already open, skip
+
+            # entry_yes_pct = Kalshi YES ask % when flagged (for CLV calculation)
+            kalshi_yes_at_flag = e["kalshi_pct"] if e["side"] == "YES" else round((1 - e["kalshi"]) * 100, 1)
+            paper_stake = _paper_kelly_stake(e["edge_pct"], e["kalshi"])
+
+            # Pinnacle probability at flag time — the baseline for line-shift detection
+            bd = e.get("books_detail", {})
+            pin_prob_raw = bd.get("pinnacle")  # Pinnacle no-vig prob for YES side
+            if pin_prob_raw is not None:
+                pin_prob_at_flag = round(
+                    pin_prob_raw * 100 if e["side"] == "YES"
+                    else (1.0 - pin_prob_raw) * 100,
+                    1,
+                )
+            else:
+                pin_prob_at_flag = None  # Pinnacle not available at flag time
+
+            _bets.append({
+                "id":                 bid,
+                "ticker":             e["ticker"],
+                "matchup":            e["matchup"],
+                "title":              e["title"],
+                "side":               e["side"],
+                "mkt_type":           e.get("mkt_type", ""),
+                "edge_pct":           e["edge_pct"],            # post-haircut adj. edge %
+                "raw_edge_pct":       round(e.get("raw_edge", 0) * 100, 1),
+                "books_used":         e.get("books_used", []),
+                "consensus_prob":     e.get("consensus_prob"),
+                # ── Pinnacle source-of-truth fields ──────────────────────────
+                "pin_prob_at_flag":   pin_prob_at_flag,         # Pinnacle % at detection
+                "pin_prob_pct":       e.get("pin_prob_pct"),    # same, pre-computed by _run_scan
+                # ─────────────────────────────────────────────────────────────
+                "kalshi_price":       e["kalshi"],
+                "kalshi_yes_at_flag": kalshi_yes_at_flag,
+                "flagged_at":         datetime.now(timezone.utc).isoformat(),
+                "status":             "open",
+                "resolved_at":        None,
+                "pnl":                None,
+                "closing_yes_pct":    kalshi_yes_at_flag,   # init to entry; CLV loop overwrites
+                "clv":                0.0,                  # init to 0; CLV loop overwrites
+                "paper_stake":        paper_stake,           # Kelly-sized virtual wager
+                "paper_pnl":          None,                  # set on resolution
+            })
+            existing_ids.add(bid)
+            open_slots.add(slot)
+            added += 1
+        if added:
+            _save_bets(_bets)
+            print(f"  Bet tracker: logged {added} new bet(s)")
+
+
+def _build_score_index() -> dict:
+    """
+    Fetch completed game scores (free, 0 credits) and return a lookup:
+      norm(away + " @ " + home) → {home_score, away_score, total, margin}
+    Covers MLB and NBA.
+    """
+    import re
+    def _n(s): return re.sub(r"[^a-z0-9]", "", s.lower())
+    index = {}
+    for sport in ("baseball_mlb", "basketball_nba"):
+        try:
+            games = fetch_game_scores(sport, days_from=3)
+        except Exception:
+            continue
+        for g in games:
+            sc = {s["name"]: int(s["score"]) for s in (g.get("scores") or []) if s.get("score") is not None}
+            home, away = g.get("home_team", ""), g.get("away_team", "")
+            if home not in sc or away not in sc:
+                continue
+            hs, as_ = sc[home], sc[away]
+            key = _n(away + "@" + home)
+            index[key] = {
+                "home_score": hs, "away_score": as_,
+                "total": hs + as_, "margin": hs - as_,
+                "home": home, "away": away,
+            }
+    return index
+
+
+def _resolve_from_score(bet: dict, score_index: dict) -> Optional[bool]:
+    """
+    For spread/total bets, determine win/loss from final scores.
+    Returns True (won), False (lost), or None (can't determine).
+    """
+    import re
+    def _n(s): return re.sub(r"[^a-z0-9]", "", s.lower())
+
+    matchup = bet.get("matchup", "")
+    key = _n(matchup.replace(" @ ", "@"))
+    game = score_index.get(key)
+    if game is None:
+        return None
+
+    mkt_type = bet.get("mkt_type", "")
+    side     = bet.get("side", "")
+    title    = bet.get("title", "")
+
+    # Detect totals by mkt_type field OR by ">X" threshold pattern in title
+    is_total = mkt_type == "total" or bool(re.search(r">\s*\d+\.?\d*", title))
+
+    if is_total:
+        # Extract threshold from title: looks for e.g. ">8.5" or "(>8.5)"
+        m = re.search(r">(\d+\.?\d*)", title)
+        if not m:
+            return None
+        threshold = float(m.group(1))
+        over_result = game["total"] > threshold
+        if side == "YES":
+            return over_result
+        else:  # NO = under
+            return not over_result
+
+    elif mkt_type == "spread":
+        # Title format: "{Team} wins by over {X} runs/goals?"
+        # YES = team wins by more than X; NO = team does NOT win by more than X.
+        m = re.search(r"(\d+\.?\d*)\s*(?:runs|goals)", title)
+        if not m:
+            return None
+        threshold = float(m.group(1))
+        # Figure out which team the spread references
+        team_in_title = title.split(" wins by")[0].strip().lower()
+        home_name = game["home"].lower()
+        away_name = game["away"].lower()
+        # Match by substring (e.g. "Toronto" in "Toronto Blue Jays")
+        if team_in_title in home_name or home_name.startswith(team_in_title):
+            team_margin = game["home_score"] - game["away_score"]
+        elif team_in_title in away_name or away_name.startswith(team_in_title):
+            team_margin = game["away_score"] - game["home_score"]
+        else:
+            return None
+        covers = team_margin > threshold
+        return covers if side == "YES" else not covers
+
+    return None
+
+
+def _check_resolutions():
+    """
+    Settle open bets via two methods:
+      1. Scores-based (free, instant): for total bets after game ends.
+      2. Kalshi API result field: for all bet types after Kalshi resolves.
+    Only checks bets flagged > 3 hours ago.
+    """
+    with _bets_lock:
+        open_bets = [b for b in _bets if b["status"] == "open"]
+
+    if not open_bets:
+        return
+
+    # MLB games average ~3h but many end in 2.5h; check after 2.5h so results
+    # show up quickly after the final out.
+    cutoff = datetime.now(timezone.utc).timestamp() - 2.5 * 3600
+    to_check = [b for b in open_bets
+                if datetime.fromisoformat(b["flagged_at"]).timestamp() < cutoff]
+
+    if not to_check:
+        return
+
+    # ── Method 1: Score-based settlement (totals only, free) ─────────────────
+    score_index = _build_score_index()
+    resolved = 0
+    score_resolved_ids = set()
+
+    for bet in to_check:
+        side_won = _resolve_from_score(bet, score_index)
+        if side_won is None:
+            continue
+        k = bet["kalshi_price"]
+        with _bets_lock:
+            for b in _bets:
+                if b["id"] == bet["id"]:
+                    b["status"]      = "won" if side_won else "lost"
+                    b["resolved_at"] = datetime.now(timezone.utc).isoformat()
+                    b["resolved_by"] = "score"
+                    # Kelly P&L — use paper_stake as the bet size
+                    ps = b.get("paper_stake") or 0.0
+                    kelly_pnl = round(ps * (1 - k) / k, 2) if side_won else round(-ps, 2)
+                    b["pnl"]       = kelly_pnl   # unified: pnl IS kelly pnl
+                    b["paper_pnl"] = kelly_pnl
+                    # CLV
+                    closing_yes = b.get("closing_yes_pct")
+                    entry_yes   = b.get("kalshi_yes_at_flag")
+                    if closing_yes is not None and entry_yes is not None:
+                        b["clv"] = round(
+                            closing_yes - entry_yes if b["side"] == "YES"
+                            else entry_yes - closing_yes, 1
+                        )
+                    break
+        score_resolved_ids.add(bet["id"])
+        resolved += 1
+
+    # ── Method 2: Kalshi API result (spreads, props, remaining totals) ────────
+    remaining = [b for b in to_check if b["id"] not in score_resolved_ids]
+    for bet in remaining[:20]:  # cap at 20 Kalshi API calls per cycle
+        try:
+            time.sleep(0.25)
+            data = kalshi_get(f"/markets/{bet['ticker']}")
+            mkt = data.get("market", {})
+            result = mkt.get("result", "")
+            if not result:
+                continue
+            side_won = (result == "yes" and bet["side"] == "YES") or \
+                       (result == "no"  and bet["side"] == "NO")
+            k = bet["kalshi_price"]
+            # CLV: prefer the live-captured closing_yes_pct already stored on the bet.
+            # Fall back to the scanner's last_kalshi_pct only if nothing was captured.
+            with _bets_lock:
+                bet_closing = next(
+                    (b.get("closing_yes_pct") for b in _bets if b["id"] == bet["id"]),
+                    None,
+                )
+            if bet_closing is None:
+                ek = _edge_key(bet)
+                with _edge_history_lock:
+                    hist = _edge_price_history.get(ek, {})
+                    bet_closing = hist.get("last_kalshi_pct")
+            closing_yes = bet_closing
+            entry_yes = bet.get("kalshi_yes_at_flag")
+            clv = None
+            if closing_yes is not None and entry_yes is not None:
+                clv = round(closing_yes - entry_yes if bet["side"] == "YES"
+                            else entry_yes - closing_yes, 1)
+            with _bets_lock:
+                for b in _bets:
+                    if b["id"] == bet["id"]:
+                        b["status"]          = "won" if side_won else "lost"
+                        b["resolved_at"]     = datetime.now(timezone.utc).isoformat()
+                        b["resolved_by"]     = "kalshi"
+                        b["closing_yes_pct"] = closing_yes
+                        b["clv"]             = clv
+                        # Kelly P&L — unified: pnl IS paper_pnl
+                        ps = b.get("paper_stake") or 0.0
+                        kelly_pnl = round(ps * (1 - k) / k, 2) if side_won else round(-ps, 2)
+                        b["pnl"]       = kelly_pnl
+                        b["paper_pnl"] = kelly_pnl
+                        break
+            resolved += 1
+        except Exception as exc:
+            print(f"  Resolution check error ({bet['ticker']}): {exc}")
+
+    if resolved:
+        with _bets_lock:
+            _save_bets(_bets)
+        print(f"  Resolved {resolved} bet(s)")
+
+
+def _infer_mkt_type(b: dict) -> str:
+    """Infer raw market type ('spread'/'total'/'moneyline') from a bet or edge dict."""
+    mtype = b.get("mkt_type", "")
+    if mtype:
+        return mtype
+    ticker = b.get("ticker", "").upper()
+    title  = b.get("title", "").lower()
+    if "SPREAD" in ticker:
+        return "spread"
+    if "TOTAL" in ticker:
+        return "total"
+    if "ML" in ticker:
+        return "moneyline"
+    if "runs scored" in title or ("over" in title and "." in title):
+        return "total"
+    if "wins by" in title:
+        return "spread"
+    return ""
+
+
+# Minimum number of CLV data points before we apply a penalty multiplier.
+# Prevents over-reacting to a small sample of resolved bets.
+_CLV_PENALTY_MIN_SAMPLE = 40
+
+
+def _get_clv_multipliers() -> dict:
+    """
+    Compute per-market-type Kelly confidence multipliers from CLV history.
+
+    Logic:
+      • Group all settled bets that have CLV data by raw market type.
+      • If a type has ≥ _CLV_PENALTY_MIN_SAMPLE data points AND avg CLV < 0,
+        that type gets a 0.5x multiplier (half Kelly) until CLV recovers.
+      • All other types return 1.0 (full quarter-Kelly).
+
+    Returns dict like {"total": 1.0, "spread": 1.0, "moneyline": 1.0}
+    """
+    with _bets_lock:
+        settled = [b for b in _bets
+                   if b["status"] in ("won", "lost") and b.get("clv") is not None]
+
+    by_type: dict = {}
+    for b in settled:
+        mtype = _infer_mkt_type(b)
+        if not mtype:
+            continue
+        by_type.setdefault(mtype, []).append(b["clv"])
+
+    multipliers: dict = {}
+    for mtype, clvs in by_type.items():
+        if len(clvs) >= _CLV_PENALTY_MIN_SAMPLE:
+            avg_clv = sum(clvs) / len(clvs)
+            multipliers[mtype] = 0.5 if avg_clv < 0 else 1.0
+
+    return multipliers
+
+
+def _get_performance(since: Optional[str] = None) -> dict:
+    """Return model-quality performance stats — bet-size agnostic.
+
+    since: ISO date string like '2026-03-15'.  When provided, only bets
+           flagged on or after that date are included.
+    """
+    with _bets_lock:
+        bets = list(_bets)
+
+    if since:
+        # since is a date string; flagged_at is a full ISO timestamp
+        bets = [b for b in bets if b.get("flagged_at", "") >= since]
+
+    won   = [b for b in bets if b["status"] == "won"]
+    lost  = [b for b in bets if b["status"] == "lost"]
+    open_ = [b for b in bets if b["status"] == "open"]
+    settled = won + lost
+
+    # ── Kelly sizing helper ────────────────────────────────────────────────────
+    # 0.25 Fractional Kelly for a binary prediction-market bet, with:
+    #   • Hard 5% bankroll cap per bet
+    #   • Dynamic CLV confidence multiplier — types with negative avg CLV get
+    #     0.5× applied on top of the quarter-Kelly fraction
+    #
+    # Full Kelly  = edge / (1 − kalshi_price)
+    # Adjusted    = full × 0.25 × clv_multiplier,  capped at 5% of bankroll
+    KELLY_FRACTION   = 0.25   # fractional Kelly scaling
+    KELLY_SINGLE_CAP = 0.05   # max 5% of bankroll per bet
+
+    # Fetch CLV-based multipliers once for the whole performance pass
+    clv_mults = _get_clv_multipliers()
+
+    def _kelly_frac(b: dict) -> float:
+        k = b.get("kalshi_price", 0.5)
+        e = b.get("edge_pct", 0) / 100.0
+        if k <= 0 or k >= 1 or e <= 0:
+            return 0.0
+        full_kelly  = e / (1.0 - k)
+        mtype       = _infer_mkt_type(b)
+        clv_mult    = clv_mults.get(mtype, 1.0)
+        return min(full_kelly * KELLY_FRACTION * clv_mult, KELLY_SINGLE_CAP)
+
+    def _kelly_pnl(b: dict) -> Optional[float]:
+        """P&L as fraction-of-bankroll under CLV-adjusted quarter-Kelly sizing."""
+        if b["status"] not in ("won", "lost"):
+            return None
+        f = _kelly_frac(b)
+        k = b["kalshi_price"]
+        if b["status"] == "won":
+            return f * (1.0 - k) / k   # profit = stake × net_odds
+        return -f                        # loss = −stake (fraction of bankroll)
+
+    # CLV stats — only for bets that have a recorded closing price
+    clv_bets = [b for b in settled if b.get("clv") is not None]
+    avg_clv  = round(sum(b["clv"] for b in clv_bets) / len(clv_bets), 1) if clv_bets else None
+
+    # Win rate — did the flagged side actually win?
+    win_rate = round(len(won) / len(settled) * 100, 1) if settled else None
+
+    # Average edge across all tracked bets
+    avg_edge = round(sum(b["edge_pct"] for b in bets) / len(bets), 1) if bets else None
+
+    # ── Flat unit P&L (1 unit = 1 bet stake regardless of edge/price) ─────────
+    unit_pnls = []
+    for b in settled:
+        k = b["kalshi_price"]
+        unit_pnls.append((1 - k) / k if b["status"] == "won" else -1.0)
+
+    total_units = round(sum(unit_pnls), 3) if unit_pnls else None
+    avg_units   = round(sum(unit_pnls) / len(unit_pnls), 3) if unit_pnls else None
+
+    # ── Kelly-weighted P&L (each bet weighted by quarter-Kelly stake) ──────────
+    # Expressed as "Kelly units" where 1 Kelly unit = PERF_BANKROLL dollars.
+    # A positive number means the model made money sizing bets by edge strength.
+    kelly_pnls = [_kelly_pnl(b) for b in settled]
+    kelly_pnls = [x for x in kelly_pnls if x is not None]
+
+    total_kelly_units   = round(sum(kelly_pnls), 4)         if kelly_pnls else None
+    total_kelly_dollars = round(sum(kelly_pnls) * PERF_BANKROLL, 2) if kelly_pnls else None
+    avg_kelly_units     = round(sum(kelly_pnls) / len(kelly_pnls), 4) if kelly_pnls else None
+
+    # Model accuracy: actual win rate vs Kalshi-implied win rate
+    if settled:
+        avg_kalshi_implied = round(
+            sum(b["kalshi_price"] * 100 for b in settled) / len(settled), 1
+        )
+    else:
+        avg_kalshi_implied = None
+
+    # Add per-bet P&L fields for display
+    # kelly_pnl_pct = P&L as % of bankroll (e.g. +0.42 = +0.42%)
+    # kelly_bet_pct = Kelly-recommended stake as % of bankroll
+    table_bets = sorted(settled + open_, key=lambda b: b["flagged_at"], reverse=True)[:30]
+    for b in table_bets:
+        kf = _kelly_frac(b)
+        kp = _kelly_pnl(b)
+        b["kelly_bet_pct"]     = round(kf * 100, 3)           # e.g. 1.5 = 1.5% of bankroll
+        b["kelly_bet_dollars"] = round(kf * PERF_BANKROLL, 2)
+        if b["status"] == "open":
+            b["kelly_pnl"]        = None
+            b["kelly_pnl_pct"]    = None
+            b["kelly_pnl_dollars"] = None
+        else:
+            b["kelly_pnl"]         = round(kp, 5) if kp is not None else None
+            b["kelly_pnl_pct"]     = round(kp * 100, 3) if kp is not None else None  # % of bankroll
+            b["kelly_pnl_dollars"] = round(kp * PERF_BANKROLL, 2) if kp is not None else None
+        # Flag which multiplier was applied so the UI can show a note
+        mtype = _infer_mkt_type(b)
+        b["clv_mult_applied"]  = clv_mults.get(mtype, 1.0)
+
+    def _perf_label(b: dict) -> str:
+        ticker = b.get("ticker", "").upper()
+        mtype  = _infer_mkt_type(b)
+        if ticker.startswith("KXNBA"):
+            sport = "NBA"
+        elif mtype == "prop":
+            return "Props"
+        else:
+            sport = "MLB"
+        return f"{sport} {mtype.capitalize()}" if mtype else sport
+
+    by_type = {}
+    for b in settled:
+        label = _perf_label(b)
+        if label not in by_type:
+            by_type[label] = {"won": 0, "lost": 0, "units": [], "kelly": []}
+        kp = _kelly_pnl(b)
+        if b["status"] == "won":
+            by_type[label]["won"] += 1
+            k = b["kalshi_price"]
+            by_type[label]["units"].append((1 - k) / k)
+        else:
+            by_type[label]["lost"] += 1
+            by_type[label]["units"].append(-1.0)
+        if kp is not None:
+            by_type[label]["kelly"].append(kp)
+
+    MIN_SAMPLE = 20   # need at least 20 settled bets before win rate is meaningful
+
+    type_breakdown = []
+    for label, d in by_type.items():
+        total_t    = d["won"] + d["lost"]
+        wr_t       = round(d["won"] / total_t * 100, 1) if total_t else None
+        # Kelly P&L expressed as % of bankroll (sum of kelly fractions × 100)
+        kelly_pct_t = round(sum(d["kelly"]) * 100, 3) if d["kelly"] else None
+        # Dollar amount for display alongside %, derived from pct × bankroll
+        kelly_t    = round(sum(d["kelly"]) * PERF_BANKROLL, 2) if d["kelly"] else None
+        type_breakdown.append({
+            "label":             label,
+            "won":               d["won"],
+            "lost":              d["lost"],
+            "win_rate":          wr_t,
+            "kelly_pct":         kelly_pct_t,    # % of bankroll P&L
+            "kelly_dollars":     kelly_t,
+            "insufficient_data": total_t < MIN_SAMPLE,
+            "sample_size":       total_t,
+        })
+    type_breakdown.sort(key=lambda x: -(x["won"] + x["lost"]))
+
+    # Total Kelly P&L as % of bankroll
+    total_kelly_pct = round(sum(kelly_pnls) * 100, 3) if kelly_pnls else None
+
+    return {
+        "total_bets":           len(bets),
+        "won":                  len(won),
+        "lost":                 len(lost),
+        "open":                 len(open_),
+        "win_rate":             win_rate,
+        "avg_edge":             avg_edge,
+        "total_units":          total_units,
+        "avg_units":            avg_units,
+        "total_kelly_units":    total_kelly_units,
+        "total_kelly_dollars":  total_kelly_dollars,
+        "total_kelly_pct":      total_kelly_pct,    # total P&L as % of bankroll
+        "avg_kelly_units":      avg_kelly_units,
+        "avg_kalshi_implied":   avg_kalshi_implied,
+        "avg_clv":              avg_clv,
+        "kelly_bankroll":       PERF_BANKROLL,
+        "bets":                 table_bets,
+        "by_type":              type_breakdown,
+        "clv_multipliers":      clv_mults,         # e.g. {"prop": 0.5, "spread": 1.0}
+    }
+
+
+# ── My Bets tracker (actual bets placed by user) ──────────────────────────────
+import re as _re
+
+def _load_my_bets() -> list:
+    try:
+        with open(MY_BETS_FILE, "r") as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return []
+
+def _save_my_bets(bets: list):
+    try:
+        import tempfile, os as _os
+        fd, tmp = tempfile.mkstemp(dir=BASE_DIR, suffix=".tmp")
+        with _os.fdopen(fd, "w") as f:
+            json.dump(bets, f, indent=2)
+        _os.replace(tmp, MY_BETS_FILE)
+    except Exception as exc:
+        print(f"  WARNING: could not save my_bets: {exc}")
+
+_my_bets: list = _load_my_bets()
+_my_bets_lock = threading.Lock()
+
+# Cache for mark-to-market state — refreshed by background thread every 60s
+# so the /api/mybets endpoint never blocks on live Kalshi API calls.
+_my_bets_state_cache: Optional[dict] = None
+_my_bets_state_lock  = threading.Lock()
+
+
+def _refresh_my_bets_state():
+    """Fetch live Kalshi prices for open my_bets and update the cache."""
+    with _my_bets_lock:
+        bets = json.loads(json.dumps(_my_bets))   # deep copy
+
+    for b in bets:
+        b["current_price"] = None
+        b["unrealized_pnl"] = None
+        if b["status"] != "open":
+            continue
+        try:
+            time.sleep(0.15)
+            data = kalshi_get(f"/markets/{b['ticker']}")
+            mkt  = data.get("market", {})
+            bid_c = float(mkt.get("yes_bid") or 0)
+            ask_c = float(mkt.get("yes_ask") or 0)
+            if bid_c > 0 and ask_c > 0:
+                yes_mid = (bid_c + ask_c) / 200.0   # cents → decimal mid
+                cur = yes_mid if b["side"] == "YES" else 1.0 - yes_mid
+                entry = b["entry_price"]
+                contracts = b["contracts"]
+                b["current_price"]   = round(cur * 100, 1)
+                b["unrealized_pnl"]  = round((cur - entry) * contracts, 2)
+        except Exception:
+            pass
+
+    open_b    = [b for b in bets if b["status"] == "open"]
+    settled_b = [b for b in bets if b["status"] in ("won", "lost")]
+    total_in      = sum(b["amount_spent"] for b in bets)
+    realized_pnl  = sum(b["pnl"] for b in settled_b if b["pnl"] is not None)
+    unrealized_pnl= sum(b.get("unrealized_pnl") or 0 for b in open_b)
+
+    state = {
+        "bets":            bets,
+        "total_in":        round(total_in, 2),
+        "realized_pnl":    round(realized_pnl, 2),
+        "unrealized_pnl":  round(unrealized_pnl, 2),
+        "net_pnl":         round(realized_pnl + unrealized_pnl, 2),
+    }
+    with _my_bets_state_lock:
+        global _my_bets_state_cache
+        _my_bets_state_cache = state
+
+
+def _get_my_bets_state() -> dict:
+    """Return cached mark-to-market state (refreshed every 60s in background)."""
+    with _my_bets_state_lock:
+        cached = _my_bets_state_cache
+    if cached is not None:
+        return cached
+    # First call before cache is warm — compute synchronously once
+    _refresh_my_bets_state()
+    with _my_bets_state_lock:
+        return _my_bets_state_cache or {"bets": [], "total_in": 0, "realized_pnl": 0, "unrealized_pnl": 0, "net_pnl": 0}
+
+
+def _background_my_bets_loop():
+    """Refresh mark-to-market prices for open my_bets every 60s."""
+    while True:
+        try:
+            _refresh_my_bets_state()
+        except Exception as exc:
+            print(f"  My bets refresh error: {exc}")
+        time.sleep(60)
+
+
+def _settle_my_bets():
+    """Settle open my_bets via scores then Kalshi API."""
+    with _my_bets_lock:
+        open_bets = [b for b in _my_bets if b["status"] == "open"]
+    if not open_bets:
+        return
+
+    score_index = _build_score_index()
+    resolved = 0
+
+    for bet in open_bets:
+        mkey = _re.sub(r"[^a-z0-9]", "", bet["matchup"].replace(" @ ", "@").lower())
+        game = score_index.get(mkey)
+        settled = False
+
+        if game:
+            m = _re.search(r">(\d+\.?\d*)", bet["title"])
+            if m:
+                threshold = float(m.group(1))
+                over_wins = game["total"] > threshold
+                won = over_wins if bet["side"] == "YES" else not over_wins
+                pnl = round(bet["amount_spent"] * (1 - bet["entry_price"]) / bet["entry_price"], 2) if won else -bet["amount_spent"]
+                with _my_bets_lock:
+                    for b in _my_bets:
+                        if b["id"] == bet["id"]:
+                            b["status"] = "won" if won else "lost"
+                            b["pnl"] = pnl
+                            b["resolved_at"] = datetime.now(timezone.utc).isoformat()
+                            break
+                resolved += 1
+                settled = True
+
+        if not settled:
+            try:
+                time.sleep(0.2)
+                data = kalshi_get(f"/markets/{bet['ticker']}")
+                result = data.get("market", {}).get("result", "")
+                if result:
+                    won = (result == "yes" and bet["side"] == "YES") or \
+                          (result == "no"  and bet["side"] == "NO")
+                    pnl = round(bet["amount_spent"] * (1 - bet["entry_price"]) / bet["entry_price"], 2) if won else -bet["amount_spent"]
+                    with _my_bets_lock:
+                        for b in _my_bets:
+                            if b["id"] == bet["id"]:
+                                b["status"] = "won" if won else "lost"
+                                b["pnl"] = pnl
+                                b["resolved_at"] = datetime.now(timezone.utc).isoformat()
+                                break
+                    resolved += 1
+            except Exception:
+                pass
+
+    if resolved:
+        with _my_bets_lock:
+            _save_my_bets(_my_bets)
+        print(f"  My Bets: settled {resolved}")
+
+
+# ── Twilio SMS alerts ─────────────────────────────────────────────────────────
+_ALERT_MIN    = float(os.getenv("ALERT_MIN_EDGE", "0.05"))  # Discord alerts at ≥5% (display threshold)
+_BET_SIZE     = float(os.getenv("ALERT_BET_SIZE", "20"))
+
+# ── Discord webhook alert config ───────────────────────────────────────────────
+_DISCORD_WEBHOOK = os.getenv(
+    "DISCORD_WEBHOOK",
+    "https://discord.com/api/webhooks/1491138264088838225/37azkybaSXl3ecgm_ltKXgt1y_VhmEETGuPNMOSke-5q3zv2v6TVmeGZaZTraVJlhqLt"
+)
+
+# ── Persistent alert dedup — survives server restarts ────────────────────────
+# Each entry is "<matchup>|<title>|<side>|<game_date>" keyed by YYYY-MM-DD game
+# date so the same teams+threshold on different days can each fire once.
+_ALERTED_KEYS_FILE = os.path.join(BASE_DIR, "ev_alerted_keys.json")
+
+def _load_alerted_keys() -> set:
+    """Load persisted alert keys, pruning entries older than 14 days."""
+    try:
+        with open(_ALERTED_KEYS_FILE) as f:
+            data = json.load(f)   # {key: "YYYY-MM-DD" alerted_date}
+        cutoff = (datetime.now(timezone.utc).date() - __import__('datetime').timedelta(days=14)).isoformat()
+        return {k for k, d in data.items() if d >= cutoff}
+    except (FileNotFoundError, json.JSONDecodeError, KeyError):
+        return set()
+
+def _save_alerted_keys(keys: set):
+    try:
+        import tempfile, os as _os
+        # Merge with existing file so concurrent writes don't lose data
+        existing = {}
+        try:
+            with open(_ALERTED_KEYS_FILE) as f:
+                existing = json.load(f)
+        except Exception:
+            pass
+        today = datetime.now(timezone.utc).date().isoformat()
+        for k in keys:
+            existing.setdefault(k, today)
+        fd, tmp = tempfile.mkstemp(dir=BASE_DIR, suffix=".tmp")
+        with _os.fdopen(fd, "w") as f:
+            json.dump(existing, f)
+        _os.replace(tmp, _ALERTED_KEYS_FILE)
+    except Exception as exc:
+        print(f"  WARNING: could not save alerted keys: {exc}")
+
+# Keys already alerted — loaded from disk so server restarts don't re-fire
+_alerted_keys: set = _load_alerted_keys()
+print(f"  Loaded {len(_alerted_keys)} previously alerted edge key(s) from disk")
+
+# Keys alerted for gone/corrected — tracks which alerted edges have already
+# received a "line corrected" follow-up so we don't spam.
+_gone_alerted_keys: set = set()
+
+# ── Zero-edge drought detector ────────────────────────────────────────────────
+# Fires a Discord alert when the scanner has produced zero edges for an extended
+# period during game hours — indicates a silent data pipeline failure.
+_zero_edge_streak      = 0          # consecutive scans with no qualifying edges
+_zero_edge_alerted     = False      # suppresses duplicate alerts per drought
+_ZERO_EDGE_ALERT_SCANS = 60         # 60 × 2-min scan = 2 hours of silence
+
+# ── Scan staleness detector ───────────────────────────────────────────────────
+# Separate watchdog thread checks _state["last_scan"] every 60s.
+# If >10 minutes pass without a completed scan during game hours, the scan
+# thread is considered HUNG (blocked on network I/O but still alive) — fire
+# alert + force-restart it regardless of is_alive() status.
+_scan_stale_alerted    = False      # suppresses duplicate stale alerts
+_SCAN_STALE_MINUTES    = 10         # minutes without a scan = hung thread
+
+# ── Discord alert log (visible in UI) ─────────────────────────────────────────
+_discord_log: List[dict] = []
+_discord_log_lock = threading.Lock()
+_DISCORD_LOG_MAX  = 25
+
+
+def _log_discord(ok: bool, preview: str, error: str = ""):
+    with _discord_log_lock:
+        _discord_log.append({
+            "ts":      datetime.now().isoformat(),
+            "ok":      ok,
+            "preview": preview[:80],
+            "error":   error[:200] if error else "",
+        })
+        if len(_discord_log) > _DISCORD_LOG_MAX:
+            _discord_log.pop(0)
+
+
+def _edge_key(e: dict) -> str:
+    """Stable identifier for an edge — matchup + prop + side + game date.
+
+    Including the game date means Mets @ Dodgers Over 8.5 on Apr 13 and
+    Apr 14 are treated as distinct edges and can each alert exactly once,
+    while the same game on the same date is still deduplicated.
+    """
+    ticker    = e.get("ticker", "")
+    game_date = _parse_ticker_date(ticker) or ""   # "2026-04-13" or ""
+    return f"{e['matchup']}|{e['title']}|{e['side']}|{game_date}"
+
+
+def send_discord(embed: dict, content: str = "") -> bool:
+    """Send a Rich Embed to Discord via webhook. Returns True on success.
+
+    content  = text shown in the phone push notification preview (plain text).
+    embed    = Discord embed object (color, title, fields, footer, etc).
+
+    Discord mobile shows `content` in the lock-screen notification, so we put
+    the most critical info (edge %, Kelly $) there so no unlock needed.
+    """
+    if not _DISCORD_WEBHOOK:
+        _log_discord(False, content, "DISCORD_WEBHOOK not set")
+        return False
+    try:
+        import requests as _req
+        resp = _req.post(
+            _DISCORD_WEBHOOK,
+            json={"content": content, "embeds": [embed]},
+            timeout=10,
+        )
+        ok = resp.status_code in (200, 204)
+        _log_discord(ok, content, "" if ok else resp.text[:200])
+        print(f"  Discord alert {'sent ✓' if ok else f'FAIL {resp.status_code}'}")
+        return ok
+    except Exception as exc:
+        _log_discord(False, content, str(exc))
+        print(f"  Discord ERROR: {exc}")
+        return False
+
+
+def _prob_to_american_str(p: Optional[float]) -> str:
+    """Convert decimal probability to American odds string, e.g. 0.60 → '-150'."""
+    if p is None or p <= 0 or p >= 1:
+        return "?"
+    if p >= 0.5:
+        return f"-{round(p / (1 - p) * 100)}"
+    else:
+        return f"+{round((1 - p) / p * 100)}"
+
+
+def _sms_kelly(e: dict) -> float:
+    """Compute 0.25 fractional Kelly (with CLV multiplier) matching the model."""
+    k    = e.get("kalshi", 0.5)
+    edge = e.get("edge", 0)          # post-haircut adj. edge (0–1 decimal)
+    if k <= 0 or k >= 1 or edge <= 0:
+        return 0.0
+    full_kelly = edge / (1.0 - k)
+    clv_mults  = _get_clv_multipliers()
+    mtype      = e.get("mkt_type", "")
+    clv_mult   = clv_mults.get(mtype, 1.0)
+    return min(full_kelly * 0.25 * clv_mult, 0.05)
+
+
+def _alert_top10():
+    """
+    After each scan, alert on any qualifying edge that hasn't been seen before.
+    Qualifying = edge_pct >= ALERT_MIN_EDGE (default 4%) + passed book-consensus
+    validation (is_valid_consensus is always True for edges that reach here).
+
+    Each unique edge fires exactly once per server session (_alerted_keys never
+    clears), so restarting the server will re-alert on edges that are still live.
+    """
+    global _alerted_keys
+
+    with _lock:
+        game_edges = list(_state.get("edges", []))
+    min_edge = _ALERT_MIN  # from env: ALERT_MIN_EDGE (default 0.04 = 4%)
+
+    # Apply minimum edge threshold, sort best-first
+    all_edges = sorted(
+        [e for e in game_edges
+         if e.get("edge_pct", e.get("edge", 0) * 100) >= min_edge * 100],
+        key=lambda x: x.get("edge_pct", x.get("edge", 0) * 100),
+        reverse=True,
+    )
+
+    for e in all_edges:
+        key = _edge_key(e)
+        if key in _alerted_keys:
+            continue   # already alerted this session — skip
+
+        ts   = datetime.now().strftime("%I:%M %p")
+        k    = e.get("kalshi", 0.5)
+        ep   = round(e.get("edge_pct", e.get("edge", 0) * 100), 1)
+        side = e.get("side", "?")
+
+        # American odds
+        # e["fair"] = model probability for the bet side at the exact Kalshi threshold.
+        # This is the correct "consensus" price — it's calibrated to the specific bet line,
+        # not the book's main line (which can be at a different threshold for totals).
+        kalshi_amer = _prob_to_american_str(k)
+        fair_p      = e.get("fair", None)
+        cons_amer   = _prob_to_american_str(fair_p)   # fair value for this exact bet
+
+        # Confirming books (from consensus_reason: "Confirmed by Pinnacle + DraftKings")
+        conf_reason = e.get("consensus_reason", "")
+        conf_books  = conf_reason.replace("Confirmed by ", "").replace("Pinnacle", "PIN").replace("DraftKings", "DK").replace("FanDuel", "FD") if conf_reason else "PIN+?"
+
+        # Kelly bet size
+        kelly_frac = _sms_kelly(e)
+        kelly_bet  = round(kelly_frac * PERF_BANKROLL, 2)
+        kelly_pct  = round(kelly_frac * 100, 2)
+        clv_mults  = _get_clv_multipliers()
+        clv_tag    = " (½ CLV penalty)" if clv_mults.get(e.get("mkt_type", ""), 1.0) == 0.5 else ""
+
+        # Embed color: green ≥10%, yellow ≥7%, blue otherwise
+        color = 0x00c853 if ep >= 10 else 0xffe57a if ep >= 7 else 0x2979ff
+        stars = "🔥" if ep >= 10 else "⚡" if ep >= 7 else "📈"
+        conf_label = "★★★ HIGH CONF" if e.get("confidence", 0) >= 0.80 else "★★ MED CONF" if e.get("confidence", 0) >= 0.50 else "★ LOW CONF"
+
+        # content = what shows on the phone lock screen without unlocking
+        # Keep it tight: the two numbers the user needs at a glance
+        content = f"{stars} **+{ep}% edge** | Kelly **${kelly_bet:.0f}** ({kelly_pct}%){clv_tag}"
+
+        # Rich embed — full detail visible after opening Discord
+        ticker_str = e.get("ticker", "")
+        mkt_type_str = e.get("mkt_type", "").upper()
+        embed = {
+            "color": color,
+            "author": {"name": f"Kalshi EV Scanner  •  {ts}"},
+            "title": f"{e.get('matchup', '')}",
+            "description": f"**{e.get('title', '')}**  —  Side: **{side}**",
+            "fields": [
+                {"name": "Adj. Edge",      "value": f"`+{ep}%`",                        "inline": True},
+                {"name": "Kelly Stake",    "value": f"`${kelly_bet:.0f}` ({kelly_pct}%){clv_tag}", "inline": True},
+                {"name": "Confidence",     "value": conf_label,                          "inline": True},
+                # ⚠ Kalshi price is captured at scan time — can be up to 2 min stale.
+                # Always use ✓ Check (or validate_bet) before placing.
+                {"name": "Kalshi Price",   "value": f"`{kalshi_amer}`  ({round(k*100)}¢)  *(scan price)*","inline": True},
+                {"name": "Fair Value",     "value": f"`{cons_amer}`",                    "inline": True},
+                {"name": "Books",          "value": conf_books,                          "inline": True},
+                {"name": "Market Ticker",  "value": f"`{ticker_str}`  [{mkt_type_str}]", "inline": False},
+            ],
+            "footer": {"text": f"⚠ Kalshi price shown is from scan time — verify live price before betting  •  Bankroll ${PERF_BANKROLL:.0f}  •  Pinnacle fair value"},
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+
+        ok = send_discord(embed, content)
+        if ok:
+            _alerted_keys.add(key)   # only mark as alerted if send succeeded
+            _save_alerted_keys(_alerted_keys)   # persist so restarts don't re-fire
+        # If send failed, key stays un-alerted so next scan cycle retries.
+
+    # ── Follow-up: alert when a previously flagged edge is gone ──────────────
+    # Fires once per edge when it drops out of the current scan results,
+    # giving you a heads-up before you place the bet.
+    current_keys = {_edge_key(e) for e in game_edges}
+    for key in list(_alerted_keys):
+        if key in _gone_alerted_keys:
+            continue   # already sent the correction notice
+        if key in current_keys:
+            continue   # edge still live
+
+        # Edge was alerted but is no longer in current scan — line corrected.
+        matchup, title, side = key.split("|", 2)
+
+        # Check if it was Pinnacle-invalidated (line moved) or just fell below threshold
+        with _edge_history_lock:
+            hist = next(
+                (h for k2, h in _edge_price_history.items() if k2.startswith(f"{matchup}|")),
+                None,
+            )
+        pin_shift = hist.get("last_pin_pct", 0) - hist.get("first_pin_pct", 0) if hist else None
+        if pin_shift is not None and hist.get("first_pin_pct") is not None:
+            reason = f"Pinnacle shifted {pin_shift:+.1f}pp" if abs(pin_shift) >= 1 else "Kalshi price corrected"
+        else:
+            reason = "Edge no longer qualifies"
+
+        ts = datetime.now().strftime("%I:%M %p")
+        content_gone = f"🚫 **EDGE GONE** — {title} ({side}) | {reason}"
+        embed_gone = {
+            "color": 0xf85149,   # red
+            "author": {"name": f"Kalshi EV Scanner  •  {ts}  •  LINE CORRECTED"},
+            "title": matchup,
+            "description": f"**{title}**  —  Side: **{side}**",
+            "fields": [
+                {"name": "Status",  "value": "❌ Edge no longer +EV — do not bet", "inline": False},
+                {"name": "Reason",  "value": reason,                                "inline": False},
+            ],
+            "footer": {"text": "This fires once when a flagged edge disappears from the scan"},
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+        ok = send_discord(embed_gone, content_gone)
+        if ok:
+            _gone_alerted_keys.add(key)
+
+
+def _alert_min_threshold() -> float:
+    return _ALERT_MIN
+
+
+def send_test_discord() -> bool:
+    """Fire a test Discord embed with a dummy edge — call this to verify the webhook."""
+    ts = datetime.now().strftime("%I:%M %p")
+    content = "⚡ **+6.1% edge** | Kelly **$23** (2.3%)  ← TEST ALERT"
+    embed = {
+        "color": 0x2979ff,
+        "author": {"name": f"Kalshi EV Scanner  •  {ts}  •  TEST"},
+        "title": "Atlanta Braves @ Arizona Diamondbacks",
+        "description": "**Total Runs Over 8.5**  —  Side: **YES**",
+        "fields": [
+            {"name": "Adj. Edge",    "value": "`+6.1%`",           "inline": True},
+            {"name": "Kelly Stake",  "value": "`$23` (2.3%)",       "inline": True},
+            {"name": "Confidence",   "value": "★★ MED CONF",        "inline": True},
+            {"name": "Kalshi Price", "value": "`-120`  (55¢)",      "inline": True},
+            {"name": "Fair Value",   "value": "`-138`",             "inline": True},
+            {"name": "Books",        "value": "PIN+DK+FD",          "inline": True},
+        ],
+        "footer": {"text": f"Bankroll $1000  •  Min edge {round(_ALERT_MIN*100,1)}%  •  Pinnacle fair value · DK+FD confirm"},
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+    return send_discord(embed, content)
+
+
+def _send_zero_edge_alert(hours: float) -> None:
+    """Fire a Discord health-check alert when no edges found for `hours` hours."""
+    ts = datetime.now().strftime("%-I:%M %p")
+    embed = {
+        "color": 0xFF4444,   # red
+        "author": {"name": f"Kalshi EV Scanner  •  {ts}  •  HEALTH CHECK"},
+        "title": "⚠️ No edges found in the last {:.0f} hours".format(hours),
+        "description": (
+            "The scanner has been running but found **zero qualifying edges** "
+            "for the past **{:.0f} hours** during game hours.\n\n"
+            "This likely means a **silent data pipeline failure** — "
+            "not a market condition. Common causes:\n"
+            "• Odds API returning an error (bad market param, quota, timeout)\n"
+            "• Kalshi API auth failure\n"
+            "• All Pinnacle lines failing to match any Kalshi threshold\n\n"
+            "Check the scanner logs immediately."
+        ).format(hours),
+        "footer": {"text": "Alert fires once per drought — resets when next edge is found"},
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+    content = f"⚠️ Scanner health check: no edges in {hours:.0f}h — possible pipeline failure"
+    ok = send_discord(embed, content)
+    print(f"  Zero-edge alert sent (streak={_zero_edge_streak} scans / {hours:.1f}h): {'✓' if ok else 'FAILED'}")
+
+
+def _send_scan_stale_alert(minutes: float) -> None:
+    """Fire a Discord alert when the scan thread appears hung — no scan in `minutes` min."""
+    ts = datetime.now().strftime("%-I:%M %p")
+    embed = {
+        "color": 0xE74C3C,   # red
+        "author": {"name": f"Kalshi EV Scanner  •  {ts}  •  THREAD WATCHDOG"},
+        "title": f"🚨 Scan thread hung — {minutes:.0f} min without a scan",
+        "description": (
+            f"The scan thread has **not completed a scan in {minutes:.0f} minutes** "
+            f"during game hours, but `is_alive()` returns True.\n\n"
+            f"This is a **hung thread** — blocked on a network call that never timed out "
+            f"(Mac sleep / stalled Kalshi or Odds API connection).\n\n"
+            f"**Auto-restarting the scan thread now.**\n\n"
+            f"You may miss edges during this window. Check scanner logs."
+        ),
+        "fields": [
+            {"name": "Common causes", "value":
+             "• Mac went to sleep during a scan cycle\n"
+             "• Kalshi API connection hung (no timeout triggered)\n"
+             "• Network reconnected after long offline period\n"
+             "• Odds API response stalled mid-stream", "inline": False},
+        ],
+        "footer": {"text": "Watchdog checks staleness every 60s — fires once per hung episode"},
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+    content = f"🚨 Scan thread hung {minutes:.0f}min — watchdog auto-restarting"
+    ok = send_discord(embed, content)
+    print(f"  Scan-stale alert sent ({minutes:.0f} min since last scan): {'✓' if ok else 'FAILED'}")
+
+
+def _run_odds_refresh():
+    """
+    Fetch fresh book odds (Pinnacle + DK + FanDuel) and update the cached indices.
+    Costs exactly 2 Odds API credits (1 per sport: MLB + NBA).
+    Runs every ODDS_REFRESH_SECONDS in a dedicated background thread.
+    """
+    global _cached_mlb_index, _cached_nba_index, _last_odds_refresh
+    from kalshi_ev_scanner import fetch_odds_index
+    print(f"\n  ── Odds index refresh  {datetime.now().strftime('%H:%M:%S')} ──")
+
+    try:
+        mlb_idx, _ = fetch_odds_index(
+            "baseball_mlb", total_range=(5.0, 14.0), spread_limit=3.0
+        )
+        if mlb_idx is not None:
+            with _odds_cache_lock:
+                _cached_mlb_index = mlb_idx
+    except Exception as exc:
+        print(f"  ERROR refreshing MLB odds index: {exc}")
+
+    try:
+        nba_idx, _ = fetch_odds_index(
+            "basketball_nba", total_range=(170.0, 280.0), spread_limit=40.0
+        )
+        if nba_idx is not None:
+            with _odds_cache_lock:
+                _cached_nba_index = nba_idx
+    except Exception as exc:
+        print(f"  ERROR refreshing NBA odds index: {exc}")
+
+    with _odds_cache_lock:
+        _last_odds_refresh = time.time()
+
+
+def _background_odds_loop():
+    """Refresh book-odds cache on an adaptive schedule (costs 3 credits/refresh)."""
+    try:
+        _run_odds_refresh()      # run immediately so first Kalshi scan has data
+    except Exception as exc:
+        print(f"  Odds refresh (initial) error: {exc}")
+    while True:
+        time.sleep(_odds_refresh_interval())
+        try:
+            _run_odds_refresh()
+        except Exception as exc:
+            print(f"  Odds refresh loop error: {exc}")
+
+
+def _run_scan():
+    """
+    Main scan cycle.
+
+    SOURCE OF TRUTH: Pinnacle line only.
+      • Gaussian model removed.
+      • DraftKings / FanDuel confirmation steps removed.
+      • Edges are invalidated when Pinnacle's no-vig probability shifts ≥ 2 pp
+        from the value recorded on the first scan the edge was seen ("pin_first_pct").
+        This catches market corrections before we log stale bets.
+
+    Staleness is still tracked via Kalshi price drift (≥ 5 pp) as a secondary
+    signal, but the primary invalidation gate is the Pinnacle line shift.
+    """
+    # Pinnacle-line shift threshold for invalidating an edge (percentage points)
+    PIN_SHIFT_THRESHOLD = 2.0   # pp — Pinnacle moved ≥2 pp → edge is stale
+
+    with _lock:
+        _state["scanning"] = True
+        _state["error"]    = None
+
+    try:
+        # Read cached indices (populated by _background_odds_loop).
+        # If cache is still None (very first startup before odds loop finishes),
+        # scan_sport falls back to fetching inline automatically.
+        with _odds_cache_lock:
+            mlb_idx = _cached_mlb_index
+            nba_idx = _cached_nba_index
+
+        mlb = scan_sport(
+            label="MLB — Run Line, Totals & Moneyline",
+            spread_series="KXMLBSPREAD",
+            total_series="KXMLBTOTAL",
+            ml_series="KXMLBML",
+            odds_sport="baseball_mlb",
+            abbr_map=MLB_ABBR,
+            spread_std=MLB_SPREAD_STD,
+            total_std=MLB_TOTAL_STD,
+            game_index=mlb_idx,
+        )
+
+        nba = scan_sport(
+            label="NBA — Spread, Totals & Moneyline",
+            spread_series="KXNBASPREAD",
+            total_series="KXNBATOTAL",
+            ml_series="KXNBAML",
+            odds_sport="basketball_nba",
+            abbr_map=NBA_ABBR,
+            spread_std=NBA_SPREAD_STD,
+            total_std=NBA_TOTAL_STD,
+            game_index=nba_idx,
+        )
+
+        all_edges = sorted(mlb + nba, key=lambda x: x["edge"], reverse=True)
+
+        # Deduplicate: keep only best edge per (matchup, mkt_type, side)
+        edges = _best_edge_per_game(all_edges)
+
+        # Secondary dedup: normalize matchup name to catch whitespace/case differences
+        # across multiple Kalshi event tickers for the same game.
+        import re as _re2
+        _seen_norm = set()
+        _deduped = []
+        for _e in edges:
+            _norm_key = (
+                _re2.sub(r"[^a-z0-9]", "", _e.get("matchup","").lower()),
+                _e.get("mkt_type",""),
+                _e.get("side",""),
+            )
+            if _norm_key not in _seen_norm:
+                _seen_norm.add(_norm_key)
+                _deduped.append(_e)
+        edges = _deduped
+
+        # ── Per-edge: compute derived fields + Pinnacle line-movement tracking ─
+        now_ts = time.time()
+        for e in edges:
+            e["kalshi_pct"] = round(e["kalshi"] * 100, 1)
+            e["fair_pct"]   = round(e["fair"]   * 100, 1)
+            e["edge_pct"]   = round(e["edge"]   * 100, 1)
+
+            # ── Pinnacle probability for this edge's side ──────────────────
+            bd = e.get("books_detail", {})
+            pin_raw = bd.get("pinnacle")   # no-vig prob for YES side
+
+            if pin_raw is not None:
+                # Convert to the probability for the side we're betting
+                pin_side_pct = round(
+                    (pin_raw if e["side"] == "YES" else 1.0 - pin_raw) * 100, 1
+                )
+                e["pin_prob_pct"]      = round(pin_raw * 100, 1)
+                e["pin_side_pct"]      = pin_side_pct   # pin prob aligned to our bet side
+                e["projected_clv_pct"] = round(pin_side_pct - e["kalshi_pct"], 1)
+            else:
+                pin_side_pct           = None
+                e["pin_prob_pct"]      = None
+                e["pin_side_pct"]      = None
+                e["projected_clv_pct"] = None
+
+            # ── Pinnacle line-movement tracking (primary invalidation gate) ─
+            ek = _edge_key(e)
+            with _edge_history_lock:
+                hist = _edge_price_history.get(ek)
+
+                if hist is None:
+                    # First time we see this edge — record Pinnacle baseline
+                    _edge_price_history[ek] = {
+                        "first_kalshi_pct": e["kalshi_pct"],
+                        "first_pin_pct":    pin_side_pct,   # may be None if PIN unavailable
+                        "first_ts":         now_ts,
+                    }
+                    hist = _edge_price_history[ek]
+
+                hist["last_kalshi_pct"] = e["kalshi_pct"]
+                hist["last_pin_pct"]    = pin_side_pct
+                hist["last_ts"]         = now_ts
+
+                age_sec = now_ts - hist["first_ts"]
+                e["age_min"] = round(age_sec / 60, 1)
+
+                # ── Kalshi drift (secondary signal) ────────────────────────
+                kalshi_drift = e["kalshi_pct"] - hist["first_kalshi_pct"]
+                if e["side"] == "NO":
+                    kalshi_drift = -kalshi_drift   # rising YES = bad for NO
+                e["drift_pct"] = round(kalshi_drift, 1)
+                e["stale"]     = kalshi_drift >= 5.0   # kept for UI display
+
+                # ── Pinnacle line shift (primary invalidation) ─────────────
+                # Compare current Pinnacle prob to the baseline recorded at
+                # first detection.  A shift ≥ PIN_SHIFT_THRESHOLD pp means
+                # the sharp market has moved against the edge; discard it.
+                first_pin = hist.get("first_pin_pct")
+                if pin_side_pct is not None and first_pin is not None:
+                    pin_shift = pin_side_pct - first_pin  # + = line moved our way
+                    e["pin_shift_pct"] = round(pin_shift, 1)
+                    # Invalidated when Pinnacle moved AWAY from our bet by ≥ threshold
+                    e["pin_invalidated"] = (pin_shift <= -PIN_SHIFT_THRESHOLD)
+                    if e["pin_invalidated"]:
+                        e["invalidation_reason"] = (
+                            f"Pinnacle shifted {abs(pin_shift):.1f}pp against "
+                            f"our {e['side']} — line moved from "
+                            f"{first_pin:.1f}% → {pin_side_pct:.1f}%"
+                        )
+                else:
+                    # No Pinnacle data — can't confirm the edge; mark invalid
+                    e["pin_shift_pct"]    = None
+                    e["pin_invalidated"]  = (pin_side_pct is None)
+                    e["invalidation_reason"] = (
+                        "No Pinnacle line available — cannot confirm edge"
+                        if pin_side_pct is None else ""
+                    )
+
+        # ── Invalidation filter (Pinnacle-led) ────────────────────────────────
+        # Remove edges where Pinnacle has shifted against us OR is unavailable.
+        # We keep stale-Kalshi edges visible (shown in UI with a warning) but
+        # hard-drop Pinnacle-invalidated ones — they are not real edges.
+        valid_edges = [e for e in edges if not e.get("pin_invalidated")]
+        invalidated = [e for e in edges if e.get("pin_invalidated")]
+        if invalidated:
+            print(f"  Invalidated {len(invalidated)} edge(s) by Pinnacle line shift: "
+                  + ", ".join(e["title"] for e in invalidated))
+        edges = valid_edges
+
+        # ── Recency-premium sort ──────────────────────────────────────────────
+        # Fresh edges (< 5 min) get a 20% boost so they bubble above older
+        # equal-confidence edges.  Confidence × adjusted EV is the base score.
+        def _sort_score(e):
+            fresh_mult = 1.2 if e["age_min"] < 5 else 1.0
+            return fresh_mult * e.get("confidence", 0.5) * e["edge_pct"]
+        edges.sort(key=_sort_score, reverse=True)
+
+        now_iso = datetime.now(timezone.utc).isoformat()
+        snapshot = {
+            "ts":         now_iso,
+            "edge_count": len(edges),
+            "top_edge":   round(edges[0]["edge_pct"], 1) if edges else 0,
+            "edges": [
+                {"matchup": e["matchup"], "title": e["title"],
+                 "side": e["side"], "edge_pct": e["edge_pct"],
+                 "mkt_type": e["mkt_type"]}
+                for e in edges
+            ],
+        }
+        _history.append(snapshot)
+        _save_history(_history)
+
+        with _lock:
+            _state["edges"]     = edges
+            _state["last_scan"] = now_iso
+            _state["scanning"]  = False
+
+        # Log new bets (skips pin_invalidated edges)
+        _add_new_bets(edges)
+
+        # Alert on any new qualifying edge (fires exactly once per unique edge)
+        _alert_top10()
+
+        # ── Zero-edge drought check ───────────────────────────────────────────
+        # Track consecutive scans with no edges.  After 2 hours of silence
+        # during game hours (10 AM – 11 PM PT), fire a health-check alert so
+        # a silent pipeline failure doesn't go unnoticed for days.
+        global _zero_edge_streak, _zero_edge_alerted
+        pt_hour = datetime.now(timezone.utc).hour - 7  # UTC → PT (approx)
+        if pt_hour < 0:
+            pt_hour += 24
+        in_game_hours = 10 <= pt_hour <= 23   # 10 AM – 11 PM PT
+
+        if len(edges) > 0:
+            _zero_edge_streak  = 0
+            _zero_edge_alerted = False   # reset so next drought fires fresh
+        elif in_game_hours:
+            _zero_edge_streak += 1
+            if _zero_edge_streak >= _ZERO_EDGE_ALERT_SCANS and not _zero_edge_alerted:
+                _zero_edge_alerted = True
+                hours = round(_zero_edge_streak * REFRESH_SECONDS / 3600, 1)
+                _send_zero_edge_alert(hours)
+
+    except Exception as exc:
+        with _lock:
+            _state["error"]    = str(exc)
+            _state["scanning"] = False
+
+
+def _background_loop():
+    while True:
+        try:
+            _run_scan()
+        except Exception as exc:
+            print(f"  Scan loop error: {exc}")
+        time.sleep(REFRESH_SECONDS)
+
+
+
+RESOLUTION_POLL_SECONDS = 5 * 60   # check for settled games every 5 minutes
+CLV_CAPTURE_SECONDS     = 60       # refresh closing prices for open bets every 60 sec
+
+
+def _capture_clv_prices():
+    """
+    Continuously refresh the 'closing' Kalshi price for every open bet.
+
+    We call the Kalshi API for each open bet and overwrite `closing_yes_pct`
+    with the current mid-price.  The last write before the market resolves
+    becomes the true closing line — which is what CLV measures.
+
+    Strategy:
+      • While market status == "open" (pre-game): always update.  This is
+        the true closing line — the last pre-game price.
+      • Once status changes (game started / market closed): STOP updating.
+        The last captured pre-game price is the closing line.  In-game prices
+        reflect live game state and would produce wildly wrong CLV.
+      • If a bet was flagged close to game time and we never captured a
+        pre-game price, the initial closing_yes_pct (set to entry price at
+        flag time) remains, giving CLV = 0 (neutral, not misleading).
+    """
+    with _bets_lock:
+        open_bets = [b for b in _bets if b["status"] == "open"]
+
+    if not open_bets:
+        return
+
+    updated = 0
+    for bet in open_bets:
+        # Skip bets where game has already started — CLV is frozen
+        if bet.get("clv_frozen"):
+            continue
+        try:
+            time.sleep(0.15)          # gentle rate-limit (~6–7 calls/sec max)
+            data = kalshi_get(f"/markets/{bet['ticker']}")
+            mkt  = data.get("market", {})
+
+            # Skip already-resolved markets
+            if mkt.get("result"):
+                continue
+
+            status = mkt.get("status", "")
+            if status not in ("active", "open"):
+                continue
+
+            # Freeze CLV at game start time — do NOT update with in-game prices.
+            # Kalshi keeps markets "active" during the game, so status alone can't
+            # tell us if the game has started. Parse the start time from the ticker.
+            game_start = _parse_ticker_start_time(bet["ticker"])
+            if game_start and datetime.now(timezone.utc) >= game_start:
+                # Game has started — closing price is already frozen from last update.
+                # Mark clv_frozen so we stop calling the API for this bet.
+                with _bets_lock:
+                    for b in _bets:
+                        if b["id"] == bet["id"] and not b.get("clv_frozen"):
+                            b["clv_frozen"] = True
+                            break
+                continue
+
+            # API returns prices as dollar decimals in yes_bid_dollars/yes_ask_dollars
+            # (e.g. 0.33 = 33¢).  Multiply by 100 to get percentage points.
+            bid_c = float(mkt.get("yes_bid_dollars") or 0) * 100
+            ask_c = float(mkt.get("yes_ask_dollars") or 0) * 100
+            if bid_c <= 0 or ask_c <= 0:
+                continue
+
+            yes_mid_pct = round((bid_c + ask_c) / 2.0, 1)
+
+            # Safety guard: reject prices that have collapsed to in-game extremes.
+            # A market at 97¢+ or 3¢- means the outcome is effectively decided —
+            # that's a live game price, not a pre-game closing line.
+            # This prevents contamination if game_start parsing ever fails.
+            if yes_mid_pct >= 97.0 or yes_mid_pct <= 3.0:
+                continue
+
+            with _bets_lock:
+                for b in _bets:
+                    if b["id"] == bet["id"]:
+                        b["closing_yes_pct"] = yes_mid_pct
+                        entry_yes = b.get("kalshi_yes_at_flag")
+                        if entry_yes is not None:
+                            b["clv"] = round(
+                                yes_mid_pct - entry_yes if b["side"] == "YES"
+                                else entry_yes - yes_mid_pct,
+                                1,
+                            )
+                        break
+            updated += 1
+        except Exception as exc:
+            print(f"  CLV capture error ({bet['ticker']}): {exc}")
+
+    if updated:
+        with _bets_lock:
+            _save_bets(_bets)
+        print(f"  CLV capture: updated {updated} open bet(s)")
+
+
+def _background_clv_capture_loop():
+    """Refresh live Kalshi prices for open bets every CLV_CAPTURE_SECONDS."""
+    # Let the main scan run first so open bets exist before we start polling
+    time.sleep(30)
+    while True:
+        try:
+            _capture_clv_prices()
+        except Exception as exc:
+            print(f"  CLV capture loop error: {exc}")
+        time.sleep(CLV_CAPTURE_SECONDS)
+
+
+def _background_resolution_loop():
+    """
+    Dedicated fast-resolution thread.
+    Runs every 5 minutes — completely independent of the main scan so settled
+    games show up in the performance tracker as soon as the final score lands,
+    without waiting for the next full scan cycle.
+    Uses the free /scores endpoint first (0 credits), then Kalshi API for anything
+    not yet score-settled.
+    """
+    # Wait for the first main scan to populate open bets before we start checking
+    time.sleep(90)
+    while True:
+        try:
+            _check_resolutions()
+            _settle_my_bets()
+        except Exception as exc:
+            print(f"  Resolution loop error: {exc}")
+        time.sleep(RESOLUTION_POLL_SECONDS)
+
+
+# ── HTML template ─────────────────────────────────────────────────────────────
+HTML = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Kalshi EV Scanner</title>
+<style>
+  :root {
+    --bg:      #0d1117;
+    --surface: #161b22;
+    --border:  #30363d;
+    --text:    #e6edf3;
+    --muted:   #8b949e;
+    --green:   #3fb950;
+    --yellow:  #d29922;
+    --blue:    #58a6ff;
+    --red:     #f85149;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    font-size: 13px;
+    padding: 14px 18px;
+  }
+  header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-bottom: 10px;
+    flex-wrap: wrap;
+    gap: 8px;
+  }
+  .header-left { display: flex; align-items: center; gap: 16px; flex-wrap: wrap; }
+  h1 { font-size: 16px; font-weight: 700; white-space: nowrap; }
+  h1 span { color: var(--green); }
+  .meta { color: var(--muted); font-size: 11px; }
+  .header-right { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+  .bankroll-inline { display: flex; align-items: center; gap: 6px; }
+  .bankroll-inline label { font-size: 11px; color: var(--muted); white-space: nowrap; }
+  .bankroll-inline input {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 5px;
+    color: var(--text);
+    font-size: 12px;
+    padding: 3px 7px;
+    width: 90px;
+  }
+  .bankroll-inline input:focus { outline: none; border-color: var(--blue); }
+  .badge {
+    display: inline-block;
+    padding: 2px 7px;
+    border-radius: 10px;
+    font-size: 11px;
+    font-weight: 600;
+  }
+  .badge-scanning { background: #1f2d3d; color: var(--blue); }
+  .badge-ok       { background: #1a2d1a; color: var(--green); }
+  .badge-error    { background: #2d1a1a; color: var(--red); }
+  button#refresh {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    color: var(--text);
+    padding: 4px 10px;
+    border-radius: 5px;
+    cursor: pointer;
+    font-size: 11px;
+  }
+  button#refresh:hover { background: #21262d; }
+  .card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 7px;
+    overflow: hidden;
+    margin-bottom: 8px;
+  }
+  .card-header {
+    padding: 7px 12px;
+    border-bottom: 1px solid var(--border);
+    font-weight: 600;
+    font-size: 11px;
+    color: var(--muted);
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    cursor: pointer;
+    user-select: none;
+  }
+  .card-header:hover { background: #1c2128; }
+  .card-toggle { font-size: 10px; color: var(--muted); }
+  .card-body.collapsed { display: none; }
+  table { width: 100%; border-collapse: collapse; }
+  th, td { padding: 6px 10px; text-align: left; white-space: nowrap; }
+  th {
+    font-size: 10px;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: var(--muted);
+    border-bottom: 1px solid var(--border);
+    font-weight: 600;
+  }
+  td { border-bottom: 1px solid #1c2128; transition: background 0.15s ease; }
+  tr:last-child td { border-bottom: none; }
+  tr:hover td { background: #1c2128; }
+  /* Smooth card content transitions — prevents jarring full-page repaints */
+  .card-body { transition: opacity 0.1s ease; }
+  .card-body.updating { opacity: 0.7; }
+  .prop-col { white-space: normal; max-width: 260px; }
+  .num { text-align: right; font-variant-numeric: tabular-nums; }
+  .side-yes { color: var(--green); font-weight: 600; }
+  .side-no  { color: var(--red);   font-weight: 600; }
+  .badge-new {
+    display: inline-block;
+    background: #1f3a5f;
+    color: #58a6ff;
+    font-size: 9px;
+    font-weight: 700;
+    padding: 1px 4px;
+    border-radius: 3px;
+    margin-left: 5px;
+    vertical-align: middle;
+  }
+  .empty { padding: 18px; text-align: center; color: var(--muted); font-size: 12px; }
+  .spinner {
+    display: inline-block;
+    width: 12px; height: 12px;
+    border: 2px solid var(--border);
+    border-top-color: var(--blue);
+    border-radius: 50%;
+    animation: spin 0.8s linear infinite;
+    vertical-align: middle;
+    margin-right: 5px;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  .countdown { color: var(--muted); font-size: 11px; }
+  .kelly-val { color: #a5d6a7; font-weight: 600; }
+  .kelly-na  { color: var(--muted); }
+  .pin-line  { color: var(--muted); font-size: 11px; }
+  .matchup-header td {
+    background: #1c2128;
+    color: var(--text);
+    font-weight: 600;
+    font-size: 12px;
+    padding: 5px 10px;
+    border-bottom: 1px solid var(--border);
+    border-left: 3px solid var(--sport-color, #30363d);
+  }
+  .matchup-inline {
+    font-size: 11px;
+    color: var(--muted);
+    white-space: nowrap;
+    max-width: 180px;
+  }
+  .team-logo {
+    width: 20px; height: 20px;
+    vertical-align: middle;
+    margin-right: 5px;
+    border-radius: 3px;
+    object-fit: contain;
+  }
+  .card-mlb-spread { --sport-color: #58a6ff; }
+  .card-mlb-total  { --sport-color: #79c0ff; }
+  .card-nba-spread { --sport-color: #ff7b72; }
+  .card-nba-total  { --sport-color: #ffa657; }
+  .card-header.mlb { border-left: 3px solid #58a6ff; }
+  .card-header.nba { border-left: 3px solid #ff7b72; }
+  .stat-row { display: flex; flex-wrap: wrap; gap: 6px; padding: 8px 10px; }
+  .stat-pill {
+    background: #1c2128; border: 1px solid var(--border);
+    border-radius: 6px; padding: 5px 10px;
+  }
+  .stat-pill .label { color: var(--muted); font-size: 10px; text-transform: uppercase; letter-spacing: 0.04em; }
+  .stat-pill .value { font-weight: 700; font-size: 14px; margin-top: 1px; }
+  .pnl-pos { color: #3fb950; }
+  .pnl-neg { color: var(--red); }
+  .pnl-neu { color: var(--muted); }
+  .result-won  { color: #3fb950; font-weight: 700; }
+  .result-lost { color: var(--red); font-weight: 700; }
+  .result-open { color: var(--muted); }
+  .rank-num { color: var(--muted); font-weight: 700; width: 24px; display: inline-block; font-size: 11px; }
+  #history-card canvas { display: block; width: 100% !important; height: 160px !important; }
+  .chart-empty { padding: 20px; text-align: center; color: var(--muted); font-size: 12px; }
+  .mb-won  { color: #00e676; font-weight: 700; }
+  .mb-lost { color: var(--red); font-weight: 700; }
+  .mb-open { color: var(--muted); }
+  .mb-pnl-pos { color: #00e676; font-weight: 700; }
+  .mb-pnl-neg { color: var(--red); font-weight: 700; }
+  .mb-del { cursor:pointer; color:var(--muted); font-size:13px; padding:0 4px; }
+  .mb-del:hover { color:var(--red); }
+  .mb-track-btn { font-size:10px; background:#21262d; border:1px solid var(--border); border-radius:3px; color:var(--muted); padding:2px 6px; cursor:pointer; margin-left:5px; vertical-align:middle; }
+  .mb-track-btn:hover { color:var(--text); border-color:var(--muted); }
+  .badge-stale { display:inline-block; font-size:9px; background:#2d1a1a; color:#f85149; padding:1px 5px; border-radius:3px; margin-left:5px; vertical-align:middle; }
+  .badge-drift { font-size:10px; color:var(--muted); margin-left:4px; }
+  .badge-unvalidated { display:inline-block; font-size:9px; background:#2d200a; color:#e3a53a; padding:1px 5px; border-radius:3px; margin-left:5px; vertical-align:middle; letter-spacing:0.03em; }
+  .badge-sharp { display:inline-block; font-size:9px; background:#0d2137; color:#58a6ff; border:1px solid #1f4e79; padding:1px 5px; border-radius:3px; margin-left:5px; vertical-align:middle; font-weight:700; letter-spacing:0.04em; }
+  .exec-card-header { background:linear-gradient(90deg,#1a2637 0%,#161b22 100%); border-left:3px solid #58a6ff; }
+  .clv-pos { color:#3fb950; font-weight:700; }
+  .clv-neg { color:#f85149; font-weight:700; }
+  .clv-neu { color:var(--muted); }
+  .conf-cell { white-space:nowrap; }
+  .insufficient-data { color:var(--muted); font-style:italic; font-size:11px; }
+</style>
+</head>
+<body>
+<header>
+  <div class="header-left">
+    <h1>Kalshi EV &nbsp;<span>MLB</span></h1>
+    <div class="meta" id="last-scan">Loading…</div>
+  </div>
+  <div class="header-right">
+    <div class="bankroll-inline">
+      <label for="bankroll">Bankroll $</label>
+      <input type="number" id="bankroll" min="0" step="100" value="1000" oninput="renderAll()">
+    </div>
+    <span class="countdown" id="countdown"></span>
+    <span class="badge badge-scanning" id="status-badge">
+      <span class="spinner"></span>Scanning…
+    </span>
+    <button id="refresh" onclick="fetchData()">↻ Refresh</button>
+  </div>
+</header>
+
+<div id="live-edges-card" class="card">
+  <div class="card-header exec-card-header" onclick="toggleCard('live-edges-body')">⚡ Live Edges ≥5% &nbsp;<span style="font-size:10px;color:var(--muted);font-weight:400;">Pinnacle fair value · DK+FD confirm · scan every 2 min · 3%+ tracked in paper portfolio</span> <span class="card-toggle" id="live-edges-body-toggle">▾</span></div>
+  <div id="live-edges-body" class="card-body"><div class="empty">No edges ≥5% right now. Scanning every 2 min.</div></div>
+</div>
+
+<div id="top10-card" class="card">
+  <div class="card-header mlb" onclick="toggleCard('top10-body')">📋 All Picks ≥3% &nbsp;<span style="font-size:10px;color:var(--muted);font-weight:400;">MLB · NBA · spreads · totals · moneylines · sorted by edge strength</span> <span class="card-toggle" id="top10-body-toggle">▾</span></div>
+  <div id="top10-body" class="card-body"><div class="empty">No edges ≥3% right now. Scanning every 2 min.</div></div>
+</div>
+
+<div id="mlb-card" class="card">
+  <div class="card-header mlb" onclick="toggleCard('mlb-body')">⚾ MLB &nbsp;<span style="font-size:10px;color:var(--muted);font-weight:400;">spreads · totals · moneylines · sorted by edge strength</span> <span class="card-toggle" id="mlb-body-toggle">▾</span></div>
+  <div id="mlb-body" class="card-body"><div class="empty">No MLB edges ≥3% right now.</div></div>
+</div>
+
+<div id="nba-card" class="card">
+  <div class="card-header" style="border-left:3px solid #58a6ff;" onclick="toggleCard('nba-body')">🏀 NBA &nbsp;<span style="font-size:10px;color:var(--muted);font-weight:400;">spreads · totals · moneylines · sorted by edge strength</span> <span class="card-toggle" id="nba-body-toggle">▾</span></div>
+  <div id="nba-body" class="card-body"><div class="empty">No NBA edges ≥3% right now.</div></div>
+</div>
+
+
+<div id="paper-card" class="card">
+  <div class="card-header" onclick="toggleCard('paper-body')" style="border-left:3px solid #3fb950;">📊 Paper Portfolio — 0.25 Kelly · All 3%+ Edges · $1,000 Starting Balance <span class="card-toggle" id="paper-body-toggle">▾</span></div>
+  <div id="paper-body" class="card-body"><div class="empty"><span class="spinner"></span>Loading portfolio…</div></div>
+</div>
+
+<div id="perf-card" class="card">
+  <div class="card-header" onclick="toggleCard('perf-body-wrap')">Performance — Model Accuracy <span class="card-toggle" id="perf-body-wrap-toggle">▾</span></div>
+  <div id="perf-body-wrap" class="card-body">
+    <div style="display:flex;align-items:center;gap:10px;padding:6px 0 12px 0;flex-wrap:wrap;">
+      <label style="font-size:12px;color:var(--muted);white-space:nowrap;">Filter from:</label>
+      <input type="date" id="perf-since" style="background:var(--bg2);color:var(--fg);border:1px solid var(--border);border-radius:4px;padding:3px 8px;font-size:12px;" oninput="fetchPerformance()">
+      <button onclick="document.getElementById('perf-since').value='';fetchPerformance();"
+        style="font-size:11px;padding:3px 10px;background:var(--bg2);color:var(--muted);border:1px solid var(--border);border-radius:4px;cursor:pointer;">
+        All time
+      </button>
+      <span id="perf-filter-label" style="font-size:11px;color:var(--muted);"></span>
+    </div>
+    <div id="perf-stats"></div>
+    <div id="perf-body"><div class="empty">No resolved bets yet.</div></div>
+  </div>
+</div>
+
+<div id="history-card" class="card">
+  <div class="card-header" onclick="toggleCard('history-body')">Edge History <span class="card-toggle" id="history-body-toggle">▾</span></div>
+  <div id="history-body" class="card-body" style="padding:12px;">
+    <div class="chart-empty">Waiting for first scan…</div>
+  </div>
+</div>
+
+<div id="mlb-spread-card" class="card">
+  <div class="card-header mlb" onclick="toggleCard('mlb-spread-body')">⚾ MLB — Run Line <span class="card-toggle" id="mlb-spread-body-toggle">▾</span></div>
+  <div id="mlb-spread-body" class="card-body card-mlb-spread"><div class="empty">No run line edges found. Scanning every 2 min.</div></div>
+</div>
+
+<div id="mlb-total-card" class="card">
+  <div class="card-header mlb" onclick="toggleCard('mlb-total-body')">⚾ MLB — Totals <span class="card-toggle" id="mlb-total-body-toggle">▾</span></div>
+  <div id="mlb-total-body" class="card-body card-mlb-total"><div class="empty">No totals edges found. Scanning every 2 min.</div></div>
+</div>
+
+
+
+<div id="mybets-card" class="card">
+  <div class="card-header" style="border-left:3px solid #f0c000;" onclick="toggleCard('mybets-body')">💰 My Bets — Real P&amp;L <span class="card-toggle" id="mybets-body-toggle">▾</span></div>
+  <div id="mybets-body" class="card-body">
+    <div id="mybets-stats" style="padding:8px 10px;border-bottom:1px solid var(--border);display:flex;gap:12px;flex-wrap:wrap;align-items:center;">
+      <span style="color:var(--muted);font-size:11px;">Add a bet you placed on Kalshi to track real P&amp;L.</span>
+    </div>
+    <div style="padding:8px 12px;border-bottom:1px solid var(--border);display:flex;gap:8px;flex-wrap:wrap;align-items:flex-end;">
+      <div style="display:flex;flex-direction:column;gap:3px;">
+        <label style="font-size:10px;color:var(--muted);text-transform:uppercase;">Market ticker</label>
+        <input id="mb-ticker" type="text" placeholder="KXMLBTOTAL-26APR05..." style="background:var(--surface);border:1px solid var(--border);border-radius:5px;color:var(--text);font-size:12px;padding:4px 8px;width:220px;">
+      </div>
+      <div style="display:flex;flex-direction:column;gap:3px;">
+        <label style="font-size:10px;color:var(--muted);text-transform:uppercase;">Side</label>
+        <select id="mb-side" style="background:var(--surface);border:1px solid var(--border);border-radius:5px;color:var(--text);font-size:12px;padding:4px 8px;">
+          <option value="YES">YES</option>
+          <option value="NO">NO</option>
+        </select>
+      </div>
+      <div style="display:flex;flex-direction:column;gap:3px;">
+        <label style="font-size:10px;color:var(--muted);text-transform:uppercase;">Price paid (¢)</label>
+        <input id="mb-price" type="number" min="1" max="99" placeholder="79" style="background:var(--surface);border:1px solid var(--border);border-radius:5px;color:var(--text);font-size:12px;padding:4px 8px;width:80px;">
+      </div>
+      <div style="display:flex;flex-direction:column;gap:3px;">
+        <label style="font-size:10px;color:var(--muted);text-transform:uppercase;">Amount ($)</label>
+        <input id="mb-amount" type="number" min="1" placeholder="25" style="background:var(--surface);border:1px solid var(--border);border-radius:5px;color:var(--text);font-size:12px;padding:4px 8px;width:80px;">
+      </div>
+      <button onclick="addMyBet()" style="background:#21262d;border:1px solid var(--border);border-radius:5px;color:var(--text);font-size:12px;padding:5px 14px;cursor:pointer;height:30px;">+ Track Bet</button>
+    </div>
+    <div id="mybets-table"><div class="empty">No bets tracked yet — add one above.</div></div>
+  </div>
+</div>
+
+<script src="/static/chart.umd.min.js"></script>
+<script>
+const REFRESH_MS = """ + str(REFRESH_SECONDS * 1000) + """;
+let nextRefresh = Date.now() + REFRESH_MS;
+let lastEdges      = [];   // MLB spreads/totals
+let prevEdgeKeys = new Set();
+let historyChart = null;
+let clvMultipliers = {};   // {"prop": 0.5, "spread": 1.0, …} — set by fetchPerformance()
+
+let _slowRefreshCounter = 0;  // perf+history refresh every 3 scan cycles
+
+// Safe innerHTML — only writes if content changed (prevents scroll-jump / flicker)
+function _setHTML(id, html) {
+  const el = document.getElementById(id);
+  if (!el) return;
+  if (el.innerHTML === html) return;
+  el.innerHTML = html;
+}
+
+function toggleCard(bodyId) {
+  const el = document.getElementById(bodyId);
+  const tog = document.getElementById(bodyId + '-toggle');
+  if (!el) return;
+  el.classList.toggle('collapsed');
+  if (tog) tog.textContent = el.classList.contains('collapsed') ? '▸' : '▾';
+}
+
+function fmtDate(iso) {
+  const d = new Date(iso);
+  return d.toLocaleString([], {month:'short', day:'numeric', hour:'2-digit', minute:'2-digit'});
+}
+
+function edgeKey(e) { return e.matchup + '|' + e.title + '|' + e.side; }
+
+// Edge color by strength: orange (weakest) → yellow → green → bright green (strongest)
+function edgeColor(pct) {
+  if (pct >= 12) return '#00e676';   // bright green  — 12%+
+  if (pct >= 8)  return '#3fb950';   // green         — 8–12%
+  if (pct >= 5)  return '#d29922';   // yellow        — 5–8%
+  return '#ff8c42';                  // orange        — 3–5%
+}
+
+function edgeClass(pct) { return ''; }  // kept for compatibility, color now inline
+
+// Safely escape a string for use inside an HTML attribute value (data-*)
+function hesc(s) { return (s||'').replace(/&/g,'&amp;').replace(/"/g,'&quot;').replace(/</g,'&lt;'); }
+
+// Track button that reads data-attributes — avoids all JS string escaping issues
+function trackBetFromBtn(btn) {
+  trackBet(btn.dataset.ticker, btn.dataset.title, btn.dataset.matchup,
+           btn.dataset.side, btn.dataset.mkttype);
+}
+
+function trackBtn(e) {
+  return '<button class="mb-track-btn" '
+    + 'data-ticker="' + hesc(e.ticker)  + '" '
+    + 'data-title="'  + hesc(e.title)   + '" '
+    + 'data-matchup="'+ hesc(e.matchup) + '" '
+    + 'data-side="'   + hesc(e.side)    + '" '
+    + 'data-mkttype="'+ hesc(e.mkt_type||'') + '" '
+    + 'onclick="trackBetFromBtn(this)">Track</button>';
+}
+
+async function fetchHistory() {
+  try {
+    const r = await fetch('/api/history');
+    const data = await r.json();
+    renderHistoryChart(data);
+  } catch (e) { console.error('history fetch failed', e); }
+}
+
+function renderHistoryChart(data) {
+  const el = document.getElementById('history-body');
+  if (!data.length) {
+    el.innerHTML = '<div class="chart-empty">No history yet — data appears after first scan.</div>';
+    return;
+  }
+
+  // Ensure canvas exists
+  if (!document.getElementById('history-canvas')) {
+    el.innerHTML = '<canvas id="history-canvas"></canvas>';
+  }
+
+  const labels   = data.map(d => new Date(d.ts).toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'}));
+  const counts   = data.map(d => d.edge_count);
+  const topEdges = data.map(d => d.top_edge);
+
+  const ctx = document.getElementById('history-canvas').getContext('2d');
+
+  if (historyChart) {
+    historyChart.data.labels         = labels;
+    historyChart.data.datasets[0].data = counts;
+    historyChart.data.datasets[1].data = topEdges;
+    historyChart.update('none');
+    return;
+  }
+
+  historyChart = new Chart(ctx, {
+    type: 'line',
+    data: {
+      labels,
+      datasets: [
+        {
+          label: 'Edge count',
+          data: counts,
+          borderColor: '#3fb950',
+          backgroundColor: 'rgba(63,185,80,0.08)',
+          fill: true,
+          tension: 0.3,
+          pointRadius: 3,
+          yAxisID: 'yCount',
+        },
+        {
+          label: 'Top edge (%)',
+          data: topEdges,
+          borderColor: '#58a6ff',
+          backgroundColor: 'rgba(88,166,255,0.06)',
+          fill: false,
+          tension: 0.3,
+          pointRadius: 3,
+          yAxisID: 'yEdge',
+        },
+      ],
+    },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      interaction: { mode: 'index', intersect: false },
+      plugins: {
+        legend: { labels: { color: '#8b949e', font: { size: 12 } } },
+        tooltip: { backgroundColor: '#161b22', borderColor: '#30363d', borderWidth: 1,
+                   titleColor: '#e6edf3', bodyColor: '#8b949e' },
+      },
+      scales: {
+        x: {
+          ticks: { color: '#8b949e', maxTicksLimit: 10, maxRotation: 0 },
+          grid:  { color: '#21262d' },
+        },
+        yCount: {
+          type: 'linear', position: 'left',
+          title: { display: true, text: 'Edges', color: '#3fb950', font: { size: 11 } },
+          ticks: { color: '#3fb950', stepSize: 1 },
+          grid:  { color: '#21262d' },
+          min: 0,
+        },
+        yEdge: {
+          type: 'linear', position: 'right',
+          title: { display: true, text: 'Top edge %', color: '#58a6ff', font: { size: 11 } },
+          ticks: { color: '#58a6ff', callback: v => v + '%' },
+          grid:  { drawOnChartArea: false },
+          min: 0,
+        },
+      },
+    },
+  });
+}
+
+function pct(v) { return v.toFixed(1) + '%'; }
+
+/** Convert a decimal (no-vig) probability to an American odds string.
+ *  e.g. probToAmerican(0.60) → "-150"   probToAmerican(0.40) → "+150"
+ *  Returns "—" for null / out-of-range inputs.
+ */
+function probToAmerican(p) {
+  if (p == null || p <= 0 || p >= 1) return '—';
+  if (p >= 0.5) {
+    return '-' + Math.round(p / (1 - p) * 100);
+  } else {
+    return '+' + Math.round((1 - p) / p * 100);
+  }
+}
+
+/** Format a Kalshi decimal price (0–1) as American odds. */
+function kalshiToAmerican(k) { return probToAmerican(k); }
+
+function getBankroll() {
+  const val = parseFloat(document.getElementById('bankroll').value);
+  return isNaN(val) || val <= 0 ? 1000 : val;
+}
+
+// 0.25 Fractional Kelly for a binary prediction market.
+//   full Kelly   = (fair − kalshi) / (1 − kalshi)
+//   adjusted     = full × 0.25 × clvMultiplier(mktType)
+//   hard cap     = 5% of bankroll per bet
+// mktType is optional; if provided and that type has a CLV penalty, stake is halved.
+function kellyBet(fair, kalshi, bankroll, mktType) {
+  if (!bankroll || fair == null || kalshi == null) return null;
+  const edge = fair - kalshi;
+  if (edge <= 0 || kalshi <= 0 || kalshi >= 1) return 0;
+  const fullKelly   = edge / (1 - kalshi);
+  const clvMult     = (mktType && clvMultipliers[mktType] != null) ? clvMultipliers[mktType] : 1.0;
+  const adjFraction = Math.min(fullKelly * 0.25 * clvMult, 0.05);   // 5% hard cap
+  return adjFraction * bankroll;
+}
+
+// ESPN team logo CDN map
+const LOGOS = {
+  // MLB
+  'Arizona Diamondbacks':    'https://a.espncdn.com/i/teamlogos/mlb/500/ari.png',
+  'Atlanta Braves':          'https://a.espncdn.com/i/teamlogos/mlb/500/atl.png',
+  'Baltimore Orioles':       'https://a.espncdn.com/i/teamlogos/mlb/500/bal.png',
+  'Boston Red Sox':          'https://a.espncdn.com/i/teamlogos/mlb/500/bos.png',
+  'Chicago Cubs':            'https://a.espncdn.com/i/teamlogos/mlb/500/chc.png',
+  'Chicago White Sox':       'https://a.espncdn.com/i/teamlogos/mlb/500/chw.png',
+  'Cincinnati Reds':         'https://a.espncdn.com/i/teamlogos/mlb/500/cin.png',
+  'Cleveland Guardians':     'https://a.espncdn.com/i/teamlogos/mlb/500/cle.png',
+  'Colorado Rockies':        'https://a.espncdn.com/i/teamlogos/mlb/500/col.png',
+  'Detroit Tigers':          'https://a.espncdn.com/i/teamlogos/mlb/500/det.png',
+  'Houston Astros':          'https://a.espncdn.com/i/teamlogos/mlb/500/hou.png',
+  'Kansas City Royals':      'https://a.espncdn.com/i/teamlogos/mlb/500/kc.png',
+  'Los Angeles Angels':      'https://a.espncdn.com/i/teamlogos/mlb/500/laa.png',
+  'Los Angeles Dodgers':     'https://a.espncdn.com/i/teamlogos/mlb/500/lad.png',
+  'Miami Marlins':           'https://a.espncdn.com/i/teamlogos/mlb/500/mia.png',
+  'Milwaukee Brewers':       'https://a.espncdn.com/i/teamlogos/mlb/500/mil.png',
+  'Minnesota Twins':         'https://a.espncdn.com/i/teamlogos/mlb/500/min.png',
+  'New York Mets':           'https://a.espncdn.com/i/teamlogos/mlb/500/nym.png',
+  'New York Yankees':        'https://a.espncdn.com/i/teamlogos/mlb/500/nyy.png',
+  'Athletics':               'https://a.espncdn.com/i/teamlogos/mlb/500/oak.png',
+  'Oakland Athletics':       'https://a.espncdn.com/i/teamlogos/mlb/500/oak.png',
+  "A's":                     'https://a.espncdn.com/i/teamlogos/mlb/500/oak.png',
+  'Philadelphia Phillies':   'https://a.espncdn.com/i/teamlogos/mlb/500/phi.png',
+  'Pittsburgh Pirates':      'https://a.espncdn.com/i/teamlogos/mlb/500/pit.png',
+  'San Diego Padres':        'https://a.espncdn.com/i/teamlogos/mlb/500/sd.png',
+  'San Francisco Giants':    'https://a.espncdn.com/i/teamlogos/mlb/500/sf.png',
+  'Seattle Mariners':        'https://a.espncdn.com/i/teamlogos/mlb/500/sea.png',
+  'St. Louis Cardinals':     'https://a.espncdn.com/i/teamlogos/mlb/500/stl.png',
+  'Tampa Bay Rays':          'https://a.espncdn.com/i/teamlogos/mlb/500/tb.png',
+  'Texas Rangers':           'https://a.espncdn.com/i/teamlogos/mlb/500/tex.png',
+  'Toronto Blue Jays':       'https://a.espncdn.com/i/teamlogos/mlb/500/tor.png',
+  'Washington Nationals':    'https://a.espncdn.com/i/teamlogos/mlb/500/wsh.png',
+  // NBA
+  'Atlanta Hawks':           'https://a.espncdn.com/i/teamlogos/nba/500/atl.png',
+  'Boston Celtics':          'https://a.espncdn.com/i/teamlogos/nba/500/bos.png',
+  'Brooklyn Nets':           'https://a.espncdn.com/i/teamlogos/nba/500/bkn.png',
+  'Charlotte Hornets':       'https://a.espncdn.com/i/teamlogos/nba/500/cha.png',
+  'Chicago Bulls':           'https://a.espncdn.com/i/teamlogos/nba/500/chi.png',
+  'Cleveland Cavaliers':     'https://a.espncdn.com/i/teamlogos/nba/500/cle.png',
+  'Dallas Mavericks':        'https://a.espncdn.com/i/teamlogos/nba/500/dal.png',
+  'Denver Nuggets':          'https://a.espncdn.com/i/teamlogos/nba/500/den.png',
+  'Detroit Pistons':         'https://a.espncdn.com/i/teamlogos/nba/500/det.png',
+  'Golden State Warriors':   'https://a.espncdn.com/i/teamlogos/nba/500/gs.png',
+  'Houston Rockets':         'https://a.espncdn.com/i/teamlogos/nba/500/hou.png',
+  'Indiana Pacers':          'https://a.espncdn.com/i/teamlogos/nba/500/ind.png',
+  'Los Angeles Clippers':    'https://a.espncdn.com/i/teamlogos/nba/500/lac.png',
+  'Los Angeles Lakers':      'https://a.espncdn.com/i/teamlogos/nba/500/lal.png',
+  'Memphis Grizzlies':       'https://a.espncdn.com/i/teamlogos/nba/500/mem.png',
+  'Miami Heat':              'https://a.espncdn.com/i/teamlogos/nba/500/mia.png',
+  'Milwaukee Bucks':         'https://a.espncdn.com/i/teamlogos/nba/500/mil.png',
+  'Minnesota Timberwolves':  'https://a.espncdn.com/i/teamlogos/nba/500/min.png',
+  'New Orleans Pelicans':    'https://a.espncdn.com/i/teamlogos/nba/500/no.png',
+  'New York Knicks':         'https://a.espncdn.com/i/teamlogos/nba/500/ny.png',
+  'Oklahoma City Thunder':   'https://a.espncdn.com/i/teamlogos/nba/500/okc.png',
+  'Orlando Magic':           'https://a.espncdn.com/i/teamlogos/nba/500/orl.png',
+  'Philadelphia 76ers':      'https://a.espncdn.com/i/teamlogos/nba/500/phi.png',
+  'Phoenix Suns':            'https://a.espncdn.com/i/teamlogos/nba/500/phx.png',
+  'Portland Trail Blazers':  'https://a.espncdn.com/i/teamlogos/nba/500/por.png',
+  'Sacramento Kings':        'https://a.espncdn.com/i/teamlogos/nba/500/sac.png',
+  'San Antonio Spurs':       'https://a.espncdn.com/i/teamlogos/nba/500/sa.png',
+  'Toronto Raptors':         'https://a.espncdn.com/i/teamlogos/nba/500/tor.png',
+  'Utah Jazz':               'https://a.espncdn.com/i/teamlogos/nba/500/utah.png',
+  'Washington Wizards':      'https://a.espncdn.com/i/teamlogos/nba/500/wsh.png',
+};
+
+function teamLogo(name) {
+  const url = LOGOS[name];
+  return url ? `<img class="team-logo" src="${url}" alt="" onerror="this.style.display='none'">` : '';
+}
+
+function matchupHtml(matchup) {
+  const parts = matchup.split(' @ ');
+  if (parts.length !== 2) return matchup;
+  const [away, home] = parts;
+  return `${teamLogo(away)}<span>${away}</span> <span style="color:var(--muted);font-weight:400;">@</span> ${teamLogo(home)}<span>${home}</span>`;
+}
+
+function pinLineLabel(e) {
+  if (e.pin_line == null) return '—';
+  if (e.mkt_type === 'spread') {
+    const v = e.pin_line;
+    return 'Fav ' + (v > 0 ? '+' : '') + v;
+  }
+  return 'O/U ' + e.pin_line;
+}
+
+function renderTable(edges) {
+  if (!edges.length) return '<div class="empty">No edges ≥ 3% found.</div>';
+  const bankroll = getBankroll();
+
+  // Flat list sorted by edge descending — best edge always at top
+  const sorted = [...edges].sort((a, b) => b.edge_pct - a.edge_pct);
+
+  let rows = '';
+  for (const e of sorted) {
+    const bet = kellyBet(e.fair, e.kalshi, bankroll, e.mkt_type);
+    const kellyCell = `<td class="num kelly-val">$${bet != null ? bet.toFixed(0) : '—'}</td>`;
+    const isNew = !prevEdgeKeys.has(edgeKey(e));
+    const newBadge = isNew ? '<span class="badge-new">NEW</span>' : '';
+    const staleBadge = e.stale ? `<span class="badge-stale">STALE</span>` : '';
+    const driftTxt = e.drift_pct != null && e.drift_pct !== 0
+      ? `<span class="badge-drift">(${e.drift_pct > 0 ? '+' : ''}${e.drift_pct}%)</span>` : '';
+    rows += `
+    <tr>
+      <td class="matchup-inline">${matchupHtml(e.matchup)}</td>
+      <td class="prop-col">${e.title}${newBadge}${staleBadge}${driftTxt}${trackBtn(e)}</td>
+      <td class="num pin-line">${pinLineLabel(e)}</td>
+      <td class="side-${e.side.toLowerCase()}">${e.side}</td>
+      <td class="num">${pct(e.kalshi_pct)}</td>
+      <td class="num">${pct(e.fair_pct)}</td>
+      <td class="num" style="color:${edgeColor(e.edge_pct)};font-weight:700;">+${pct(e.edge_pct)}</td>
+      ${kellyCell}
+    </tr>`;
+  }
+
+  return `<table>
+    <thead><tr>
+      <th>Matchup</th><th>Prop</th><th class="num">Pinnacle</th><th>Side</th>
+      <th class="num">Kalshi</th><th class="num">Fair</th><th class="num">Edge</th>
+      <th class="num">Kelly Bet</th>
+    </tr></thead>
+    <tbody>${rows}</tbody>
+  </table>`;
+}
+
+function sportOf(e) {
+  // Infer sport from matchup teams or ticker prefix
+  const t = (e.ticker || '').toUpperCase();
+  if (t.startsWith('KXNBA') || t.startsWith('KXNBA')) return 'nba';
+  if (t.startsWith('KXMLB')) return 'mlb';
+  return 'mlb';
+}
+
+function renderAll() {
+  const mlbEdges = lastEdges.filter(e => sportOf(e) === 'mlb');
+  const nbaEdges = lastEdges.filter(e => sportOf(e) === 'nba');
+  _setHTML('mlb-body', renderTable(mlbEdges));
+  _setHTML('nba-body', renderTable(nbaEdges));
+
+  // Update tab title
+  const count = lastEdges.length;
+  document.title = count > 0 ? `(${count}) Kalshi EV Scanner` : 'Kalshi EV Scanner';
+  // Re-render execution table so Kelly % updates when bankroll changes
+  renderLiveEdges();
+}
+
+let autoRefreshTimer = null;
+
+function scheduleRefresh(ms) {
+  if (autoRefreshTimer) clearTimeout(autoRefreshTimer);
+  nextRefresh = Date.now() + ms;
+  autoRefreshTimer = setTimeout(fetchData, ms);
+}
+
+async function fetchData() {
+  try {
+    const r = await fetch('/api/scan');
+    const d = await r.json();
+
+    const badge = document.getElementById('status-badge');
+    if (d.scanning) {
+      badge.className = 'badge badge-scanning';
+      badge.innerHTML = '<span class="spinner"></span>Scanning…';
+      // Poll every 3s while scan is running so results appear immediately
+      scheduleRefresh(3000);
+    } else if (d.error) {
+      badge.className = 'badge badge-error';
+      badge.textContent = 'Error: ' + d.error.slice(0, 60);
+      scheduleRefresh(REFRESH_MS);
+    } else {
+      badge.className = 'badge badge-ok';
+      badge.textContent = d.edges.length + ' edge' + (d.edges.length !== 1 ? 's' : '');
+      scheduleRefresh(REFRESH_MS);
+    }
+
+    if (d.last_scan) {
+      document.getElementById('last-scan').textContent = fmtDate(d.last_scan);
+    }
+
+    // While scanning: show spinner only if we have no data yet
+    if (d.scanning) {
+      if (!lastEdges.length) {
+        const scanning = '<div class="empty">Scanning...</div>';
+        ['mlb-body','nba-body']
+          .forEach(id => _setHTML(id, scanning));
+      }
+    } else {
+      // Always update data and re-render
+      prevEdgeKeys = new Set(lastEdges.map(edgeKey));
+      lastEdges = d.edges || [];
+      renderAll();
+      renderTop10();
+      renderLiveEdges();
+
+      // History + perf: first load always, then every 3 cycles to save work
+      _slowRefreshCounter++;
+      if (_slowRefreshCounter <= 1 || _slowRefreshCounter % 3 === 0) {
+        fetchHistory();
+        fetchPerformance();
+      }
+    }
+
+  } catch (err) {
+    console.error('fetchData error:', err);
+    scheduleRefresh(5000);
+  }
+}
+
+function updateCountdown() {
+  const secs = Math.max(0, Math.round((nextRefresh - Date.now()) / 1000));
+  const el = document.getElementById('countdown');
+  el.textContent = secs > 5 ? 'Next refresh in ' + secs + 's' : '';
+}
+
+// ── Best 10 — All Edges (MLB + NBA spreads/totals) ───────────────────────────
+function confStars(c, booksUsed) {
+  // Visual confidence indicator.
+  // ★★★ = Triple-book confirmation: all 3 books (PIN+DK+FD) within ≤2pp (c ≥ 0.80)
+  // ★★  = Dual-book agreement OR tight single-book (c ≥ 0.50)
+  // ★   = High divergence or only 1 book
+  if (c == null) return '<span style="color:var(--muted)" title="No confidence data">?</span>';
+  const n = (booksUsed && booksUsed.length) ? booksUsed.length : 0;
+  if (c >= 0.80 && n >= 3) {
+    return `<span style="color:#3fb950" title="★★★ Triple-book confirmation — PIN+DK+FD all within 2pp">★★★</span>`;
+  }
+  if (c >= 0.50) {
+    const tip = n >= 3 ? `3 books but spread >2pp (${Math.round((1-c)*10)}pp)` : `${n} book(s) — moderate agreement`;
+    return `<span style="color:#ffe082" title="★★ ${tip}">★★</span>`;
+  }
+  return `<span style="color:#f85149" title="★ High divergence (${Math.round((1-c)*10)}pp spread) — possible Sharp-Led Move">★</span>`;
+}
+
+// ── Live Edges ≥5% ───────────────────────────────────────────────────────────
+function renderLiveEdges() {
+  // Show ≥5% only — clean, high-confidence display.
+  // Edges from 3–5% are tracked silently in the paper portfolio for data.
+  const qualified = lastEdges
+    .filter(e => e.edge_pct >= 5)
+    .sort((a, b) => {
+      // Sharp-led edges bubble to the top within same edge tier
+      if (b.sharp_led !== a.sharp_led) return b.sharp_led ? 1 : -1;
+      return b.edge_pct - a.edge_pct;
+    });
+  const bankroll  = getBankroll();
+
+  if (!qualified.length) {
+    _setHTML('live-edges-body', '<div class="empty">No edges ≥5% right now. 3–5% edges are tracked silently in the paper portfolio. Scanning every 2 min.</div>');
+    return;
+  }
+
+  function fmtAmer(n) { return n == null ? '—' : n > 0 ? `+${n}` : `${n}`; }
+
+  const rows = qualified.map(e => {
+    const consReason  = e.consensus_reason || '';
+    const confBooks   = consReason.replace('Confirmed by ','').replace('Pinnacle','PIN').replace('DraftKings','DK').replace('FanDuel','FD');
+    const sharpBadge  = e.sharp_led
+      ? `<span class="badge-sharp" title="PIN moved vs DK/FD">⚡ SHARP</span>` : '';
+    const ageMins     = e.age_min != null ? e.age_min : 0;
+    const ageBadge    = ageMins < 5 && ageMins > 0
+      ? `<span style="font-size:9px;color:#3fb950;margin-left:4px;font-weight:600;">●NEW</span>`
+      : ageMins >= 10 ? `<span style="font-size:9px;color:#e3a53a;margin-left:4px;">⚠${Math.round(ageMins)}m</span>` : '';
+    const fairAmer    = e.fair != null ? probToAmerican(e.fair) : '—';
+    const kalshiAmer  = fmtAmer(kalshiToAmerican(e.kalshi));
+    const bet         = kellyBet(e.fair, e.kalshi, bankroll, e.mkt_type);
+    const kellyDollars = bet != null ? `$${bet.toFixed(0)}` : '—';
+    const clvPenalty  = clvMultipliers[e.mkt_type] === 0.5;
+    const pclv        = e.projected_clv_pct;
+    const pclvTxt     = pclv != null
+      ? `<span class="${pclv>0?'clv-pos':'clv-neg'}">${pclv>=0?'+':''}${pclv.toFixed(1)}pp</span>`
+      : '<span class="clv-neu">—</span>';
+    const isEquivLive  = e.fair_source === 'equiv';
+    const fairAmерCell = isEquivLive
+      ? `<span style="color:#e3a53a;" title="⚠ Pinnacle does not offer this exact line. Fair value extrapolated from nearest Pinnacle line using equivalence rule — verify this threshold directly on Pinnacle before betting.">${fairAmer} <span style="font-size:9px;font-weight:700;">~LINE</span></span>`
+      : `<span style="color:#58a6ff;" title="✓ Pinnacle has this exact line">${fairAmer}</span>`;
+
+    return `<tr>
+      <td>${matchupHtml(e.matchup)}</td>
+      <td class="prop-col">${e.title}${sharpBadge}${ageBadge}${trackBtn(e)}</td>
+      <td class="side-${e.side.toLowerCase()}">${e.side}</td>
+      <td class="num" style="color:${edgeColor(e.edge_pct)};font-weight:700;">+${pct(e.edge_pct)}</td>
+      <td class="num">${fairAmерCell}</td>
+      <td class="num" style="color:#e3a53a;">${kalshiAmer}</td>
+      <td class="num">${pclvTxt}</td>
+      <td class="num kelly-val">${kellyDollars}${clvPenalty ? ' <span style="color:#e3a53a;font-size:9px;">½</span>' : ''}</td>
+      <td style="font-size:10px;color:var(--muted);">${confBooks}</td>
+    </tr>`;
+  }).join('');
+
+  _setHTML('live-edges-body', `
+    <table>
+      <thead><tr>
+        <th>Matchup</th><th>Bet</th><th>Side</th>
+        <th class="num">Adj. EV</th>
+        <th class="num">Fair (PIN)</th>
+        <th class="num">Kalshi</th>
+        <th class="num">Proj. CLV</th>
+        <th class="num">Kelly $</th>
+        <th>Confirmed By</th>
+      </tr></thead>
+      <tbody>${rows}</tbody>
+    </table>`);
+}
+
+function renderTop10() {
+  // All edges ≥3% — complete pick list. Sharp-led and fresh edges sort higher.
+  function _edgeSortScore(e) {
+    const freshMult = (e.age_min != null && e.age_min < 5) ? 1.2 : 1.0;
+    const sharpMult = e.sharp_led ? 1.3 : 1.0;
+    return sharpMult * freshMult * (e.confidence != null ? e.confidence : 0.5) * e.edge_pct;
+  }
+  const combined = [...lastEdges]
+    .sort((a, b) => _edgeSortScore(b) - _edgeSortScore(a));
+
+  if (!combined.length) {
+    _setHTML('top10-body', '<div class="empty">No edges ≥3% right now. Scanning every 2 min.</div>');
+    return;
+  }
+  const bankroll = getBankroll();
+  let rows = combined.map((e, i) => {
+    const isNew  = !prevEdgeKeys.has(edgeKey(e));
+    const newBadge = isNew ? '<span class="badge-new">NEW</span>' : '';
+    const bet  = kellyBet(e.fair, e.kalshi, bankroll, e.mkt_type);
+    const clvPenalty = clvMultipliers[e.mkt_type] === 0.5;
+    const kellyCell = bet != null
+      ? `$${bet.toFixed(0)}${clvPenalty ? ' <span style="font-size:9px;color:#e3a53a;" title="CLV penalty active: 0.5× stake">½</span>' : ''}`
+      : '—';
+    const isProp = e.mkt_type === 'prop';
+    const _sp = sportOf(e);
+    const sportColors = { mlb: ['#1a2d1a','#3fb950'], nba: ['#1a1f3a','#58a6ff'] };
+    const [sBg, sFg] = sportColors[_sp] || sportColors.mlb;
+    const sportLabel = _sp.toUpperCase();
+    const typeTag = isProp
+      ? `<span style="font-size:9px;background:#2d1f4e;color:#a371f7;padding:1px 4px;border-radius:3px;margin-right:4px;">PROP</span>`
+      : `<span style="font-size:9px;background:${sBg};color:${sFg};padding:1px 4px;border-radius:3px;margin-right:4px;">${sportLabel}</span>`;
+    const unvalidatedBadge = isProp ? '<span class="badge-unvalidated">⚠ UNVALIDATED</span>' : '';
+    const booksCell = (e.books_used && e.books_used.length)
+      ? `<span style="font-size:9px;color:var(--muted);">${e.books_used.map(b=>b.replace('draftkings','DK').replace('fanduel','FD').replace('pinnacle','PIN')).join('+')}</span>`
+      : '';
+    // Age / freshness badge
+    const ageMins = e.age_min != null ? e.age_min : 0;
+    // 10–15 min: STALE RISK warning  |  < 5 min: FRESH highlight  |  5–10 min: age label only
+    const ageBadge = ageMins >= 10
+      ? `<span style="display:inline-block;font-size:9px;background:#2d1a00;color:#e3a53a;padding:1px 5px;border-radius:3px;margin-left:5px;vertical-align:middle;" title="Edge is ${Math.round(ageMins)}m old — market may have already corrected">⚠️ STALE RISK</span>`
+      : ageMins >= 5
+        ? `<span style="font-size:9px;color:var(--muted);margin-left:5px;" title="${ageMins.toFixed(0)}m since first seen">⏱ ${Math.round(ageMins)}m</span>`
+        : ageMins > 0
+          ? `<span style="font-size:9px;color:#3fb950;margin-left:5px;font-weight:600;" title="Fresh edge — first seen ${ageMins.toFixed(1)}m ago">● FRESH</span>`
+          : '';
+    // Per-book no-vig odds for top-10 table (same logic as exec table)
+    const pbn10 = e.per_book_novig || {};
+    const bOrder10 = ['pinnacle','draftkings','fanduel'];
+    const bAbbr10  = {pinnacle:'PIN', draftkings:'DK', fanduel:'FD'};
+    const bLines10 = bOrder10.filter(b => pbn10[b]).map(b => {
+      const bd = pbn10[b];
+      const yA = bd.yes_american != null ? (bd.yes_american > 0 ? '+'+bd.yes_american : bd.yes_american) : '—';
+      const nA = bd.no_american  != null ? (bd.no_american  > 0 ? '+'+bd.no_american  : bd.no_american)  : '—';
+      const yP = bd.yes_prob != null ? (bd.yes_prob*100).toFixed(1)+'%' : '?';
+      const nP = bd.no_prob  != null ? (bd.no_prob *100).toFixed(1)+'%' : '?';
+      return `${bAbbr10[b]}: YES ${yA} (${yP})  NO ${nA} (${nP})`;
+    });
+    const tip10 = bLines10.length
+      ? `No-vig per book:\\n${bLines10.join('\\n')}\\nFair value: Pinnacle only`
+      : 'Fair value: Pinnacle only (DK+FD confirm)';
+
+    // Fair-value American odds for the exact Kalshi threshold
+    const fairAmer10  = e.fair != null ? probToAmerican(e.fair) : '—';
+    const isEquiv     = e.fair_source === 'equiv';
+    const equivBadge  = isEquiv
+      ? `<span style="font-size:9px;background:#2d1f00;color:#e3a53a;padding:1px 5px;border-radius:3px;margin-left:4px;border:1px solid #5a3d00;font-weight:700;" title="⚠ Pinnacle does not offer this exact line. Fair value is extrapolated from their nearest line using the equivalence rule — verify this threshold directly on Pinnacle before betting.">~LINE</span>`
+      : '';
+    const tip10full   = e.fair != null
+      ? `Fair value for this exact Kalshi threshold: ${fairAmer10}${isEquiv ? '\\n\\n⚠ EQUIVALENCE RULE: Pinnacle does not have this exact line. Fair value extrapolated from nearest Pinnacle line. Verify on Pinnacle before betting.' : '\\n\\n✓ Pinnacle has this exact line.'}\\n\\n${tip10}`
+      : tip10;
+    const cAmerTxt = fairAmer10 !== '—'
+      ? `<span style="font-weight:700;color:${isEquiv ? '#e3a53a' : '#58a6ff'};" title="${tip10full}">${fairAmer10}</span>${equivBadge}`
+      : `<span style="color:var(--muted)" title="${tip10full}">—</span>`;
+
+    // Kalshi in American odds — price is from last scan, not live
+    const kAmer10 = kalshiToAmerican(e.kalshi);
+    // Compute how many seconds ago the Kalshi price was captured
+    const kPriceTs = e.kalshi_price_ts ? new Date(e.kalshi_price_ts) : null;
+    const kAgeSec  = kPriceTs ? Math.round((Date.now() - kPriceTs.getTime()) / 1000) : null;
+    const kAgeStr  = kAgeSec != null
+      ? (kAgeSec < 60 ? `${kAgeSec}s ago` : `${Math.round(kAgeSec/60)}m ago`)
+      : '';
+    // Stale (>90s) = amber warning; fresh = normal text color
+    const kPriceColor = (kAgeSec != null && kAgeSec > 90) ? '#e3a53a' : 'var(--text)';
+    const kStaleBadge = (kAgeSec != null && kAgeSec > 90)
+      ? `<span style="font-size:8px;color:#e3a53a;margin-left:3px;" title="Price captured ${kAgeStr} — click ✓ Check for live price">⏱ ${kAgeStr}</span>`
+      : (kAgeSec != null ? `<span style="font-size:8px;color:var(--muted);margin-left:3px;">⏱ ${kAgeStr}</span>` : '');
+    const kTip = `Kalshi ask: ${e.kalshi_pct}% (${kAgeStr || 'age unknown'})\n⚠ This price was captured at scan time.\nClick ✓ Check to see the live price.\nTicker: ${e.ticker}`;
+    const kAmerTxt = kAmer10 !== '—'
+      ? `<span style="color:${kPriceColor};" title="${kTip}">${kAmer10}</span>${kStaleBadge}`
+      : '—';
+
+    // Consensus badge for top-10 (same data source as exec table)
+    const consReason10  = e.consensus_reason || '';
+    const confBooksShort = consReason10.replace('Confirmed by ', '').replace('Pinnacle','PIN').replace('DraftKings','DK').replace('FanDuel','FD');
+    const consBadge10 = consReason10
+      ? `<span style="font-size:9px;background:#0d2119;color:#3fb950;padding:1px 4px;border-radius:3px;margin-left:3px;border:1px solid #1a4a2a;" title="${consReason10}">✓ ${confBooksShort}</span>`
+      : '';
+
+    const tickerBadge = `<span style="display:block;font-size:8px;color:var(--muted);margin-top:2px;font-family:monospace;" title="Kalshi ticker — search this on kalshi.com to find the exact market">${e.ticker}</span>`;
+    return `<tr>
+      <td><span class="rank-num">#${i+1}</span></td>
+      <td>${matchupHtml(e.matchup)}</td>
+      <td class="prop-col">${typeTag}${e.title}${newBadge}${unvalidatedBadge}${consBadge10}${ageBadge}${trackBtn(e)}${tickerBadge}</td>
+      <td class="side-${e.side.toLowerCase()}">${e.side}</td>
+      <td class="num" style="color:${edgeColor(e.edge_pct)};font-weight:700;">+${pct(e.edge_pct)}</td>
+      <td class="num" title="${tip10}">${cAmerTxt} <span style="font-size:9px;color:var(--muted);">→</span> ${kAmerTxt}</td>
+      <td class="num">${confStars(e.confidence, e.books_used)} ${booksCell}</td>
+      <td class="num kelly-val">${kellyCell}</td>
+      <td class="num"><button onclick="runValidate('${e.ticker}','${e.side}')" style="background:#0d2119;color:#3fb950;border:1px solid #1a4a2a;border-radius:4px;padding:3px 8px;cursor:pointer;font-size:11px;font-weight:600;">✓ Check</button></td>
+    </tr>`;
+  }).join('');
+  _setHTML('top10-body', `<table>
+    <thead><tr>
+      <th>#</th><th>Matchup / Player</th><th>Prop</th><th>Side</th>
+      <th class="num">Adj. EV</th>
+      <th class="num" title="Model fair value for this exact Kalshi threshold → Kalshi ask price (both in American odds). Hover for per-book breakdown.">Fair → Kalshi</th>
+      <th class="num" title="How closely Pinnacle, DraftKings, and FanDuel agree on fair probability. ★★★ = tight agreement = higher confidence.">Confidence</th>
+      <th class="num">Kelly Bet</th>
+      <th class="num" title="Re-fetch Kalshi + Pinnacle right now and confirm the edge is still valid before betting">Pre-Bet Check</th>
+    </tr></thead>
+    <tbody>${rows}</tbody>
+  </table>`);
+}
+
+// ── Pre-Bet Validator ─────────────────────────────────────────────────────────
+async function runValidate(ticker, side) {
+  const modal = document.getElementById('validate-modal');
+  const body  = document.getElementById('validate-body');
+  modal.style.display = 'flex';
+  body.innerHTML = '<div class="empty"><span class="spinner"></span> Re-fetching Kalshi + Pinnacle…</div>';
+
+  try {
+    const r = await fetch(`/api/validate/${encodeURIComponent(ticker)}?side=${side}`);
+    const d = await r.json();
+
+    if (d.error) {
+      body.innerHTML = `<div style="color:var(--red);padding:16px;">Error: ${d.error}</div>`;
+      return;
+    }
+
+    const validColor  = d.valid ? 'var(--green)' : 'var(--red)';
+    const validIcon   = d.valid ? '✓' : '✗';
+    const validLabel  = d.valid ? 'VALID' : 'DO NOT BET';
+
+    const kMovedColor = d.kalshi_moved == null ? 'var(--muted)'
+      : Math.abs(d.kalshi_moved) < 1 ? 'var(--green)'
+      : d.kalshi_moved > 0 ? 'var(--red)' : 'var(--green)';
+    const fMovedColor = d.fair_moved == null ? 'var(--muted)'
+      : Math.abs(d.fair_moved) < 1 ? 'var(--green)'
+      : d.fair_moved > 0 ? 'var(--green)' : 'var(--red)';
+
+    const row = (label, val, color) =>
+      `<tr><td style="color:var(--muted);padding:6px 12px;font-size:12px;">${label}</td>
+           <td style="color:${color||'var(--text)'};padding:6px 12px;font-size:13px;font-weight:600;">${val}</td></tr>`;
+
+    const sign = v => v == null ? '—' : (v >= 0 ? '+' : '') + v.toFixed(1);
+
+    body.innerHTML = `
+      <div style="padding:20px 24px 8px;">
+        <div style="font-size:22px;font-weight:800;color:${validColor};margin-bottom:8px;">${validIcon} ${validLabel}</div>
+        <div style="font-size:13px;color:var(--muted);margin-bottom:16px;line-height:1.5;">${d.reason}</div>
+        <table style="width:100%;border-collapse:collapse;">
+          ${row('Ticker', ticker + ' ' + side, '#58a6ff')}
+          ${row('Age', d.age_seconds != null ? d.age_seconds + 's ago' : '—', d.staleness_ok ? 'var(--green)' : 'var(--red)')}
+          ${row('Kalshi price', d.kalshi_was + '¢ → ' + (d.kalshi_now != null ? d.kalshi_now + '¢' : '—'), 'var(--text)')}
+          ${row('Kalshi moved', sign(d.kalshi_moved) + 'pp', kMovedColor)}
+          ${row('Fair value', d.fair_was + '¢ → ' + (d.fair_now != null ? d.fair_now + '¢' : '—'), 'var(--text)')}
+          ${row('Fair moved', sign(d.fair_moved) + 'pp', fMovedColor)}
+          ${row('Edge at flag', '+' + d.edge_was + '%', 'var(--muted)')}
+          ${row('Edge now', d.edge_now != null ? (d.edge_now > 0 ? '+' : '') + d.edge_now + '%' : '—',
+            d.edge_now == null ? 'var(--muted)' : d.edge_now >= 3 ? 'var(--green)' : 'var(--red)')}
+        </table>
+      </div>`;
+  } catch(e) {
+    body.innerHTML = `<div style="color:var(--red);padding:16px;">Request failed: ${e}</div>`;
+  }
+}
+
+function closeValidateModal() {
+  document.getElementById('validate-modal').style.display = 'none';
+}
+
+// ── Performance ───────────────────────────────────────────────────────────────
+async function fetchPerformance() {
+  try {
+    const since = (document.getElementById('perf-since') || {}).value || '';
+    const url   = since ? `/api/performance?since=${encodeURIComponent(since)}` : '/api/performance';
+    const r = await fetch(url);
+    const d = await r.json();
+    // update filter label
+    const lbl = document.getElementById('perf-filter-label');
+    if (lbl) {
+      if (since) {
+        const isDefault = since === '2026-04-07';
+        lbl.textContent = isDefault
+          ? `Post-fix only (from ${since}) — clear to see all bets`
+          : `Showing bets from ${since} onward`;
+        lbl.style.color = isDefault ? 'var(--muted)' : 'var(--yellow, #ffe082)';
+      } else {
+        lbl.textContent = 'Showing all bets including pre-fix data';
+        lbl.style.color = 'var(--yellow, #ffe082)';
+      }
+    }
+    // Store CLV multipliers globally so kellyBet() in the live table uses them
+    if (d.clv_multipliers) clvMultipliers = d.clv_multipliers;
+    renderPerformance(d);
+  } catch(e) { console.error('perf fetch failed', e); }
+}
+
+function renderPerformance(d) {
+  function pill(label, value, cls) {
+    return `<div class="stat-pill"><div class="label">${label}</div><div class="value ${cls||''}">${value}</div></div>`;
+  }
+  function na(v, fmt) { return v != null ? fmt(v) : '—'; }
+  function uClass(v) { return v == null ? '' : v > 0 ? 'pnl-pos' : v < 0 ? 'pnl-neg' : 'pnl-neu'; }
+  function sign(v)   { return v >= 0 ? '+' : ''; }
+  function fmt$(v)   { return (v >= 0 ? '+$' : '-$') + Math.abs(v).toFixed(2); }
+
+  const kellyPctClass = uClass(d.total_kelly_pct);
+
+  // Win rate vs Kalshi-implied tells you if the model is beating the market
+  let modelCallout = '—';
+  if (d.win_rate != null && d.avg_kalshi_implied != null) {
+    const diff = (d.win_rate - d.avg_kalshi_implied).toFixed(1);
+    const cls  = diff >= 0 ? 'pnl-pos' : 'pnl-neg';
+    modelCallout = `<span class="${cls}">${sign(diff)}${diff}%</span> vs market`;
+  }
+
+  const bankroll = d.kelly_bankroll || 1000;
+
+  // CLV penalty notice — list any types currently running at 0.5× stake
+  const penalised = Object.entries(d.clv_multipliers || {})
+    .filter(([, v]) => v < 1.0)
+    .map(([k]) => k);
+  const penaltyNote = penalised.length
+    ? `<p style="font-size:11px;color:#e3a53a;padding:4px 0 8px;margin:0;">
+        ⚠️ <strong>CLV penalty active</strong> for: ${penalised.join(', ')}.
+        Stake is 0.5× until avg CLV for these types turns positive (min ${""" + str(_CLV_PENALTY_MIN_SAMPLE) + """} data points required).
+       </p>`
+    : '';
+
+  document.getElementById('perf-stats').innerHTML = `
+    <div class="stat-row">
+      ${pill('Tracked', d.total_bets)}
+      ${pill('Won', d.won, 'pnl-pos')}
+      ${pill('Lost', d.lost, 'pnl-neg')}
+      ${pill('Open', d.open, 'pnl-neu')}
+      ${pill('Win Rate', na(d.win_rate, v => v + '%'))}
+      ${pill('Avg Edge Flagged', na(d.avg_edge, v => '+' + v + '%'))}
+      ${pill('Avg CLV', d.avg_clv != null ? `<span class="${d.avg_clv >= 0 ? 'pnl-pos' : 'pnl-neg'}">${d.avg_clv >= 0 ? '+' : ''}${d.avg_clv}%</span>` : '—')}
+      ${pill('Kelly P&amp;L (% bank)', d.total_kelly_pct != null ? `<span class="${kellyPctClass}">${sign(d.total_kelly_pct)}${d.total_kelly_pct.toFixed(2)}%</span>` : '—')}
+      <div class="stat-pill"><div class="label">Model vs Market</div><div class="value">${modelCallout}</div></div>
+    </div>
+    ${penaltyNote}
+    <p style="font-size:11px;color:var(--muted);padding-bottom:10px;">
+      P&amp;L sized by <strong>0.25 Fractional Kelly</strong>, capped at 5% per bet.
+      CLV-penalised types run at 0.5× until their closing-line value stabilises.
+      Reported as <strong>% of bankroll</strong> — a 5¢ longshot loss shows −0.15%, not −1 unit.
+    </p>`;
+
+  // By-type breakdown table
+  if (d.by_type && d.by_type.length) {
+    const typeRows = d.by_type.map(t => {
+      const insuf  = t.insufficient_data;
+      const isProp = t.label === 'Props';
+      const wrCls  = insuf || t.win_rate == null ? '' : t.win_rate >= 55 ? 'pnl-pos' : t.win_rate < 45 ? 'pnl-neg' : '';
+      const kpct   = t.kelly_pct;
+      const kcls   = kpct == null ? '' : kpct > 0 ? 'pnl-pos' : 'pnl-neg';
+      const wrCell = insuf
+        ? `<span class="insufficient-data" title="Need 20+ settled bets for reliable stats">Insufficient data (${t.sample_size})</span>`
+        : t.win_rate != null ? `<span class="${wrCls}">${t.win_rate}%</span>` : '—';
+      const labelCell = isProp
+        ? `<span style="font-weight:600;">${t.label}</span> <span class="badge-unvalidated">⚠ UNVALIDATED</span>`
+        : `<span style="font-weight:600;">${t.label}</span>`;
+      const kellyCell = kpct != null
+        ? `<span class="${kcls}" title="$${t.kelly_dollars != null ? Math.abs(t.kelly_dollars).toFixed(0) : '?'} on $${bankroll} bank">${sign(kpct)}${kpct.toFixed(2)}%</span>`
+        : '—';
+      return `<tr>
+        <td>${labelCell}</td>
+        <td class="num pnl-pos">${t.won}</td>
+        <td class="num pnl-neg">${t.lost}</td>
+        <td class="num">${wrCell}</td>
+        <td class="num">${kellyCell}</td>
+      </tr>`;
+    }).join('');
+    _setHTML('perf-body', `
+      <table style="margin-bottom:8px;">
+        <thead><tr>
+          <th>Market Type</th><th class="num">Won</th><th class="num">Lost</th>
+          <th class="num">Win Rate</th>
+          <th class="num" title="Kelly P&amp;L as % of bankroll (hover for dollar amount)">Kelly P&amp;L (% bank)</th>
+        </tr></thead>
+        <tbody>${typeRows}</tbody>
+      </table>`);
+  }
+
+  if (!d.bets.length) {
+    document.getElementById('perf-body').innerHTML +=
+      '<div class="empty">No bets tracked yet — edges appear after the next scan.</div>';
+    return;
+  }
+
+  const PERF_PREVIEW = 15;
+  const allPerfBets = d.bets;
+  const showAllPerf = window._perfShowAll || false;
+  const visiblePerf = showAllPerf ? allPerfBets : allPerfBets.slice(0, PERF_PREVIEW);
+
+  let rows = visiblePerf.map(b => {
+    const rClass = b.status === 'won' ? 'result-won' : b.status === 'lost' ? 'result-lost' : 'result-open';
+    const rLabel = b.status === 'won' ? '✓ WON' : b.status === 'lost' ? '✗ LOST' : '…';
+    // Kelly bet size as % of bankroll (dollar amount in tooltip)
+    const kBet   = b.kelly_bet_pct != null
+      ? `<span class="kelly-val" title="$${b.kelly_bet_dollars != null ? b.kelly_bet_dollars.toFixed(0) : '?'} on $${bankroll} bank${b.clv_mult_applied < 1 ? ' — CLV penalty 0.5×' : ''}">${b.kelly_bet_pct.toFixed(2)}%${b.clv_mult_applied < 1 ? ' <span style="color:#e3a53a;font-size:9px;">½</span>' : ''}</span>`
+      : '<span class="kelly-na">—</span>';
+    // P&L as % of bankroll (dollar amount in tooltip)
+    const kPnl   = b.kelly_pnl_pct != null
+      ? `<span class="${uClass(b.kelly_pnl_pct)}" title="${fmt$(b.kelly_pnl_dollars || 0)} on $${bankroll} bank">${sign(b.kelly_pnl_pct)}${b.kelly_pnl_pct.toFixed(2)}%</span>`
+      : b.status === 'open' && b.kelly_bet_pct != null
+        ? `<span class="pnl-neu">open</span>`
+        : '<span class="pnl-neu">—</span>';
+    const ts = fmtDate(b.flagged_at);
+    const clvCell = b.clv != null
+      ? `<span class="${b.clv >= 0 ? 'pnl-pos' : 'pnl-neg'}">${b.clv >= 0 ? '+' : ''}${b.clv}%</span>`
+      : '—';
+    // Raw vs adj edge (raw only present on post-refactor bets)
+    const edgeCell = b.raw_edge_pct != null && b.raw_edge_pct !== b.edge_pct
+      ? `<span title="raw ${b.raw_edge_pct}% → adj ${b.edge_pct}%">${b.edge_pct}%<span style="color:var(--muted);font-size:10px;"> (raw ${b.raw_edge_pct}%)</span></span>`
+      : `${b.edge_pct}%`;
+    // Books used (only present on post-refactor bets)
+    const booksCell = (b.books_used && b.books_used.length)
+      ? `<span style="font-size:10px;color:var(--muted);">${b.books_used.join(', ')}</span>`
+      : '<span style="font-size:10px;color:var(--muted);">pin only</span>';
+    return `<tr>
+      <td>${ts}</td>
+      <td>${b.matchup}</td>
+      <td class="prop-col">${b.title}</td>
+      <td class="side-${b.side.toLowerCase()}">${b.side}</td>
+      <td class="num">${edgeCell}</td>
+      <td class="num">${(b.kalshi_price * 100).toFixed(0)}¢</td>
+      <td class="num">${booksCell}</td>
+      <td class="num ${rClass}">${rLabel}</td>
+      <td class="num">${kBet}</td>
+      <td class="num">${kPnl}</td>
+      <td class="num">${clvCell}</td>
+    </tr>`;
+  }).join('');
+
+  let perfTableHtml = `<table>
+    <thead><tr>
+      <th>Flagged</th><th>Matchup</th><th>Prop</th><th>Side</th>
+      <th class="num" title="Adjusted EV after 25% haircut (raw shown in tooltip)">Adj. EV</th>
+      <th class="num">Price</th>
+      <th class="num" title="Books that contributed to consensus probability">Sources</th>
+      <th class="num">Result</th>
+      <th class="num" title="0.25 Kelly stake as % of bankroll (hover for $ amount). ½ = CLV penalty active.">Kelly Bet %</th>
+      <th class="num" title="P&amp;L as % of bankroll at Kelly stake (hover for $ amount)">Kelly P&amp;L %</th>
+      <th class="num">CLV</th>
+    </tr></thead>
+    <tbody>${rows}</tbody>
+  </table>`;
+  if (!showAllPerf && allPerfBets.length > PERF_PREVIEW) {
+    perfTableHtml += `<div style="text-align:center;padding:10px;">
+      <button onclick="window._perfShowAll=true;fetchPerformance();" style="background:var(--bg2);color:var(--accent);border:1px solid var(--border);border-radius:6px;padding:6px 20px;cursor:pointer;font-size:12px;font-weight:600;">
+        See all ${allPerfBets.length} plays
+      </button>
+    </div>`;
+  } else if (showAllPerf && allPerfBets.length > PERF_PREVIEW) {
+    perfTableHtml += `<div style="text-align:center;padding:10px;">
+      <button onclick="window._perfShowAll=false;fetchPerformance();" style="background:var(--bg2);color:var(--muted);border:1px solid var(--border);border-radius:6px;padding:6px 20px;cursor:pointer;font-size:12px;">
+        Show recent only
+      </button>
+    </div>`;
+  }
+  document.getElementById('perf-body').innerHTML += perfTableHtml;
+}
+
+
+// ── My Bets ──────────────────────────────────────────────────────────────────
+function trackBet(ticker, title, matchup, side, mkt_type) {
+  document.getElementById('mb-ticker').value = ticker;
+  document.getElementById('mb-side').value = side;
+  document.getElementById('mb-ticker').dataset.title   = title;
+  document.getElementById('mb-ticker').dataset.matchup = matchup;
+  document.getElementById('mb-ticker').dataset.mkttype = mkt_type;
+  document.getElementById('mb-price').focus();
+  document.getElementById('mybets-body').classList.remove('collapsed');
+  document.getElementById('mybets-body-toggle').textContent = '▾';
+  document.getElementById('mybets-card').scrollIntoView({behavior:'smooth', block:'nearest'});
+}
+
+async function addMyBet() {
+  const ticker    = document.getElementById('mb-ticker').value.trim();
+  const side      = document.getElementById('mb-side').value;
+  const priceCent = parseFloat(document.getElementById('mb-price').value);
+  const amount    = parseFloat(document.getElementById('mb-amount').value);
+  if (!ticker || !priceCent || !amount) { alert('Fill in all fields'); return; }
+  const title   = document.getElementById('mb-ticker').dataset.title   || ticker;
+  const matchup = document.getElementById('mb-ticker').dataset.matchup || '';
+  const mkt_type= document.getElementById('mb-ticker').dataset.mkttype || '';
+  try {
+    await fetch('/api/mybets', {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({ ticker, side, title, matchup, mkt_type,
+                             entry_price: priceCent / 100, amount_spent: amount })
+    });
+    document.getElementById('mb-price').value = '';
+    document.getElementById('mb-amount').value = '';
+    fetchMyBets();
+  } catch(e) { console.error(e); }
+}
+
+async function deleteMyBet(id) {
+  await fetch('/api/mybets/' + encodeURIComponent(id), { method: 'DELETE' });
+  fetchMyBets();
+}
+
+// ── Paper Portfolio ───────────────────────────────────────────────────────────
+async function fetchPaper() {
+  try {
+    const r = await fetch('/api/paper');
+    const d = await r.json();
+    const pnlPos    = d.total_pnl >= 0;
+    const pnlColor  = pnlPos ? 'var(--green)' : 'var(--red)';
+    const pnlSign   = pnlPos ? '+' : '';
+    const roiSign   = d.roi_pct >= 0 ? '+' : '';
+    const roiColor  = d.roi_pct >= 0 ? 'var(--green)' : 'var(--red)';
+    const settled   = d.won + d.lost;
+
+    // Avg CLV across settled bets with a recorded closing price
+    const clvBets = (d.bets || []).filter(b => b.status !== 'open' && b.clv != null);
+    const avgClv  = clvBets.length
+      ? clvBets.reduce((s, b) => s + b.clv, 0) / clvBets.length
+      : null;
+    const clvColor = avgClv == null ? 'var(--muted)' : avgClv >= 0 ? 'var(--green)' : 'var(--red)';
+    const clvTxt   = avgClv == null ? '—'
+      : `${avgClv >= 0 ? '+' : ''}${avgClv.toFixed(1)}pp`;
+
+    // ── Primary KPI bar ────────────────────────────────────────────────────
+    let html = `
+    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(110px,1fr));gap:1px;background:var(--border);border-bottom:1px solid var(--border);">
+      <div style="background:var(--surface);padding:14px 16px;text-align:center;">
+        <div style="font-size:26px;font-weight:800;color:${pnlColor};letter-spacing:-0.5px;">$${d.balance.toFixed(2)}</div>
+        <div style="font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:0.06em;margin-top:3px;">Current Bankroll</div>
+      </div>
+      <div style="background:var(--surface);padding:14px 16px;text-align:center;">
+        <div style="font-size:22px;font-weight:700;color:${pnlColor};">${pnlSign}$${d.total_pnl.toFixed(2)}</div>
+        <div style="font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:0.06em;margin-top:3px;">Total P&amp;L</div>
+      </div>
+      <div style="background:var(--surface);padding:14px 16px;text-align:center;">
+        <div style="font-size:22px;font-weight:700;color:${roiColor};">${roiSign}${d.roi_pct.toFixed(2)}%</div>
+        <div style="font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:0.06em;margin-top:3px;">ROI on $${d.start_balance.toFixed(0)}</div>
+      </div>
+      <div style="background:var(--surface);padding:14px 16px;text-align:center;">
+        <div style="font-size:22px;font-weight:700;color:${d.win_rate != null ? (d.win_rate >= 55 ? 'var(--green)' : d.win_rate < 45 ? 'var(--red)' : 'var(--text)') : 'var(--muted)'};">${d.win_rate != null ? d.win_rate + '%' : '—'}</div>
+        <div style="font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:0.06em;margin-top:3px;">Win Rate (${settled} settled)</div>
+      </div>
+      <div style="background:var(--surface);padding:14px 16px;text-align:center;">
+        <div style="font-size:22px;font-weight:700;color:${clvColor};" title="Closing Line Value — positive means we beat the closing price. Tracked on every open bet, frozen at game start.">${clvTxt}</div>
+        <div style="font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:0.06em;margin-top:3px;">Avg CLV (${clvBets.length} bets)</div>
+      </div>
+      <div style="background:var(--surface);padding:14px 16px;text-align:center;">
+        <div style="font-size:18px;font-weight:600;color:var(--green);">${d.won}W</div>
+        <div style="font-size:11px;color:var(--red);">${d.lost}L &nbsp; <span style="color:var(--muted);">${d.open} open</span></div>
+        <div style="font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:0.06em;margin-top:2px;">Record</div>
+      </div>
+      <div style="background:var(--surface);padding:14px 16px;text-align:center;">
+        <div style="font-size:18px;font-weight:600;color:var(--text);">$${d.open_exposure.toFixed(2)}</div>
+        <div style="font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:0.06em;margin-top:3px;">Exposure (open)</div>
+      </div>
+    </div>
+    <div style="padding:6px 12px;border-bottom:1px solid var(--border);background:#0d1117;">
+      <span style="font-size:11px;color:var(--muted);">📊 Tracks <strong style="color:var(--text);">all edges ≥3%</strong> · 0.25 fractional Kelly · 5% max stake · compounding from $${d.start_balance.toFixed(0)} since ${d.start_date} · CLV captured every 2 min until game start</span>
+    </div>`;
+
+    // ── Bet table ──────────────────────────────────────────────────────────
+    if (d.bets && d.bets.length) {
+      const PAPER_PREVIEW = 15;
+      const allBets = d.bets;
+      const showAll = window._paperShowAll || false;
+      const visibleBets = showAll ? allBets : allBets.slice(0, PAPER_PREVIEW);
+      let rows = '';
+      for (const b of visibleBets) {
+        const stake = b.paper_stake != null ? '$' + b.paper_stake.toFixed(2) : '—';
+        let pnlCell = '—';
+        if (b.paper_pnl != null) {
+          const c = b.paper_pnl >= 0 ? 'var(--green)' : 'var(--red)';
+          const s = b.paper_pnl >= 0 ? '+' : '';
+          pnlCell = `<span style="color:${c};font-weight:600;">${s}$${b.paper_pnl.toFixed(2)}</span>`;
+        }
+        const statusColor = b.status === 'won' ? 'var(--green)' : b.status === 'lost' ? 'var(--red)' : 'var(--muted)';
+        const statusLabel = b.status === 'won' ? '✓ WON' : b.status === 'lost' ? '✗ LOST' : '…';
+        const flagDate = b.flagged_at ? fmtDate(b.flagged_at) : '';
+        // Edge badge: distinguish 3-5% "data" edges from 5%+ "signal" edges
+        const edgePct = b.edge_pct != null ? b.edge_pct : 0;
+        const edgeTag = edgePct >= 5
+          ? `<span style="color:${edgeColor(edgePct)};font-weight:700;">+${edgePct}%</span>`
+          : `<span style="color:#ff8c42;font-weight:600;">+${edgePct}%</span><span style="font-size:9px;color:var(--muted);margin-left:3px;">data</span>`;
+        // CLV cell: positive = beating closing line (real edge), negative = line moved against us
+        let clvCell = '<span style="color:var(--muted);">—</span>';
+        if (b.status === 'open') {
+          // Show live CLV for open bets (updates every 2 min)
+          if (b.clv != null && b.clv !== 0) {
+            const cc = b.clv >= 0 ? '#3fb950' : '#f85149';
+            clvCell = `<span style="color:${cc};" title="Live CLV — updated every 2 min. Positive = closing line moving in our favour.">${b.clv >= 0 ? '+' : ''}${b.clv.toFixed(1)}pp</span>`;
+          } else {
+            clvCell = '<span style="color:var(--muted);font-size:10px;">tracking…</span>';
+          }
+        } else if (b.clv != null) {
+          const cc = b.clv >= 0 ? '#3fb950' : '#f85149';
+          clvCell = `<span style="color:${cc};font-weight:600;" title="Final CLV at game start">${b.clv >= 0 ? '+' : ''}${b.clv.toFixed(1)}pp</span>`;
+        }
+        rows += `<tr>
+          <td style="color:var(--muted);font-size:11px;">${flagDate}</td>
+          <td class="matchup-inline">${matchupHtml(b.matchup)}</td>
+          <td style="font-size:12px;max-width:200px;">${b.title}</td>
+          <td class="side-${(b.side||'').toLowerCase()}">${b.side}</td>
+          <td class="num">${edgeTag}</td>
+          <td class="num">${clvCell}</td>
+          <td class="num">${stake}</td>
+          <td class="num">${pnlCell}</td>
+          <td style="color:${statusColor};font-weight:700;text-align:center;">${statusLabel}</td>
+        </tr>`;
+      }
+      html += `<table style="font-size:12px;">
+        <thead><tr>
+          <th>Date</th><th>Matchup</th><th>Bet</th><th>Side</th>
+          <th class="num">Edge</th>
+          <th class="num" title="Closing Line Value — how much the market moved in our favour before game start. Positive = we had real edge. Updated live every 2 min.">CLV</th>
+          <th class="num">Kelly Stake</th><th class="num">P&amp;L</th><th>Result</th>
+        </tr></thead>
+        <tbody>${rows}</tbody>
+      </table>`;
+      if (!showAll && allBets.length > PAPER_PREVIEW) {
+        html += `<div style="text-align:center;padding:10px;">
+          <button onclick="window._paperShowAll=true;fetchPaper();" style="background:var(--bg2);color:var(--accent);border:1px solid var(--border);border-radius:6px;padding:6px 20px;cursor:pointer;font-size:12px;font-weight:600;">
+            See all ${allBets.length} plays
+          </button>
+        </div>`;
+      } else if (showAll && allBets.length > PAPER_PREVIEW) {
+        html += `<div style="text-align:center;padding:10px;">
+          <button onclick="window._paperShowAll=false;fetchPaper();" style="background:var(--bg2);color:var(--muted);border:1px solid var(--border);border-radius:6px;padding:6px 20px;cursor:pointer;font-size:12px;">
+            Show recent only
+          </button>
+        </div>`;
+      }
+    } else {
+      html += '<div class="empty" style="padding:16px;">No paper trades yet. Every edge ≥3% flagged from ' + d.start_date + ' is automatically sized and tracked here.</div>';
+    }
+    _setHTML('paper-body', html);
+  } catch(e) { console.error('paper fetch failed', e); }
+}
+
+async function fetchMyBets() {
+  try {
+    const r = await fetch('/api/mybets');
+    const d = await r.json();
+    renderMyBets(d);
+  } catch(e) { console.error(e); }
+}
+
+function renderMyBets(d) {
+  // Stats bar
+  const np = d.net_pnl;
+  const npClass = np > 0 ? 'mb-pnl-pos' : np < 0 ? 'mb-pnl-neg' : '';
+  const npSign  = np >= 0 ? '+' : '';
+  _setHTML('mybets-stats', `
+    <div class="stat-pill"><div class="label">Total In</div><div class="value">$${d.total_in.toFixed(2)}</div></div>
+    <div class="stat-pill"><div class="label">Realized P&amp;L</div><div class="value ${d.realized_pnl>=0?'mb-pnl-pos':'mb-pnl-neg'}">${d.realized_pnl>=0?'+':''}$${d.realized_pnl.toFixed(2)}</div></div>
+    <div class="stat-pill"><div class="label">Unrealized P&amp;L</div><div class="value ${d.unrealized_pnl>=0?'mb-pnl-pos':'mb-pnl-neg'}">${d.unrealized_pnl>=0?'+':''}$${d.unrealized_pnl.toFixed(2)}</div></div>
+    <div class="stat-pill"><div class="label">Net P&amp;L</div><div class="value ${npClass}">${npSign}$${np.toFixed(2)}</div></div>`);
+
+  if (!d.bets.length) {
+    _setHTML('mybets-table', '<div class="empty">No bets tracked yet — add one above.</div>');
+    return;
+  }
+  let rows = '';
+  for (const b of d.bets) {
+    const statusCls = b.status === 'won' ? 'mb-won' : b.status === 'lost' ? 'mb-lost' : 'mb-open';
+    const statusTxt = b.status === 'won' ? '✅ WON' : b.status === 'lost' ? '❌ LOST' : '⏳ Open';
+    const pnlTxt = b.pnl != null
+      ? `<span class="${b.pnl>=0?'mb-pnl-pos':'mb-pnl-neg'}">${b.pnl>=0?'+':''}$${b.pnl.toFixed(2)}</span>`
+      : b.unrealized_pnl != null
+        ? `<span class="${b.unrealized_pnl>=0?'mb-pnl-pos':'mb-pnl-neg'}" title="Unrealized">${b.unrealized_pnl>=0?'+':''}$${b.unrealized_pnl.toFixed(2)}*</span>`
+        : '—';
+    const curTxt = b.current_price != null ? `${b.current_price}¢` : '—';
+    rows += `<tr>
+      <td class="prop-col">${b.title || b.ticker}</td>
+      <td class="side-${b.side.toLowerCase()}">${b.side}</td>
+      <td class="num">${Math.round(b.entry_price*100)}¢</td>
+      <td class="num">${b.contracts.toFixed(1)}</td>
+      <td class="num">$${b.amount_spent.toFixed(2)}</td>
+      <td class="num">${curTxt}</td>
+      <td class="${statusCls}">${statusTxt}</td>
+      <td class="num">${pnlTxt}</td>
+      <td><span class="mb-del" data-id="${hesc(b.id)}" onclick="deleteMyBet(this.dataset.id)">✕</span></td>
+    </tr>`;
+  }
+  _setHTML('mybets-table', `<table>
+    <thead><tr>
+      <th>Bet</th><th>Side</th><th class="num">Paid</th><th class="num">Contracts</th>
+      <th class="num">Invested</th><th class="num">Current</th><th>Status</th>
+      <th class="num">P&amp;L</th><th></th>
+    </tr></thead>
+    <tbody>${rows}</tbody>
+  </table>`);
+}
+
+// Resume refresh when tab becomes visible again
+document.addEventListener('visibilitychange', () => {
+  if (!document.hidden) { fetchData(); fetchMyBets(); }
+});
+
+// Initial load — default performance filter to clean-data start date (2026-04-07)
+// This excludes pre-fix ghost edges and sub-15¢ bets from stats by default.
+// Clear the date field and click Refresh to see all historical bets.
+(function() {
+  const inp = document.getElementById('perf-since');
+  if (inp && !inp.value) inp.value = '2026-04-07';
+})();
+fetchData();
+fetchHistory();
+fetchPerformance();
+fetchPaper();
+fetchMyBets();
+setInterval(updateCountdown, 1000);
+setInterval(fetchPaper, 60 * 1000);   // refresh paper portfolio every 60s
+setInterval(fetchMyBets, 60 * 1000);   // refresh my bets every 60s (mark-to-market)
+</script>
+
+<!-- Pre-Bet Validator Modal -->
+<div id="validate-modal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,0.7);z-index:1000;align-items:center;justify-content:center;">
+  <div style="background:var(--surface);border:1px solid var(--border);border-radius:10px;width:420px;max-width:95vw;box-shadow:0 8px 32px rgba(0,0,0,0.5);">
+    <div style="display:flex;align-items:center;justify-content:space-between;padding:14px 20px;border-bottom:1px solid var(--border);">
+      <span style="font-size:14px;font-weight:700;color:var(--text);">Pre-Bet Validation</span>
+      <button onclick="closeValidateModal()" style="background:none;border:none;color:var(--muted);font-size:18px;cursor:pointer;line-height:1;">✕</button>
+    </div>
+    <div id="validate-body" style="min-height:80px;"></div>
+    <div style="padding:12px 20px;border-top:1px solid var(--border);text-align:right;">
+      <button onclick="closeValidateModal()" style="background:var(--bg2);color:var(--muted);border:1px solid var(--border);border-radius:6px;padding:6px 16px;cursor:pointer;font-size:12px;">Close</button>
+    </div>
+  </div>
+</div>
+</body>
+</html>
+"""
+
+
+# ── HTTP handler ──────────────────────────────────────────────────────────────
+class Handler(BaseHTTPRequestHandler):
+
+    def log_message(self, fmt, *args):
+        pass  # suppress default access logs
+
+    def _send(self, code: int, content_type: str, body: bytes, extra_headers: dict = None):
+        self.send_response(code)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(body)))
+        if extra_headers:
+            for k, v in extra_headers.items():
+                self.send_header(k, v)
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self):
+        path = self.path.split("?")[0]
+
+        if path == "/":
+            # Force-bust browser cache: redirect bare / to /?v=<timestamp>
+            from urllib.parse import urlparse, parse_qs
+            qs = parse_qs(urlparse(self.path).query)
+            if "v" not in qs:
+                import time as _t
+                self.send_response(302)
+                self.send_header("Location", f"/?v={int(_t.time())}")
+                self.end_headers()
+                return
+            self._send(200, "text/html; charset=utf-8", HTML.encode(),
+                       {"Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+                        "Pragma": "no-cache",
+                        "Expires": "0"})
+
+        elif path == "/static/chart.umd.min.js":
+            try:
+                with open(os.path.join(BASE_DIR, "chart.umd.min.js"), "rb") as f:
+                    data = f.read()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/javascript")
+                self.send_header("Content-Length", str(len(data)))
+                self.send_header("Cache-Control", "public, max-age=86400")  # browser caches for 1 day
+                self.end_headers()
+                self.wfile.write(data)
+            except FileNotFoundError:
+                self._send(404, "text/plain", b"Not found")
+
+        elif path == "/api/scan":
+            with _lock:
+                payload = json.dumps(_state).encode()
+            self._send(200, "application/json", payload)
+
+        elif path == "/api/history":
+            payload = json.dumps(_history[-200:]).encode()
+            self._send(200, "application/json", payload)
+
+        elif path == "/api/performance":
+            # optional ?since=YYYY-MM-DD  (ISO date, inclusive lower bound)
+            from urllib.parse import urlparse, parse_qs
+            qs    = parse_qs(urlparse(self.path).query)
+            since = qs.get("since", [None])[0]
+            payload = json.dumps(_get_performance(since=since)).encode()
+            self._send(200, "application/json", payload)
+
+        elif path == "/api/paper":
+            with _bets_lock:
+                paper_bets = [b for b in _bets
+                              if b.get("flagged_at", "") >= PAPER_START_DATE
+                              and b.get("paper_stake") is not None]
+            balance     = _compute_paper_balance()
+            open_exp    = round(sum(b["paper_stake"] for b in paper_bets if b["status"] == "open"), 2)
+            settled     = [b for b in paper_bets if b["status"] in ("won", "lost")]
+            won_bets    = [b for b in settled if b["status"] == "won"]
+            total_pnl   = round(balance - PAPER_START_BALANCE, 2)
+            roi_pct     = round(total_pnl / PAPER_START_BALANCE * 100, 2)
+            win_rate    = round(len(won_bets) / len(settled) * 100, 1) if settled else None
+            avg_stake   = round(sum(b["paper_stake"] for b in paper_bets) / len(paper_bets), 2) if paper_bets else None
+            # Show all bets newest-first so the running table is complete (not capped at 20)
+            recent = sorted(paper_bets, key=lambda b: b.get("flagged_at",""), reverse=True)
+            result = {
+                "balance":        balance,
+                "start_balance":  PAPER_START_BALANCE,
+                "start_date":     PAPER_START_DATE,
+                "total_pnl":      total_pnl,
+                "roi_pct":        roi_pct,
+                "open_exposure":  open_exp,
+                "available":      round(balance - open_exp, 2),
+                "total_bets":     len(paper_bets),
+                "won":            len(won_bets),
+                "lost":           len(settled) - len(won_bets),
+                "open":           len(paper_bets) - len(settled),
+                "win_rate":       win_rate,
+                "avg_stake":      avg_stake,
+                "bets":           recent,
+            }
+            self._send(200, "application/json", json.dumps(result).encode())
+
+        elif path.startswith("/api/validate/"):
+            # /api/validate/{ticker}?side=YES
+            try:
+                from urllib.parse import unquote
+                raw_ticker = path.split("/api/validate/")[1].split("?")[0]
+                ticker = unquote(raw_ticker)   # decode %40 → @, etc.
+                side   = (self.path.split("side=")[1].split("&")[0] if "side=" in self.path else "YES")
+                # Search live edges first, then bet history
+                with _lock:
+                    live_edges = list(_state.get("edges", []))
+                edge = next((e for e in live_edges
+                             if e.get("ticker") == ticker and e.get("side") == side), None)
+                if edge is None:
+                    with _bets_lock:
+                        edge = next((b for b in _bets
+                                     if b.get("ticker") == ticker and b.get("side") == side), None)
+                if edge is None:
+                    self._send(404, "application/json",
+                               json.dumps({"error": f"edge not found for ticker={ticker} side={side}"}).encode())
+                    return
+                result = validate_bet(edge)
+                self._send(200, "application/json", json.dumps(result).encode())
+            except Exception as exc:
+                import traceback
+                print(f"  /api/validate/ error: {exc}\n{traceback.format_exc()}")
+                self._send(500, "application/json",
+                           json.dumps({"error": f"Server error: {exc}"}).encode())
+
+        elif path == "/api/test-discord":
+            ok = send_test_discord()
+            result = {"ok": ok, "webhook_set": bool(_DISCORD_WEBHOOK)}
+            self._send(200, "application/json", json.dumps(result).encode())
+
+        elif path == "/api/discord-status":
+            with _discord_log_lock:
+                log_copy = list(_discord_log)
+            result = {
+                "configured": bool(_DISCORD_WEBHOOK),
+                "min_edge":   _ALERT_MIN,
+                "alerted":    len(_alerted_keys),
+                "log":        log_copy,
+            }
+            self._send(200, "application/json", json.dumps(result).encode())
+
+        elif path == "/api/mybets":
+            payload = json.dumps(_get_my_bets_state()).encode()
+            self._send(200, "application/json", payload)
+
+        else:
+            self._send(404, "text/plain", b"Not found")
+
+    def do_POST(self):
+        path = self.path.split("?")[0]
+        length = int(self.headers.get("Content-Length", 0))
+        body = json.loads(self.rfile.read(length)) if length else {}
+
+        if path == "/api/mybets":
+            ticker      = body.get("ticker", "")
+            side        = body.get("side", "YES")
+            entry_price = float(body.get("entry_price", 0.5))
+            amount_spent= float(body.get("amount_spent", 10))
+            contracts   = round(amount_spent / entry_price, 1) if entry_price > 0 else 0
+            bet_id      = f"{ticker}|{side}|{int(time.time())}"
+            new_bet = {
+                "id":           bet_id,
+                "ticker":       ticker,
+                "title":        body.get("title", ticker),
+                "matchup":      body.get("matchup", ""),
+                "side":         side,
+                "mkt_type":     body.get("mkt_type", ""),
+                "entry_price":  entry_price,
+                "amount_spent": amount_spent,
+                "contracts":    contracts,
+                "added_at":     datetime.now(timezone.utc).isoformat(),
+                "status":       "open",
+                "resolved_at":  None,
+                "pnl":          None,
+            }
+            with _my_bets_lock:
+                _my_bets.append(new_bet)
+                _save_my_bets(_my_bets)
+            self._send(200, "application/json", json.dumps({"ok": True}).encode())
+        else:
+            self._send(404, "text/plain", b"Not found")
+
+    def do_DELETE(self):
+        path = self.path.split("?")[0]
+        if path.startswith("/api/mybets/"):
+            import urllib.parse
+            bet_id = urllib.parse.unquote(path[len("/api/mybets/"):])
+            with _my_bets_lock:
+                before = len(_my_bets)
+                _my_bets[:] = [b for b in _my_bets if b["id"] != bet_id]
+                if len(_my_bets) < before:
+                    _save_my_bets(_my_bets)
+            self._send(200, "application/json", json.dumps({"ok": True}).encode())
+        else:
+            self._send(404, "text/plain", b"Not found")
+
+
+# ── Entry point ───────────────────────────────────────────────────────────────
+if __name__ == "__main__":
+    import webbrowser
+
+    _bg_threads: list = []   # tracked by watchdog
+
+    def _start_bg_threads():
+        """Start (or restart) all background threads. Called on launch and by watchdog."""
+        specs = [
+            ("scan",        _background_loop),
+            ("odds",        _background_odds_loop),
+            ("resolution",  _background_resolution_loop),
+            ("my-bets",     _background_my_bets_loop),
+            ("clv-capture", _background_clv_capture_loop),
+        ]
+        _bg_threads.clear()
+        for name, target in specs:
+            th = threading.Thread(target=target, name=name, daemon=True)
+            th.start()
+            _bg_threads.append((name, target, th))
+        return _bg_threads
+
+    def _watchdog_loop():
+        """
+        Two-mode thread monitor — runs every 60 s:
+
+        Mode 1 — Dead thread:  is_alive() == False  → restart immediately
+        Mode 2 — Hung thread:  is_alive() == True but _state["last_scan"] is
+                               > _SCAN_STALE_MINUTES old during game hours.
+                               A hung thread blocks on a network call and never
+                               increments the scan counter, so is_alive() lies.
+                               We fire a Discord alert and force-restart anyway.
+        """
+        global _scan_stale_alerted
+        while True:
+            time.sleep(60)
+
+            # ── Mode 1: restart dead threads ─────────────────────────────────
+            for i, (name, target, th) in enumerate(_bg_threads):
+                if not th.is_alive():
+                    print(f"  ⚠️  Thread '{name}' died — restarting...")
+                    new_th = threading.Thread(target=target, name=name, daemon=True)
+                    new_th.start()
+                    _bg_threads[i] = (name, target, new_th)
+
+            # ── Mode 2: detect hung scan thread (alive but not scanning) ─────
+            pt_hour = datetime.now(timezone.utc).hour - 7   # UTC → PT approx
+            if pt_hour < 0:
+                pt_hour += 24
+            in_game_hours = 10 <= pt_hour <= 23   # 10 AM – 11 PM PT
+
+            with _lock:
+                last_scan_iso = _state.get("last_scan")
+
+            stale_min = None
+            if last_scan_iso:
+                try:
+                    last_dt   = datetime.fromisoformat(last_scan_iso)
+                    # make naive UTC comparable
+                    now_utc   = datetime.now(timezone.utc)
+                    if last_dt.tzinfo is None:
+                        last_dt = last_dt.replace(tzinfo=timezone.utc)
+                    stale_min = (now_utc - last_dt).total_seconds() / 60
+                except Exception:
+                    pass
+
+            if stale_min is not None and in_game_hours:
+                if stale_min >= _SCAN_STALE_MINUTES:
+                    if not _scan_stale_alerted:
+                        _scan_stale_alerted = True
+                        print(f"  🚨 Scan thread hung — {stale_min:.0f} min since last scan. "
+                              f"Force-restarting...")
+                        _send_scan_stale_alert(stale_min)
+                        # Force-start a fresh scan thread (old one may still be alive but
+                        # effectively blocked; daemon threads can't be killed, but the new
+                        # thread will take over and both produce scans — harmless duplicate)
+                        for i, (name, target, th) in enumerate(_bg_threads):
+                            if name == "scan":
+                                new_th = threading.Thread(
+                                    target=target, name="scan-restart", daemon=True
+                                )
+                                new_th.start()
+                                _bg_threads[i] = (name, target, new_th)
+                                print(f"  Scan thread force-restarted (old thread left to drain)")
+                                break
+                else:
+                    # Scan is fresh — clear stale flag
+                    if _scan_stale_alerted:
+                        _scan_stale_alerted = False
+                        print(f"  ✓ Scan thread recovered — last scan {stale_min:.1f} min ago")
+
+    _start_bg_threads()
+
+    # Watchdog monitors all bg threads and revives any that die
+    tw = threading.Thread(target=_watchdog_loop, name="watchdog", daemon=True)
+    tw.start()
+
+    class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
+        daemon_threads = True   # don't block shutdown on open connections
+
+    # On Railway/cloud bind to 0.0.0.0 so the health-check can reach us;
+    # locally keep it on 127.0.0.1 for security.
+    bind_host = "0.0.0.0" if os.environ.get("RAILWAY_ENVIRONMENT") else "127.0.0.1"
+    server = ThreadedHTTPServer((bind_host, PORT), Handler)
+    url = f"http://localhost:{PORT}"
+    print(f"  Kalshi EV Scanner UI running at {url}")
+    print(f"  Kalshi scan : every {REFRESH_SECONDS}s  (0 credits — cached odds)")
+    print(f"  Odds refresh: 4min game-hours / 20min overnight  (2 credits — Pinnacle+DK+FD)")
+    print(f"  CLV capture : every {CLV_CAPTURE_SECONDS}s  (0 credits — Kalshi-only)")
+    print(f"  Est. monthly: ~6,000 credits  (budget: 20,000)  |  Ctrl-C to stop\n")
+    # Only open browser if running on a local desktop (not a headless VPS)
+    if os.environ.get("DISPLAY") or sys.platform == "darwin":
+        try:
+            webbrowser.open(url)
+        except Exception:
+            pass   # headless — no browser available, that's fine
+
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("\n  Stopped.")

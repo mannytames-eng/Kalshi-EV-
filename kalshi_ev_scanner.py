@@ -1,0 +1,2364 @@
+#!/usr/bin/env python3
+"""
+Kalshi EV Scanner — MLB & NBA
+Compares Kalshi prices against a weighted consensus of Pinnacle, DraftKings,
+and FanDuel no-vig probabilities to find +EV bets.
+
+Key design decisions:
+  • Pinnacle-only fair value (DK/FD used for confirmation only)
+  • 25% EV haircut applied to raw edge (accounts for model uncertainty)
+  • Minimum adjusted EV ≥ 3% to flag a bet (logged to paper portfolio)
+  • Live display (UI cards) shows only ≥5% edges for clean, high-confidence view
+  • Hard ceiling of 20% — larger edges are almost certainly data mismatches
+  • Top 25 bets per scan cycle (all qualifying edges logged to paper portfolio)
+  • Max 2 bets per (matchup × market-type) group to control correlation
+  • Supports spreads, totals, and moneylines for all three sports
+  • recheck_ev() available for pre-execution validation
+
+Usage:
+    python kalshi_ev_scanner.py              # single scan
+    python kalshi_ev_scanner.py --loop 300  # repeat every 300 seconds
+"""
+
+import argparse
+import base64
+import math
+import os
+import re
+import time
+from datetime import datetime, timezone
+from typing import Dict, List, Optional, Tuple
+
+import requests
+from cryptography.hazmat.backends import default_backend
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import padding
+
+# ── Portable base directory ──────────────────────────────────────────────────
+_SCANNER_DIR = os.path.dirname(os.path.abspath(__file__))
+
+# ── Config ─────────────────────────────────────────────────────────────────
+KALSHI_API_KEY      = os.environ.get("KALSHI_API_KEY", "d09478eb-4f1d-4d1a-b12a-02893bd02738")
+KALSHI_PRIVKEY_PATH = os.path.join(_SCANNER_DIR, "mannyxolo.txt")
+ODDS_API_KEY        = os.environ.get("ODDS_API_KEY", "85de0453dbc95b70936e6c1b5aeba6ca")
+
+KALSHI_BASE = "https://api.elections.kalshi.com/trade-api/v2"
+ODDS_BASE   = "https://api.the-odds-api.com/v4"
+
+# ── EV / filtering constants ────────────────────────────────────────────────
+# All thresholds apply to the POST-haircut adjusted edge.
+EDGE_THRESHOLD     = 0.03    # ≥3% adjusted EV — everything above is logged to paper portfolio
+                             # (UI display is filtered to ≥5% separately in kalshi_ev_ui.py)
+MAX_EDGE           = 0.20    # reject edges >20% post-haircut — almost certainly
+                             # a stale line or data mismatch, not real EV.
+                             # Real market makers close gaps this large in seconds.
+EV_HAIRCUT         = 0.10    # discount raw edge by 10% for model uncertainty (reduced from 25% for data collection phase)
+TOP_BETS_PER_CYCLE = 25      # surface up to 25 qualifying bets per scan (all go to paper portfolio)
+MAX_BETS_PER_GROUP = 2       # max bets per (matchup, mkt_type) group
+
+# Minimum Kalshi price for any side we'll consider betting.
+# Data shows 0/18 wins on markets priced below 15¢ — these are almost always
+# either threshold-mismatch ghost edges (Kalshi ">2.5 runs" matched to Pinnacle
+# ">8.5 runs") or rare-event props where model error is amplified.
+MIN_KALSHI_PRICE   = 0.15
+
+MAX_PROP_EVENTS = 10         # prop scan credit budget (see comment in UI)
+
+# ── Book weights for consensus probability ───────────────────────────────────
+# Fair value is Pinnacle ONLY — the sharpest closing-line book.
+# DK and FD are still fetched and used as CONFIRMATION signals in
+# _validate_book_consensus() but do NOT influence the fair-value price.
+# Including soft books in fair value adds public-money noise to the model.
+BOOK_WEIGHTS: Dict[str, float] = {
+    "pinnacle":   1.00,   # sharp book — sole fair-value anchor
+    "draftkings": 0.00,   # confirmation only — excluded from fair-value calc
+    "fanduel":    0.00,   # confirmation only — excluded from fair-value calc
+}
+
+# ── Normal-distribution standard deviations (empirical) ─────────────────────
+# Used for Gaussian extrapolation: given Pinnacle's spread cover prob at their
+# line, compute P(margin > X) at a different threshold (the Kalshi line).
+NBA_SPREAD_STD = 12.0   # points
+NBA_TOTAL_STD  = 15.0   # points
+MLB_SPREAD_STD =  3.2   # runs (margin)
+MLB_TOTAL_STD  =  4.5   # runs (total)
+
+
+# ── Ticker date parser ───────────────────────────────────────────────────────
+_MONTH_MAP = {"JAN":1,"FEB":2,"MAR":3,"APR":4,"MAY":5,"JUN":6,
+              "JUL":7,"AUG":8,"SEP":9,"OCT":10,"NOV":11,"DEC":12}
+
+def _parse_ticker_date(ticker: str) -> Optional[str]:
+    """Extract YYYY-MM-DD from a Kalshi ticker like KXMLBTOTAL-26APR121410CWSKC-9.
+    Returns None if the date can't be parsed."""
+    m = re.search(r"-(\d{2})([A-Z]{3})(\d{2})\d{4}", ticker)
+    if not m:
+        # Try without time component
+        m = re.search(r"-(\d{2})([A-Z]{3})(\d{2})", ticker)
+    if not m:
+        return None
+    yy, mon, dd = m.group(1), m.group(2), m.group(3)
+    month_num = _MONTH_MAP.get(mon)
+    if not month_num:
+        return None
+    return f"20{yy}-{month_num:02d}-{dd}"
+
+
+def _parse_ticker_start_time(ticker: str) -> Optional[datetime]:
+    """Extract the game start datetime (UTC) from a Kalshi ticker.
+    e.g. KXMLBTOTAL-26APR131840LAANYY-10 → 2026-04-13 18:40 UTC
+    Returns None if no time component found."""
+    m = re.search(r"-(\d{2})([A-Z]{3})(\d{2})(\d{2})(\d{2})", ticker)
+    if not m:
+        return None
+    yy, mon, dd, hh, mm = m.group(1), m.group(2), m.group(3), m.group(4), m.group(5)
+    month_num = _MONTH_MAP.get(mon)
+    if not month_num:
+        return None
+    try:
+        return datetime(2000 + int(yy), month_num, int(dd),
+                        int(hh), int(mm), tzinfo=timezone.utc)
+    except ValueError:
+        return None
+
+
+# ── Gaussian helpers (pure math, no scipy) ───────────────────────────────────
+def _norm_cdf(x: float) -> float:
+    """Standard normal CDF — P(Z ≤ x)."""
+    return 0.5 * math.erfc(-x / math.sqrt(2))
+
+
+def _norm_ppf(p: float) -> float:
+    """Inverse standard normal CDF (percent-point function).
+    Uses rational approximation (Abramowitz & Stegun 26.2.23), accurate to ~4.5e-4.
+    """
+    if p <= 0:
+        return -10.0
+    if p >= 1:
+        return 10.0
+    if p == 0.5:
+        return 0.0
+    if p > 0.5:
+        return -_norm_ppf(1.0 - p)
+    # Rational approx for 0 < p < 0.5
+    t = math.sqrt(-2.0 * math.log(p))
+    c0, c1, c2 = 2.515517, 0.802853, 0.010328
+    d1, d2, d3 = 1.432788, 0.189269, 0.001308
+    return -(t - (c0 + c1 * t + c2 * t * t) / (1 + d1 * t + d2 * t * t + d3 * t * t * t))
+
+
+def _gaussian_total_fair(
+    pin_over_prob: float,
+    pin_line: float,
+    kalshi_threshold: float,
+    std: float,
+) -> float:
+    """
+    Compute P(total > kalshi_threshold) using Gaussian extrapolation.
+
+    Pinnacle gives us P(total > pin_line) = pin_over_prob at their posted line.
+    We derive the implied mean total, then compute P(total > kalshi_threshold).
+
+    Used when Pinnacle's line doesn't exactly match the Kalshi threshold (e.g.
+    Pinnacle posts O/U 8.0 but Kalshi markets are at >7.5, >8.5, >9.5).
+
+    Args:
+        pin_over_prob:     Pinnacle no-vig prob that total goes OVER their line
+        pin_line:          Pinnacle's total line (e.g. 8.0, 8.5, 9.0)
+        kalshi_threshold:  Kalshi market threshold (e.g. 7.5, 8.5, 9.5)
+        std:               Sport total std dev (e.g. 4.5 for MLB, 15.0 for NBA)
+
+    Returns:
+        P(total > kalshi_threshold)
+    """
+    # Derive implied mean total from Pinnacle's over prob:
+    #   pin_over_prob = P(total > pin_line) = 1 - Φ((pin_line - mean) / std)
+    #   → mean = pin_line + std × Φ⁻¹(pin_over_prob)
+    mean_total = pin_line + std * _norm_ppf(pin_over_prob)
+    z = (kalshi_threshold - mean_total) / std
+    return 1.0 - _norm_cdf(z)
+
+
+def _gaussian_spread_fair(
+    pin_cover_prob: float,
+    pin_spread_pt: float,
+    kalshi_threshold: float,
+    std: float,
+    team_is_fav: bool,
+) -> float:
+    """
+    Compute P(team margin > kalshi_threshold) using Gaussian extrapolation.
+
+    Pinnacle gives us P(fav margin > |pin_spread_pt|) = pin_cover_prob.
+    From that we derive the implied mean margin, then compute P(team margin > threshold).
+
+    Kalshi "Team wins by over X" = P(team margin > X).
+    This is fundamentally different from sportsbook cover probabilities.
+
+    Args:
+        pin_cover_prob: Pinnacle no-vig prob that the FAVORITE covers their spread
+        pin_spread_pt:  Pinnacle spread for the FAVORITE (negative, e.g. -1.5)
+        kalshi_threshold: The Kalshi "over X" threshold (always positive, e.g. 1.5)
+        std:            Sport-specific margin std dev (e.g. 3.2 for MLB)
+        team_is_fav:    Whether the Kalshi market's team IS the favorite
+
+    Returns:
+        P(team margin > kalshi_threshold)
+    """
+    # Pinnacle spread is negative for favorites.  |pin_spread_pt| = expected margin anchor
+    pin_abs = abs(pin_spread_pt)
+
+    # Derive implied mean margin for the favorite from the cover prob:
+    #   pin_cover_prob = P(fav_margin > pin_abs) = 1 - Φ((pin_abs - mean) / std)
+    #   → Φ⁻¹(pin_cover_prob) = (mean - pin_abs) / std
+    #   → mean = pin_abs + std * Φ⁻¹(pin_cover_prob)
+    fav_mean_margin = pin_abs + std * _norm_ppf(pin_cover_prob)
+
+    if team_is_fav:
+        # P(fav margin > threshold) = 1 - Φ((threshold - fav_mean) / std)
+        z = (kalshi_threshold - fav_mean_margin) / std
+        return 1.0 - _norm_cdf(z)
+    else:
+        # Underdog margin = -fav_margin, so underdog_mean = -fav_mean_margin
+        # P(underdog margin > threshold) = P(fav margin < -threshold)
+        #   = Φ((-threshold - fav_mean_margin) / std)
+        z = (-kalshi_threshold - fav_mean_margin) / std
+        return _norm_cdf(z)
+
+# ── Team abbreviation → Pinnacle full name ──────────────────────────────────
+NBA_ABBR: Dict[str, str] = {
+    "ATL": "Atlanta Hawks",          "BOS": "Boston Celtics",
+    "BKN": "Brooklyn Nets",          "CHA": "Charlotte Hornets",
+    "CHI": "Chicago Bulls",          "CLE": "Cleveland Cavaliers",
+    "DAL": "Dallas Mavericks",       "DEN": "Denver Nuggets",
+    "DET": "Detroit Pistons",        "GSW": "Golden State Warriors",
+    "HOU": "Houston Rockets",        "IND": "Indiana Pacers",
+    "LAC": "Los Angeles Clippers",   "LAL": "Los Angeles Lakers",
+    "MEM": "Memphis Grizzlies",      "MIA": "Miami Heat",
+    "MIL": "Milwaukee Bucks",        "MIN": "Minnesota Timberwolves",
+    "NOP": "New Orleans Pelicans",   "NYK": "New York Knicks",
+    "OKC": "Oklahoma City Thunder",  "ORL": "Orlando Magic",
+    "PHI": "Philadelphia 76ers",     "PHX": "Phoenix Suns",
+    "POR": "Portland Trail Blazers", "SAC": "Sacramento Kings",
+    "SAS": "San Antonio Spurs",      "TOR": "Toronto Raptors",
+    "UTA": "Utah Jazz",              "WAS": "Washington Wizards",
+}
+
+MLB_ABBR: Dict[str, str] = {
+    "ARI": "Arizona Diamondbacks",   "ATL": "Atlanta Braves",
+    "BAL": "Baltimore Orioles",      "BOS": "Boston Red Sox",
+    "CHC": "Chicago Cubs",           "CWS": "Chicago White Sox",
+    "CIN": "Cincinnati Reds",        "CLE": "Cleveland Guardians",
+    "COL": "Colorado Rockies",       "DET": "Detroit Tigers",
+    "HOU": "Houston Astros",         "KC":  "Kansas City Royals",
+    "LAA": "Los Angeles Angels",     "LAD": "Los Angeles Dodgers",
+    "MIA": "Miami Marlins",          "MIL": "Milwaukee Brewers",
+    "MIN": "Minnesota Twins",        "NYM": "New York Mets",
+    "NYY": "New York Yankees",       "OAK": "Oakland Athletics",
+    "PHI": "Philadelphia Phillies",  "PIT": "Pittsburgh Pirates",
+    "SD":  "San Diego Padres",       "SF":  "San Francisco Giants",
+    "SEA": "Seattle Mariners",       "STL": "St. Louis Cardinals",
+    "TB":  "Tampa Bay Rays",         "TEX": "Texas Rangers",
+    "TOR": "Toronto Blue Jays",      "WSH": "Washington Nationals",
+}
+
+
+# ── Kalshi auth ─────────────────────────────────────────────────────────────
+_privkey = None
+
+def _load_privkey():
+    global _privkey
+    if _privkey is None:
+        b64 = os.environ.get("KALSHI_PRIVKEY_B64")
+        if b64:
+            pem_bytes = base64.b64decode(b64)
+        else:
+            with open(KALSHI_PRIVKEY_PATH, "rb") as f:
+                pem_bytes = f.read()
+        _privkey = serialization.load_pem_private_key(
+            pem_bytes, password=None, backend=default_backend()
+        )
+    return _privkey
+
+
+def _sign_headers(method: str, path: str) -> dict:
+    ts = str(int(time.time() * 1000))
+    path_no_qs = path.split("?")[0]
+    msg = (ts + method.upper() + "/trade-api/v2" + path_no_qs).encode()
+    sig = _load_privkey().sign(msg, padding.PKCS1v15(), hashes.SHA256())
+    return {
+        "KALSHI-ACCESS-KEY":       KALSHI_API_KEY,
+        "KALSHI-ACCESS-TIMESTAMP": ts,
+        "KALSHI-ACCESS-SIGNATURE": base64.b64encode(sig).decode(),
+    }
+
+
+def kalshi_get(path: str, params: Optional[Dict] = None, _retries: int = 3) -> dict:
+    qs = ""
+    if params:
+        qs = "?" + "&".join(f"{k}={v}" for k, v in params.items())
+    full_path = path + qs
+    for attempt in range(_retries):
+        r = requests.get(
+            KALSHI_BASE + full_path,
+            headers=_sign_headers("GET", full_path),
+            timeout=15,
+        )
+        if r.status_code == 429:
+            time.sleep(2 ** attempt)
+            continue
+        r.raise_for_status()
+        return r.json()
+    r.raise_for_status()
+    return {}
+
+
+# ── Kalshi helpers ─────────────────────────────────────────────────────────
+def fetch_kalshi_events(series_ticker: str) -> List[dict]:
+    events, cursor = [], None
+    for _page in range(20):   # hard cap: 20 pages × 100 = 2000 events max
+        params: Dict = {"series_ticker": series_ticker, "status": "open", "limit": 100}
+        if cursor:
+            params["cursor"] = cursor
+        try:
+            data = kalshi_get("/events", params)
+        except requests.HTTPError as e:
+            if e.response is not None and e.response.status_code == 404:
+                return []
+            raise
+        batch = data.get("events", [])
+        events.extend(batch)
+        cursor = data.get("cursor")
+        if not cursor or not batch:
+            break
+    return events
+
+
+def fetch_event_markets(event_ticker: str) -> List[dict]:
+    data = kalshi_get("/markets", {"event_ticker": event_ticker, "status": "open", "limit": 100})
+    return data.get("markets", [])
+
+
+MIN_PRICE      = 0.03
+MAX_PRICE      = 0.97
+PROP_MIN_PRICE = 0.08
+PROP_MAX_PRICE = 0.92
+
+
+def kalshi_prices(mkt: dict) -> Optional[Tuple[float, float]]:
+    """Return (yes_bid, yes_ask) in [0,1], or None if unavailable / out of bounds.
+
+    Requires a live two-sided order book (both bid AND ask present).
+    We do NOT fall back to last_price — that's a historical trade, not a
+    current executable price.  Near game time, market makers pull their
+    quotes and both sides go to 0/None.  Falling back to last_price in
+    that window produces stale-data ghost edges that don't exist in the
+    real order book.
+    """
+    try:
+        bid = float(mkt.get("yes_bid_dollars") or 0)
+        ask = float(mkt.get("yes_ask_dollars") or 0)
+    except (TypeError, ValueError):
+        bid, ask = 0.0, 0.0
+
+    if bid <= 0 or ask <= 0:
+        bid_c = mkt.get("yes_bid") or 0
+        ask_c = mkt.get("yes_ask") or 0
+        bid, ask = bid_c / 100, ask_c / 100
+
+    # Both sides must be live — no last_price fallback.
+    if bid <= 0 or ask <= 0:
+        return None
+    if bid > ask:
+        bid, ask = ask, bid
+
+    mid = (bid + ask) / 2
+    if mid < MIN_PRICE or mid > MAX_PRICE:
+        return None
+
+    return bid, ask
+
+
+# ── The Odds API — multi-book ─────────────────────────────────────────────────
+def fetch_book_odds(sport: str) -> Tuple[List[dict], str]:
+    """
+    Fetch h2h / spreads / totals (+ alternate totals) from ALL books in one API call.
+    One credit regardless of how many markets are requested.
+
+    alternate_totals: returns all Pinnacle alternate lines (7.5, 8.5, 9.5, 10.5 …)
+    so we can match the Kalshi threshold directly instead of Gaussian-extrapolating.
+    Pinnacle's alternate prices already bake in every venue/weather/matchup effect —
+    no model inference needed.
+    """
+    books = ",".join(BOOK_WEIGHTS.keys())
+    r = requests.get(f"{ODDS_BASE}/sports/{sport}/odds", params={
+        "apiKey":     ODDS_API_KEY,
+        "bookmakers": books,
+        "markets":    "h2h,spreads,totals",
+        "oddsFormat": "american",
+    }, timeout=15)
+    r.raise_for_status()
+    remaining = r.headers.get("x-requests-remaining", "?")
+    return r.json(), remaining
+
+
+# Keep old name as alias so UI import still works
+def fetch_pinnacle_odds(sport: str) -> Tuple[List[dict], str]:
+    return fetch_book_odds(sport)
+
+
+def fetch_game_scores(sport: str, days_from: int = 2) -> List[dict]:
+    r = requests.get(
+        f"{ODDS_BASE}/sports/{sport}/scores",
+        params={"apiKey": ODDS_API_KEY, "daysFrom": days_from},
+        timeout=15,
+    )
+    r.raise_for_status()
+    return [g for g in r.json() if g.get("completed")]
+
+
+def fetch_odds_events_list(sport: str) -> List[dict]:
+    r = requests.get(f"{ODDS_BASE}/sports/{sport}/events", params={
+        "apiKey": ODDS_API_KEY,
+    }, timeout=15)
+    r.raise_for_status()
+    return r.json()
+
+
+def fetch_player_prop_odds_event(sport: str, event_id: str) -> dict:
+    """
+    Fetch player-prop odds for one event from all books.
+    Falls back through books if earlier ones have no data.
+    Costs 1 Odds API credit per call.
+    """
+    all_books = ",".join(BOOK_WEIGHTS.keys())
+    # Try all books together first (one credit, richest data)
+    r = requests.get(
+        f"{ODDS_BASE}/sports/{sport}/events/{event_id}/odds",
+        params={
+            "apiKey":     ODDS_API_KEY,
+            "bookmakers": all_books,
+            "markets":    PLAYER_PROP_MARKETS,
+            "oddsFormat": "american",
+        },
+        timeout=15,
+    )
+    if r.status_code not in (404, 422):
+        r.raise_for_status()
+        data = r.json()
+        remaining = r.headers.get("x-requests-remaining", "?")
+        if any(bm.get("markets") for bm in data.get("bookmakers", [])):
+            books_found = [bm["key"] for bm in data.get("bookmakers", []) if bm.get("markets")]
+            print(f"    Props fetched {books_found}  |  credits left: {remaining}")
+            return data
+    return {}
+
+
+# ── No-vig probability helpers ───────────────────────────────────────────────
+def american_to_implied(odds: float) -> float:
+    return 100 / (odds + 100) if odds > 0 else abs(odds) / (abs(odds) + 100)
+
+
+def no_vig_prob(odds_a: float, odds_b: float) -> Tuple[float, float]:
+    """Return (p_a, p_b) after removing bookmaker vig."""
+    pa = american_to_implied(odds_a)
+    pb = american_to_implied(odds_b)
+    total = pa + pb
+    return pa / total, pb / total
+
+
+def prob_to_american(p: float) -> Optional[int]:
+    """Convert a decimal (no-vig) probability to American odds.
+    e.g. 0.60 → -150,  0.40 → +150,  0.50 → +100
+    Returns None for invalid inputs.
+    """
+    if p is None or p <= 0.0 or p >= 1.0:
+        return None
+    if p >= 0.5:
+        return round(-p / (1.0 - p) * 100)
+    else:
+        return round((1.0 - p) / p * 100)
+
+
+def _build_per_book_novig(books_detail: Dict[str, float], side: str) -> Dict[str, dict]:
+    """
+    Given books_detail {"pinnacle": 0.58, "draftkings": 0.57, ...} where each value
+    is the no-vig probability for the YES/over side, return a per-book breakdown:
+      {
+        "pinnacle":   {"yes_prob": 0.58, "no_prob": 0.42,
+                       "yes_american": -138, "no_american": +138},
+        "draftkings": {...},
+        ...
+      }
+    The `side` parameter ("YES"/"NO") is included for the caller's reference but
+    all four fields are always populated.
+    """
+    result: Dict[str, dict] = {}
+    for book, yes_p in books_detail.items():
+        if not isinstance(yes_p, float):
+            continue
+        no_p = 1.0 - yes_p
+        result[book] = {
+            "yes_prob":     round(yes_p, 4),
+            "no_prob":      round(no_p, 4),
+            "yes_american": prob_to_american(yes_p),
+            "no_american":  prob_to_american(no_p),
+        }
+    return result
+
+
+def _validate_book_consensus(
+    books_detail: Dict[str, float],
+    side: str,
+    k_side: float,
+) -> Tuple[bool, str]:
+    """
+    Validate that Pinnacle AND at least one of DraftKings / FanDuel both
+    indicate value on the same side before we count a bet as +EV.
+
+    books_detail: {book_key: yes_side_no_vig_prob}  (canonical YES probability)
+    side:   "YES" or "NO" — the proposed bet direction
+    k_side: Kalshi ask price for the bet side (tradeable cost)
+
+    A book "indicates value on a side" when its no-vig probability for that
+    side exceeds the Kalshi price you would pay to buy it.
+
+    Returns (is_valid: bool, reason: str).
+      is_valid=True  → reason is ""
+      is_valid=False → reason explains why the bet was rejected
+    """
+    def _side_prob(book: str) -> Optional[float]:
+        """Return this book's no-vig prob for the bet side."""
+        p_yes = books_detail.get(book)
+        if p_yes is None:
+            return None
+        return p_yes if side == "YES" else 1.0 - p_yes
+
+    pin_p = _side_prob("pinnacle")
+    dk_p  = _side_prob("draftkings")
+    fd_p  = _side_prob("fanduel")
+
+    opp_side = "NO" if side == "YES" else "YES"
+
+    # ── 1. Pinnacle must be present and must confirm the bet side ─────────
+    if pin_p is None:
+        return False, "Pinnacle odds not available — cannot validate direction"
+
+    if pin_p <= k_side:
+        return (
+            False,
+            f"Pinnacle does not confirm {side} "
+            f"(PIN {pin_p:.1%} ≤ Kalshi {k_side:.1%}; "
+            f"Pinnacle implies {opp_side} has value instead)",
+        )
+
+    # ── 2. Classify each retail book as confirming, neutral, or disagreeing ─
+    #   confirm  : book's no-vig prob for bet side > Kalshi price  → sees +EV on our side
+    #   disagree : book's no-vig prob for bet side < Kalshi price  → sees +EV on opposite side
+    #   neutral  : probability ≈ Kalshi price (within 0.5pp rounding)
+    confirm_books:  List[str] = []
+    disagree_books: List[str] = []
+
+    retail = [("draftkings", dk_p, "DraftKings"), ("fanduel", fd_p, "FanDuel")]
+    for bkey, bp, bname in retail:
+        if bp is None:
+            continue
+        if bp > k_side:
+            confirm_books.append(bname)
+        elif bp < k_side:
+            disagree_books.append(bname)
+        # bp == k_side → neutral (skip)
+
+    # ── 3. Reject if retail books actively disagree and none confirm ──────
+    if disagree_books and not confirm_books:
+        parts = []
+        for bkey, bp, bname in retail:
+            if bp is not None:
+                parts.append(f"{bname}={bp:.1%}")
+        return (
+            False,
+            f"Books disagree on direction: Pinnacle confirms {side} "
+            f"but {' and '.join(disagree_books)} indicate {opp_side} "
+            f"({', '.join(parts)}; Kalshi={k_side:.1%})",
+        )
+
+    # ── 4. Require at least one retail book to confirm ────────────────────
+    if not confirm_books:
+        available = [(bname, bp) for _, bp, bname in retail if bp is not None]
+        if not available:
+            return (
+                False,
+                f"Neither DraftKings nor FanDuel data available to confirm {side}",
+            )
+        detail = ", ".join(f"{n}={p:.1%}" for n, p in available)
+        return (
+            False,
+            f"Neither DraftKings nor FanDuel confirms value on {side} "
+            f"({detail} ≤ Kalshi {k_side:.1%})",
+        )
+
+    # ── 5. Valid — build a short confirmation string for the edge payload ─
+    confirmed_by = ["Pinnacle"] + confirm_books
+    return True, f"Confirmed by {' + '.join(confirmed_by)}"
+
+
+def _weighted_consensus(probs_by_book: Dict[str, float]) -> Tuple[float, List[str]]:
+    """
+    Compute a weighted-average probability from available books.
+    Renormalises weights if some books are missing.
+    Returns (consensus_prob, list_of_books_used).
+    """
+    total_w = sum(BOOK_WEIGHTS[b] for b in probs_by_book if b in BOOK_WEIGHTS)
+    if total_w == 0:
+        return 0.0, []
+    consensus = sum(BOOK_WEIGHTS[b] * p for b, p in probs_by_book.items()
+                    if b in BOOK_WEIGHTS) / total_w
+    return consensus, sorted(probs_by_book.keys())
+
+
+# ── Consensus game index ─────────────────────────────────────────────────────
+def build_consensus_game_index(
+    games: List[dict],
+    total_range: Tuple[float, float] = (0, 9999),
+    spread_limit: float = 99,
+) -> Dict[str, dict]:
+    """
+    Build { normalised_team_name: game_info } with weighted-consensus probabilities.
+
+    game_info["spread"][team] = (consensus_prob, anchor_point, per_book_detail)
+      anchor_point: Pinnacle's spread point if available, else first available book's
+      per_book_detail: {"pinnacle": 0.58, "draftkings": 0.57, ...}
+
+    game_info["total"] = {
+        "over_point":  float,          # Pinnacle line (or best fallback)
+        "over_prob":   float,          # weighted consensus
+        "under_prob":  float,
+        "books_used":  [str, ...],
+        "per_book":    {"pinnacle": {"over_prob": ..., "under_prob": ..., "over_point": ...}, ...}
+    }
+    """
+    index: Dict[str, dict] = {}
+
+    for game in games:
+        home, away = game["home_team"], game["away_team"]
+        info: dict = {
+            "home": home, "away": away,
+            "h2h": {}, "spread": {}, "total": {},
+        }
+
+        # ── Collect per-book data ────────────────────────────────────────────
+        bk_spread: Dict[str, Dict[str, Tuple[float, float]]] = {}
+        # bk_spread[book][team] = (no_vig_prob, spread_point)
+
+        bk_total: Dict[str, dict] = {}
+        # bk_total[book] = {over_point, over_prob, under_prob}  (most-central line)
+
+        pin_total_lines: Dict[float, dict] = {}
+        # pin_total_lines[line] = {over_prob, under_prob}  — ALL Pinnacle lines stored
+
+        pin_spread_lines: Dict[str, Dict[float, float]] = {}
+        # pin_spread_lines[team][abs_spread] = no_vig_cover_prob
+        # Populated from alternate_spreads — every Pinnacle line where that
+        # team is listed at a negative spread (i.e. favored to cover by that margin).
+        # Used for direct-match spread fair value — no Gaussian inference.
+
+        pin_spread_points: Dict[str, float] = {}  # team → Pinnacle main spread point
+        pin_total_point: Optional[float] = None
+
+        for bm in game.get("bookmakers", []):
+            bkey = bm["key"]
+            if bkey not in BOOK_WEIGHTS:
+                continue
+
+            for mkt in bm.get("markets", []):
+                mtype = mkt.get("key")
+                outs  = mkt.get("outcomes", [])
+
+                # ── h2h (moneyline) ────────────────────────────────────────
+                if mtype == "h2h" and len(outs) == 2:
+                    pa, pb = no_vig_prob(outs[0]["price"], outs[1]["price"])
+                    # store per-book h2h probs but don't build consensus here
+                    # (h2h isn't used directly for fair-value calc in scan_sport)
+                    info["h2h"].setdefault(outs[0]["name"], {})[bkey] = pa
+                    info["h2h"].setdefault(outs[1]["name"], {})[bkey] = pb
+
+                # ── spreads + alternate_spreads ────────────────────────────
+                # alternate_spreads returns every Pinnacle line (-0.5, -1.5,
+                # -2.5 …) so we can match the Kalshi threshold directly.
+                # For each outcome where point < 0 (team favored to cover by
+                # that margin), store the no-vig cover probability directly —
+                # no Gaussian inference needed.
+                elif mtype in ("spreads", "alternate_spreads") and len(outs) == 2:
+                    pt0 = float(outs[0].get("point") or 0)
+                    if abs(pt0) > spread_limit:
+                        continue
+                    pa, pb = no_vig_prob(outs[0]["price"], outs[1]["price"])
+                    probs = [(outs[0]["name"], pa, float(outs[0].get("point", 0))),
+                             (outs[1]["name"], pb, float(outs[1].get("point", 0)))]
+                    # Main spread: update consensus anchor
+                    if mtype == "spreads":
+                        if bkey not in bk_spread:
+                            bk_spread[bkey] = {}
+                        bk_spread[bkey][outs[0]["name"]] = (pa, float(outs[0].get("point", 0)))
+                        bk_spread[bkey][outs[1]["name"]] = (pb, float(outs[1].get("point", 0)))
+                        if bkey == "pinnacle":
+                            for o in outs:
+                                pin_spread_points[o["name"]] = float(o.get("point", 0))
+                    # All spread lines (main + alternate): store Pinnacle cover probs
+                    # Only store entries where point < 0, meaning this team is
+                    # posted as the "favorite" to cover by that margin.
+                    if bkey == "pinnacle":
+                        for tname, cov_prob, pt in probs:
+                            if pt < 0:
+                                abs_pt = abs(pt)
+                                if tname not in pin_spread_lines:
+                                    pin_spread_lines[tname] = {}
+                                pin_spread_lines[tname][abs_pt] = cov_prob
+
+                # ── totals + alternate_totals ──────────────────────────────
+                # alternate_totals returns every Pinnacle line (7.5, 8.5, 9.5,
+                # 10.5 …) so we can match the Kalshi threshold directly.
+                # Pinnacle's alternate prices already embed all venue/weather/
+                # matchup effects — no Gaussian inference needed.
+                elif mtype in ("totals", "alternate_totals") and len(outs) >= 2:
+                    over  = next((o for o in outs if o["name"] == "Over"),  None)
+                    under = next((o for o in outs if o["name"] == "Under"), None)
+                    if not (over and under):
+                        continue
+                    pt = float(over.get("point") or 0)
+                    if not (total_range[0] <= pt <= total_range[1]):
+                        continue
+                    po, pu = no_vig_prob(over["price"], under["price"])
+                    # For the main total line: track the most-central line per book
+                    # (alternate lines don't update the consensus anchor)
+                    if mtype == "totals":
+                        mid_range = (total_range[0] + total_range[1]) / 2
+                        existing  = bk_total.get(bkey, {}).get("over_point")
+                        if existing is None or abs(pt - mid_range) < abs(existing - mid_range):
+                            bk_total[bkey] = {"over_point": pt, "over_prob": po, "under_prob": pu}
+                        if bkey == "pinnacle":
+                            pin_total_point = pt
+                    # Store ALL Pinnacle lines (main + alternate) for direct matching
+                    if bkey == "pinnacle":
+                        pin_total_lines[pt] = {"over_prob": po, "under_prob": pu}
+
+        # ── Build consensus spread ───────────────────────────────────────────
+        all_spread_teams: set = set()
+        for bd in bk_spread.values():
+            all_spread_teams.update(bd.keys())
+
+        for team in all_spread_teams:
+            per_book_probs: Dict[str, float] = {}
+            anchor_point: Optional[float] = pin_spread_points.get(team)
+
+            for bkey, bd in bk_spread.items():
+                if team in bd:
+                    prob, pt = bd[team]
+                    per_book_probs[bkey] = prob
+                    if anchor_point is None:
+                        anchor_point = pt  # fallback to first available book
+
+            if not per_book_probs or anchor_point is None:
+                continue
+
+            consensus_p, books_used = _weighted_consensus(per_book_probs)
+            # Safety: require at least Pinnacle alone, or 2+ books, to trust the line
+            has_pinnacle = "pinnacle" in per_book_probs
+            if not has_pinnacle and len(per_book_probs) < 2:
+                continue  # single non-Pinnacle book — not reliable enough
+
+            info["spread"][team] = (consensus_p, anchor_point, per_book_probs)
+
+        # ── Build consensus total ─────────────────────────────────────────────
+        if bk_total:
+            over_probs:  Dict[str, float] = {bk: td["over_prob"]  for bk, td in bk_total.items()}
+            under_probs: Dict[str, float] = {bk: td["under_prob"] for bk, td in bk_total.items()}
+
+            cons_over, books_used = _weighted_consensus(over_probs)
+            cons_under, _         = _weighted_consensus(under_probs)
+
+            # Renormalise (should already sum to ~1)
+            s = cons_over + cons_under
+            if s > 0:
+                cons_over  /= s
+                cons_under /= s
+
+            # Anchor point: Pinnacle's line, or closest available
+            if pin_total_point is not None:
+                anchor_pt = pin_total_point
+            else:
+                anchor_pt = next(iter(bk_total.values()))["over_point"]
+
+            has_pinnacle = "pinnacle" in bk_total
+            if has_pinnacle or len(bk_total) >= 2:
+                info["total"] = {
+                    "over_point":  anchor_pt,
+                    "over_prob":   cons_over,
+                    "under_prob":  cons_under,
+                    "books_used":  books_used,
+                    "per_book":    bk_total,
+                    # All Pinnacle lines keyed by point value — used in scan_sport
+                    # to prefer exact-match over equivalence-rule when possible
+                    "pin_lines":   pin_total_lines,
+                }
+
+        # Store all Pinnacle alternate spread lines for direct matching in scan_sport
+        if pin_spread_lines:
+            info["spread_pin_lines"] = pin_spread_lines
+
+        # ── Build consensus moneyline (h2h) ──────────────────────────────────────
+        # Restructure info["h2h"] from {team: {book: prob}} to
+        # {team: (consensus_prob, per_book_probs)} — same shape as spread entries.
+        h2h_raw = info.get("h2h", {})
+        info["h2h"] = {}
+        for team, per_book in h2h_raw.items():
+            has_pinnacle = "pinnacle" in per_book
+            if not has_pinnacle and len(per_book) < 2:
+                continue
+            consensus_p, _ = _weighted_consensus(per_book)
+            info["h2h"][team] = (consensus_p, per_book)
+
+        # Skip games that have already commenced
+        ct_str = game.get("commence_time", "")
+        if ct_str:
+            try:
+                ct = datetime.fromisoformat(ct_str.replace("Z", "+00:00"))
+                if ct < datetime.now(timezone.utc):
+                    continue
+            except ValueError:
+                pass
+
+        # Key by team+date to handle doubleheaders / same-day games.
+        # Also store a bare-team fallback for any code that doesn't have the date.
+        game_date = ct_str[:10] if ct_str else ""  # YYYY-MM-DD or ""
+        info["_game_date"] = game_date   # embed date so _find_game can cross-check
+        for team in [home, away]:
+            nteam = _norm(team)
+            if game_date:
+                index[f"{nteam}_{game_date}"] = info
+            # Bare-team fallback: keep the entry with more spread data (richer)
+            existing = index.get(nteam, {})
+            if len(info["spread"]) >= len(existing.get("spread", {})):
+                index[nteam] = info
+
+    return index
+
+
+# Keep old name as alias
+def build_game_index(
+    games: List[dict],
+    total_range: Tuple[float, float] = (0, 9999),
+    spread_limit: float = 99,
+) -> Dict[str, dict]:
+    return build_consensus_game_index(games, total_range, spread_limit)
+
+
+# ── Correlation control ───────────────────────────────────────────────────────
+def _apply_correlation_control(
+    edges: List[dict],
+    max_per_group: int = MAX_BETS_PER_GROUP,
+) -> List[dict]:
+    """
+    Limit to max_per_group bets per (matchup, mkt_type) group.
+    Input should already be sorted by adj. edge descending.
+    """
+    group_counts: Dict[tuple, int] = {}
+    result = []
+    for e in edges:
+        key = (e.get("matchup", ""), e.get("mkt_type", ""))
+        cnt = group_counts.get(key, 0)
+        if cnt < max_per_group:
+            group_counts[key] = cnt + 1
+            result.append(e)
+    return result
+
+
+# ── Pre-execution EV recheck ─────────────────────────────────────────────────
+def recheck_ev(ticker: str, fair_prob: float, side: str) -> Optional[dict]:
+    """
+    Re-fetch the latest Kalshi price for `ticker` and recompute adjusted EV.
+
+    Returns a dict with updated metrics if the bet still qualifies, else None.
+    Discard the bet if:
+      - price is unavailable
+      - adjusted EV fell below EDGE_THRESHOLD
+    """
+    try:
+        mkt_data = kalshi_get(f"/markets/{ticker}")
+        mkt = mkt_data.get("market", mkt_data)
+        prices = kalshi_prices(mkt)
+    except Exception as e:
+        print(f"  recheck_ev ERROR [{ticker}]: {e}")
+        return None
+
+    if prices is None:
+        print(f"  recheck_ev: no price for {ticker} — discarding")
+        return None
+
+    yes_bid, yes_ask = prices
+
+    if side == "YES":
+        raw_edge = fair_prob - yes_ask
+        k_price  = yes_ask
+    else:
+        raw_edge = (1 - fair_prob) - (1 - yes_bid)
+        k_price  = 1 - yes_bid
+
+    adj_edge = raw_edge * (1 - EV_HAIRCUT)
+
+    if adj_edge < EDGE_THRESHOLD or adj_edge > MAX_EDGE or k_price < MIN_KALSHI_PRICE:
+        print(f"  recheck_ev: {ticker} {side} — edge {adj_edge:.1%} out of range [{EDGE_THRESHOLD:.0%}–{MAX_EDGE:.0%}] or price {k_price:.2f} below floor, discarding")
+        return None
+
+    return {
+        "ticker":     ticker,
+        "side":       side,
+        "k_price":    round(k_price, 4),
+        "raw_edge":   round(raw_edge, 4),
+        "adj_edge":   round(adj_edge, 4),
+        "rechecked_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+
+def validate_bet(edge: dict, max_age_seconds: int = 600) -> dict:
+    """
+    Pre-execution validation — call this immediately before placing any bet.
+
+    Re-fetches both the current Kalshi price AND Pinnacle's latest odds, then
+    reports exactly what has changed since the edge was first flagged and
+    whether it is still valid to bet on.
+
+    Args:
+        edge:            The edge dict produced by scan_sport() / stored in _bets
+        max_age_seconds: Reject if flagged more than this many seconds ago (default 10 min)
+
+    Returns a dict with:
+        valid          bool   — True only if safe to bet right now
+        reason         str    — Human-readable verdict
+        kalshi_moved   float  — How much Kalshi price changed (pp), + = moved against us
+        fair_moved     float  — How much fair value changed (pp), + = edge improved
+        edge_now       float  — Current adjusted edge (post-haircut), None if unavailable
+        edge_was       float  — Edge at flag time
+        kalshi_now     float  — Current Kalshi ask/bid price for the side
+        kalshi_was     float  — Kalshi price at flag time
+        fair_now       float  — Current fair probability (re-fetched from Pinnacle)
+        fair_was       float  — Fair probability at flag time
+        age_seconds    int    — Seconds since edge was flagged
+        staleness_ok   bool   — False if edge is older than max_age_seconds
+    """
+    result: dict = {
+        "valid": False,
+        "reason": "",
+        "kalshi_moved": None,
+        "fair_moved": None,
+        "edge_now": None,
+        "edge_was": round(edge.get("edge", edge.get("adj_edge", 0)) * 100, 2),
+        "kalshi_now": None,
+        "kalshi_was": round(edge.get("kalshi", edge.get("kalshi_price", 0)) * 100, 1),
+        "fair_now": None,
+        "fair_was": round(edge.get("fair", 0) * 100, 1),
+        "age_seconds": None,
+        "staleness_ok": True,
+    }
+
+    ticker  = edge.get("ticker", "")
+    side    = edge.get("side", "YES")
+    fair_was = edge.get("fair", 0)
+    edge_was = edge.get("edge", edge.get("adj_edge", 0))
+
+    # ── 1. Staleness check ────────────────────────────────────────────────────
+    flagged_at = edge.get("flagged_at") or edge.get("kalshi_price_ts", "")
+    if flagged_at:
+        try:
+            flag_dt = datetime.fromisoformat(flagged_at)
+            age = (datetime.now(timezone.utc) - flag_dt).total_seconds()
+            result["age_seconds"] = int(age)
+            if age > max_age_seconds:
+                result["staleness_ok"] = False
+                result["reason"] = (
+                    f"STALE — flagged {int(age)}s ago (limit {max_age_seconds}s). "
+                    f"Re-scan before betting."
+                )
+                return result
+        except ValueError:
+            pass
+
+    # ── 2. Re-fetch current Kalshi price ──────────────────────────────────────
+    try:
+        mkt_data = kalshi_get(f"/markets/{ticker}")
+        mkt = mkt_data.get("market", mkt_data)
+
+        # Check if market already resolved
+        if mkt.get("result"):
+            result["reason"] = f"MARKET RESOLVED — result: {mkt['result'].upper()}"
+            return result
+
+        # Check market is still active
+        if mkt.get("status") not in ("active", "open"):
+            result["reason"] = f"MARKET NOT ACTIVE — status: {mkt.get('status', '?')}"
+            return result
+
+        prices = kalshi_prices(mkt)
+        if prices is None:
+            result["reason"] = "NO KALSHI PRICE — market may be illiquid"
+            return result
+
+        yes_bid, yes_ask = prices
+        kalshi_now = yes_ask if side == "YES" else (1 - yes_bid)
+        result["kalshi_now"] = round(kalshi_now * 100, 1)
+
+        kalshi_was_dec = edge.get("kalshi", edge.get("kalshi_price", 0))
+        kalshi_moved_pp = round((kalshi_now - kalshi_was_dec) * 100, 1)
+        result["kalshi_moved"] = kalshi_moved_pp  # positive = price rose (worse for YES bets)
+
+    except Exception as exc:
+        result["reason"] = f"KALSHI API ERROR — {exc}"
+        return result
+
+    # ── 3. Re-fetch Pinnacle fair value ───────────────────────────────────────
+    try:
+        odds_sport  = edge.get("odds_sport", "")
+        mkt_type    = edge.get("mkt_type", "")
+        matchup     = edge.get("matchup", "")
+
+        # Determine sport from ticker prefix if not stored on edge
+        if not odds_sport:
+            t = ticker.upper()
+            if "KXMLB" in t:
+                odds_sport = "baseball_mlb"
+            elif "KXNBA" in t:
+                odds_sport = "basketball_nba"
+        fair_now = None
+        if odds_sport:
+            games, _ = fetch_book_odds(odds_sport)
+            # Find this specific game
+            away_raw = matchup.split(" @ ")[0].strip() if " @ " in matchup else ""
+            home_raw = matchup.split(" @ ")[1].strip() if " @ " in matchup else ""
+            game_date = _parse_ticker_date(ticker)
+            index = build_consensus_game_index(games)
+            game_info = _find_game(away_raw, home_raw, index, game_date)
+
+            if game_info and mkt_type == "total":
+                total_info = game_info.get("total", {})
+                threshold  = edge.get("threshold") or edge.get("pin_line")
+                # Try to extract threshold from title if not stored
+                if threshold is None:
+                    import re as _re
+                    m = _re.search(r">(\d+\.?\d*)", edge.get("title", ""))
+                    if m:
+                        threshold = float(m.group(1))
+                if threshold is not None and total_info:
+                    pin_lines = total_info.get("pin_lines", {})
+                    for pt, probs in pin_lines.items():
+                        if abs(pt - threshold) <= 0.25:
+                            fair_now = probs["over_prob"] if side == "YES" else probs["under_prob"]
+                            break
+                    if fair_now is None:
+                        fair_now = total_info.get("over_prob") if side == "YES" else total_info.get("under_prob")
+
+            elif game_info and mkt_type == "moneyline":
+                team_name = edge.get("team_name", "")
+                h2h = game_info.get("h2h", {})
+                for k, v in h2h.items():
+                    if _norm(k) == _norm(team_name) or _norm(team_name) in _norm(k):
+                        fair_now = v[0]
+                        break
+
+        # Fall back to stored fair if we couldn't re-fetch
+        if fair_now is None:
+            fair_now = fair_was
+
+        result["fair_now"] = round(fair_now * 100, 1)
+        fair_moved_pp = round((fair_now - fair_was) * 100, 1)
+        result["fair_moved"] = fair_moved_pp
+
+    except Exception as exc:
+        # Non-fatal — use stored fair value if Pinnacle re-fetch fails
+        fair_now = fair_was
+        result["fair_now"] = round(fair_now * 100, 1)
+        result["fair_moved"] = 0.0
+
+    # ── 4. Recompute edge ─────────────────────────────────────────────────────
+    if side == "YES":
+        raw_now = fair_now - kalshi_now
+    else:
+        raw_now = (1 - fair_now) - (1 - kalshi_now)
+
+    adj_now = raw_now * (1 - EV_HAIRCUT)
+    result["edge_now"] = round(adj_now * 100, 2)
+
+    # ── 5. Verdict ────────────────────────────────────────────────────────────
+    issues = []
+
+    if adj_now < EDGE_THRESHOLD:
+        result["reason"] = (
+            f"EDGE GONE — was +{edge_was*100:.1f}% adj, now +{adj_now*100:.1f}% "
+            f"(Kalshi moved {result['kalshi_moved']:+.1f}pp, "
+            f"fair moved {result['fair_moved']:+.1f}pp)"
+        )
+        return result
+
+    if adj_now > MAX_EDGE:
+        result["reason"] = (
+            f"EDGE TOO LARGE ({adj_now*100:.1f}%) — possible data error, do not bet"
+        )
+        return result
+
+    if kalshi_now < MIN_KALSHI_PRICE:
+        result["reason"] = f"PRICE TOO LOW — {kalshi_now*100:.0f}¢ below floor"
+        return result
+
+    # Flag significant line movement even if edge survives
+    if abs(result["kalshi_moved"]) >= 3:
+        issues.append(f"Kalshi moved {result['kalshi_moved']:+.1f}pp")
+    if abs(result["fair_moved"]) >= 2:
+        issues.append(f"fair value moved {result['fair_moved']:+.1f}pp")
+
+    edge_shrink = edge_was - adj_now
+    if edge_shrink > 0.02:  # edge shrank by >2pp
+        issues.append(f"edge shrank {edge_shrink*100:.1f}pp (was +{edge_was*100:.1f}%, now +{adj_now*100:.1f}%)")
+
+    age_str = f"{result['age_seconds']}s old" if result["age_seconds"] is not None else "age unknown"
+
+    if issues:
+        result["valid"] = True
+        result["reason"] = (
+            f"VALID WITH CAUTION ({age_str}) — " + "; ".join(issues) +
+            f". Edge still +{adj_now*100:.1f}% adj."
+        )
+    else:
+        result["valid"] = True
+        result["reason"] = (
+            f"VALID ({age_str}) — edge confirmed +{adj_now*100:.1f}% adj. "
+            f"Kalshi {result['kalshi_now']}¢, fair {result['fair_now']}¢. "
+            f"No significant line movement."
+        )
+
+    return result
+
+
+# ── Normal distribution ───────────────────────────────────────────────────────
+def norm_cdf(x: float, mu: float = 0, sigma: float = 1) -> float:
+    return 0.5 * (1 + math.erf((x - mu) / (sigma * math.sqrt(2))))
+
+
+# ── Poisson model (player props) ──────────────────────────────────────────────
+def poisson_pmf(k: int, lam: float) -> float:
+    if lam <= 0 or k < 0:
+        return 0.0
+    return math.exp(-lam + k * math.log(lam) - math.lgamma(k + 1))
+
+
+def poisson_cdf(n: int, lam: float) -> float:
+    return sum(poisson_pmf(i, lam) for i in range(max(0, int(n)) + 1))
+
+
+def poisson_lambda_from_line(line: float, over_prob: float) -> Optional[float]:
+    """
+    Invert: find λ such that P(X > floor(line)) = over_prob.
+    Sanity guards: over_prob ∈ (0.05, 0.95), λ > 0.1.
+    """
+    if not (0.05 < over_prob < 0.95):
+        return None
+    k = int(line)
+    target_cdf = 1.0 - over_prob
+    if not (0.05 < target_cdf < 0.95):
+        return None
+    lo, hi = 0.001, max(line * 6 + 5, 20)
+    for _ in range(80):
+        mid = (lo + hi) / 2
+        if poisson_cdf(k, mid) > target_cdf:
+            lo = mid
+        else:
+            hi = mid
+    lam = (lo + hi) / 2
+    if lam <= 0.1:
+        return None
+    return lam
+
+
+def fair_spread_prob(threshold: float, mean_margin: float, std: float) -> float:
+    return 1 - norm_cdf(threshold, mu=mean_margin, sigma=std)
+
+
+def fair_total_prob(threshold: float, mean_total: float, std: float) -> float:
+    return 1 - norm_cdf(threshold, mu=mean_total, sigma=std)
+
+
+def pinnacle_mean_from_spread(spread_point: float, cover_prob: float, std: float) -> float:
+    """
+    Invert normal CDF: given P(margin > spread_point) = cover_prob, find mean margin.
+    Uses binary search approximation of the normal quantile function.
+    """
+    p_target = 1 - cover_prob
+    lo, hi = spread_point - 4 * std, spread_point + 4 * std
+    for _ in range(60):
+        mid = (lo + hi) / 2
+        if norm_cdf(spread_point, mu=mid, sigma=std) < p_target:
+            hi = mid
+        else:
+            lo = mid
+    return (lo + hi) / 2
+
+
+# ── Threshold equivalence ────────────────────────────────────────────────────
+def _lines_equivalent(a: float, b: float) -> bool:
+    """
+    Two thresholds produce identical outcomes for integer-scored sports when
+    no integer score sits strictly in (min, max].
+
+    P(score > 8.0) == P(score > 8.5) == P(score >= 9)  → equivalent
+    P(score > 8.5) != P(score > 9.0)                   → not equivalent (9 can hit)
+    P(margin > 1.0) == P(margin > 1.5) == P(margin >= 2) → equivalent
+    P(margin > 1.5) != P(margin > 2.0)                 → not equivalent (2 can hit)
+
+    Uses ceil(x + ε) so integer endpoints (8.0, 9.0) round up to the NEXT
+    integer — matching "strictly greater than" semantics.
+    """
+    return math.ceil(a + 1e-9) == math.ceil(b + 1e-9)
+
+
+# ── Text helpers ─────────────────────────────────────────────────────────────
+_MONTH_NUM = {"JAN":1,"FEB":2,"MAR":3,"APR":4,"MAY":5,"JUN":6,
+              "JUL":7,"AUG":8,"SEP":9,"OCT":10,"NOV":11,"DEC":12}
+
+def _parse_ticker_game_time(ticker: str) -> Optional[datetime]:
+    m = re.search(r"-(\d{2})([A-Z]{3})(\d{2})(\d{4})?", ticker)
+    if not m:
+        return None
+    yy, mon, dd, hhmm = m.group(1), m.group(2), m.group(3), m.group(4)
+    month = _MONTH_NUM.get(mon)
+    if not month:
+        return None
+    try:
+        year = 2000 + int(yy)
+        day  = int(dd)
+        hh, mm = (int(hhmm[:2]), int(hhmm[2:])) if hhmm else (0, 0)
+        return datetime(year, month, day, hh, mm, tzinfo=timezone.utc)
+    except ValueError:
+        return None
+
+
+def _norm(s: str) -> str:
+    return re.sub(r"[^a-z0-9]", "", s.lower())
+
+
+def _abbr_to_name(abbr: str, abbr_map: Dict[str, str]) -> Optional[str]:
+    return abbr_map.get(abbr.upper())
+
+
+def build_city_lookup(abbr_map: Dict[str, str]) -> Dict[str, str]:
+    lu: Dict[str, str] = {}
+    for abbr, full in abbr_map.items():
+        lu[_norm(abbr)] = full
+        lu[_norm(full)] = full
+        words = full.split()
+        for i in range(1, len(words)):
+            city_key = _norm(" ".join(words[:i]))
+            if city_key not in lu:
+                lu[city_key] = full
+        nick = _norm(words[-1])
+        if nick not in lu:
+            lu[nick] = full
+    return lu
+
+
+def _find_game(
+    team_a: str,
+    team_b: str,
+    game_index: Dict[str, dict],
+    game_date: Optional[str] = None,
+) -> Optional[dict]:
+    """Look up a game by team name, preferring the date-keyed entry to avoid
+    doubleheader / back-to-back collisions where two games map to the same
+    bare-team key (e.g. Mets @ Dodgers on Apr 13 vs Apr 14).
+
+    Late-night games (e.g. 10 PM ET = 2 AM UTC) cause a 1-day date skew:
+    Kalshi tickers use ET date while Pinnacle uses UTC date.  We allow a
+    ±1-day tolerance so these games match correctly.
+    """
+    from datetime import date as _date, timedelta as _td
+    # Build a list of candidate dates: exact match + next day (ET→UTC skew)
+    candidate_dates: list = []
+    if game_date:
+        candidate_dates.append(game_date)
+        try:
+            next_day = (_date.fromisoformat(game_date) + _td(days=1)).isoformat()
+            candidate_dates.append(next_day)
+        except ValueError:
+            pass
+
+    for t in [team_a, team_b]:
+        if t is None:
+            continue
+        key = _norm(t)
+        # 1. Try each candidate date key (exact date first, then +1 day)
+        for cdate in candidate_dates:
+            date_key = f"{key}_{cdate}"
+            if date_key in game_index:
+                return game_index[date_key]
+        # 2. Bare-team fallback — verify date is within ±1 day to avoid
+        #    using a completely different series game's Pinnacle odds.
+        if key in game_index:
+            entry = game_index[key]
+            stored_date = entry.get("_game_date", "")
+            if game_date and stored_date and stored_date not in candidate_dates:
+                continue
+            return entry
+    return None
+
+
+# ── Event ticker parsers ──────────────────────────────────────────────────────
+def _parse_nba_event(ticker: str, abbr_map: Dict[str, str]) -> Tuple[Optional[str], Optional[str]]:
+    suffix = re.sub(r"^KX\w+?-\d+[A-Z]+\d+", "", ticker).lstrip("-")
+    for i in range(2, len(suffix) - 1):
+        a, b = suffix[:i], suffix[i:]
+        na = _abbr_to_name(a, abbr_map)
+        nb = _abbr_to_name(b, abbr_map)
+        if na and nb:
+            return na, nb
+    return None, None
+
+
+def _parse_mlb_event(ticker: str, abbr_map: Dict[str, str]) -> Tuple[Optional[str], Optional[str]]:
+    suffix = re.sub(r"^KX\w+?-\d+[A-Z]+\d+\d{4}", "", ticker)
+    if not suffix:
+        suffix = re.sub(r"^KX\w+?-\d+[A-Z]+\d+", "", ticker).lstrip("-")
+    for i in range(2, len(suffix) - 1):
+        a, b = suffix[:i], suffix[i:]
+        na = _abbr_to_name(a, abbr_map)
+        nb = _abbr_to_name(b, abbr_map)
+        if na and nb:
+            return na, nb
+    return None, None
+
+
+def _parse_moneyline_team(
+    market: dict,
+    away_name: str,
+    home_name: str,
+    city_lu: Dict[str, str],
+) -> Optional[str]:
+    """
+    Parse which team a moneyline Kalshi market refers to from its title.
+    Returns the full team name (matching away_name or home_name) or None.
+    """
+    title = (market.get("title") or market.get("yes_sub_title") or "").lower()
+    for name in [away_name, home_name]:
+        if name is None:
+            continue
+        if _norm(name) in _norm(title):
+            return name
+        # Also check city name or nickname (last word)
+        last = _norm(name.split()[-1])
+        if len(last) > 3 and last in _norm(title):
+            return name
+    # Fallback: check each word in the title against the city lookup
+    for word in re.split(r"[\s\?\-]+", title):
+        key = _norm(word)
+        if not key:
+            continue
+        full = city_lu.get(key)
+        if full in (away_name, home_name):
+            return full
+    return None
+
+
+def _parse_market_team_and_threshold(
+    market: dict,
+    series: str,
+    event_ticker: str,
+    away_name: str,
+    home_name: str,
+) -> Tuple[Optional[str], Optional[str], Optional[float]]:
+    ticker    = market.get("ticker", "")
+    title     = market.get("title", "") or ""
+    floor_str = market.get("floor_strike")
+
+    try:
+        threshold = float(floor_str) if floor_str is not None else None
+    except (TypeError, ValueError):
+        threshold = None
+
+    if threshold is None:
+        return None, None, None
+
+    if "TOTAL" in series:
+        if "over" in title.lower():
+            return None, "total_over", threshold
+        if "under" in title.lower():
+            return None, "total_under", threshold
+        return None, "total_over", threshold
+
+    title_lc = title.lower()
+    for name in [away_name, home_name]:
+        if name and _norm(name.split()[-1]) in title_lc:
+            return name, "spread_team", threshold
+        if name and _norm(name) in title_lc:
+            return name, "spread_team", threshold
+
+    mkt_suffix = ticker.replace(event_ticker, "").lstrip("-").upper()
+    for team in [away_name, home_name]:
+        if team is None:
+            continue
+        for abbr, full in {**NBA_ABBR, **MLB_ABBR}.items():
+            if full == team and mkt_suffix.startswith(abbr):
+                return team, "spread_team", threshold
+
+    return None, None, threshold
+
+
+# ── Book confidence ────────────────────────────────────────────────────────────
+def _book_confidence(books_detail: dict) -> float:
+    """
+    How tightly do the contributing books agree on fair probability?
+    Returns 0.0 – 1.0:
+      1.0  all books identical (perfect agreement)
+      0.0  books spread ≥ 10 pp apart (high disagreement / stale line)
+      0.5  only one book available (unverified)
+
+    High confidence + high EV = strongest bet signal.
+    Low confidence can mean: line moving, injury news, one book is stale.
+    """
+    probs = [v for v in books_detail.values() if isinstance(v, (int, float))]
+    if len(probs) < 2:
+        return 0.5
+    spread = max(probs) - min(probs)
+    return round(max(0.0, 1.0 - spread / 0.10), 3)
+
+
+# ── Odds index fetch (decoupled from Kalshi scan) ─────────────────────────────
+def fetch_odds_index(
+    odds_sport: str,
+    total_range: Tuple[float, float] = (0, 9999),
+    spread_limit: float = 99,
+) -> Tuple[Optional[Dict], str]:
+    """
+    Fetch book odds and build the consensus game index.
+    Costs exactly 1 Odds API credit per call.
+
+    Intended for the slow 30-min refresh loop so the fast 2-min Kalshi
+    scan can reuse the cached result without spending credits.
+    """
+    try:
+        games, remaining = fetch_book_odds(odds_sport)
+        index = build_consensus_game_index(games, total_range, spread_limit)
+        n = len(index) // max(1, 2)
+        print(f"  Odds index refreshed [{odds_sport}]: {n} matchups  "
+              f"|  credits left: {remaining}")
+        return index, remaining
+    except Exception as exc:
+        print(f"  ERROR refreshing odds index [{odds_sport}]: {exc}")
+        return None, "?"
+
+
+# ── Scanner ───────────────────────────────────────────────────────────────────
+def scan_sport(
+    label: str,
+    spread_series: str,
+    total_series: str,
+    odds_sport: str,
+    abbr_map: Dict[str, str],
+    spread_std: float,
+    total_std: float,
+    game_index: Optional[Dict] = None,   # pass cached index to skip Odds API call
+    ml_series: str = "",                 # Kalshi moneyline series (optional)
+) -> List[dict]:
+    """
+    Scan one sport's Kalshi spread, total, and optionally moneyline markets
+    vs the weighted-consensus fair probability from Pinnacle / DraftKings / FanDuel.
+
+    Returns a list of edge dicts, each containing:
+      ticker, title, matchup, side, kalshi, fair, raw_edge, edge (adj),
+      mkt_type, pin_line, books_used, books_detail, consensus_prob, kalshi_price_ts
+    """
+
+    print(f"\n{'═'*70}")
+    print(f"  {label}  —  {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"  Books: {' + '.join(f'{b}({w:.0%})' for b, w in BOOK_WEIGHTS.items())}")
+    print(f"  EV haircut: {EV_HAIRCUT:.0%}   Min adj. EV: {EDGE_THRESHOLD:.0%}   Top N: {TOP_BETS_PER_CYCLE}")
+    print(f"{'═'*70}")
+
+    # ── 1. Game index (use cached if provided, otherwise fetch — costs 1 credit) ──
+    if game_index is not None:
+        unique_matchups = len(game_index) // max(1, 2)
+        print(f"  Using cached odds index: {unique_matchups} matchups  (0 credits)")
+    else:
+        try:
+            if "baseball" in odds_sport:
+                game_index, remaining = fetch_odds_index(
+                    odds_sport, total_range=(5.0, 14.0), spread_limit=3.0
+                )
+            else:
+                game_index, remaining = fetch_odds_index(
+                    odds_sport, total_range=(170.0, 280.0), spread_limit=40.0
+                )
+            if game_index is None:
+                return []
+        except Exception as exc:
+            print(f"  ERROR — book odds: {exc}")
+            return []
+
+    # ── 2. Kalshi markets ─────────────────────────────────────────────────
+    edges:      List[dict] = []
+    seen_edges: set        = set()
+    no_price_count         = 0
+    city_lu = build_city_lookup(abbr_map)
+    now_utc = datetime.now(timezone.utc)
+
+    def resolve(raw: Optional[str]) -> Optional[str]:
+        if not raw:
+            return None
+        if _norm(raw) in game_index:
+            return raw
+        n = _norm(raw)
+        return city_lu.get(n, raw)
+
+    series_list = [(spread_series, "spread"), (total_series, "total")]
+    if ml_series:
+        series_list.append((ml_series, "moneyline"))
+
+    for series, mkt_type in series_list:
+        if not series:
+            continue
+        try:
+            events = fetch_kalshi_events(series)
+        except Exception as e:
+            print(f"  ERROR — Kalshi {series}: {e}")
+            continue
+
+        print(f"  Kalshi [{series}]: {len(events)} event(s)")
+
+        for evt in events:
+            ev_ticker = evt.get("event_ticker", "")
+            ev_title  = evt.get("title", "")
+
+            # Skip expired events
+            exp_str = evt.get("expected_expiration_time") or evt.get("close_time") or ""
+            if exp_str:
+                try:
+                    exp_dt = datetime.fromisoformat(exp_str.replace("Z", "+00:00"))
+                    if exp_dt < now_utc:
+                        continue
+                except ValueError:
+                    pass
+
+            # Skip in-progress games (Kalshi live prices ≠ pre-game book prices)
+            game_dt = _parse_ticker_game_time(ev_ticker)
+            if game_dt and game_dt < now_utc:
+                continue
+
+            if "MLB" in series:
+                away_raw, home_raw = _parse_mlb_event(ev_ticker, abbr_map)
+            else:
+                away_raw, home_raw = _parse_nba_event(ev_ticker, abbr_map)
+
+            if away_raw is None or home_raw is None:
+                title_clean = re.sub(r":\s*(spread|total.*)", "", ev_title, flags=re.IGNORECASE)
+                parts = re.split(r"\s+(?:at|vs\.?)\s+", title_clean, flags=re.IGNORECASE)
+                if len(parts) == 2:
+                    away_raw, home_raw = parts[0].strip(), parts[1].strip()
+
+            away_name = resolve(away_raw)
+            home_name = resolve(home_raw)
+            game_date = _parse_ticker_date(ev_ticker)
+            game_info = _find_game(away_name, home_name, game_index, game_date)
+            if game_info is None:
+                continue
+
+            try:
+                time.sleep(0.2)
+                mkts = fetch_event_markets(ev_ticker)
+            except Exception:
+                continue
+
+            for mkt in mkts:
+                prices = kalshi_prices(mkt)
+                if prices is None:
+                    no_price_count += 1
+                    continue
+                yes_bid, yes_ask = prices
+
+                if mkt_type == "moneyline":
+                    # Moneylines have no threshold — parse team from title only
+                    team_name = _parse_moneyline_team(mkt, away_name, home_name, city_lu)
+                    if team_name is None:
+                        continue
+                    direction = "moneyline"
+                    threshold = None
+                else:
+                    team_name, direction, threshold = _parse_market_team_and_threshold(
+                        mkt, series, ev_ticker, away_name, home_name
+                    )
+                    if direction is None or threshold is None:
+                        continue
+
+                # ── Compute consensus fair value ──────────────────────────
+                fair           = None
+                books_detail   = {}
+                books_used     = []
+                consensus_prob = None
+                total_fair_src = "exact"   # all edges require a direct Pinnacle line
+
+                if direction == "spread_team" and team_name:
+                    fav_spread_info = None
+                    for candidate in [home_name, away_name, team_name]:
+                        if candidate is None:
+                            continue
+                        si = game_info["spread"].get(candidate)
+                        if si is None:
+                            for pname, sdata in game_info["spread"].items():
+                                if _norm(candidate) == _norm(pname):
+                                    si = sdata
+                                    break
+                        if si and si[1] <= 0:
+                            fav_spread_info = (candidate, si)
+                            break
+
+                    if fav_spread_info is None:
+                        for candidate in [home_name, away_name]:
+                            if candidate is None:
+                                continue
+                            si = game_info["spread"].get(candidate)
+                            if si:
+                                fav_spread_info = (candidate, si)
+                                break
+
+                    if fav_spread_info:
+                        fav_name, (fav_cover_prob, fav_spread_pt, fav_books) = fav_spread_info
+                        # Require a direct Pinnacle alternate spread line at this
+                        # exact threshold.  No inference — if Pinnacle doesn't post
+                        # this line, skip.  Their alternate prices already embed all
+                        # matchup context; no model math needed.
+                        spread_pin_lines = game_info.get("spread_pin_lines", {})
+                        # Look up the Kalshi market's team directly
+                        team_pin_lines: Optional[Dict[float, float]] = spread_pin_lines.get(team_name)
+                        if team_pin_lines is None and team_name:
+                            for pname, plines in spread_pin_lines.items():
+                                if _norm(pname) == _norm(team_name):
+                                    team_pin_lines = plines
+                                    break
+                        if not team_pin_lines:
+                            continue  # no Pinnacle alternate spread data for this team
+                        # Find exact match (±0.25) for the Kalshi threshold
+                        pin_match: Optional[Tuple[float, float]] = None
+                        for pin_pt, pin_cov in team_pin_lines.items():
+                            if abs(pin_pt - threshold) <= 0.25:
+                                pin_match = (pin_pt, pin_cov)
+                                break
+                        if pin_match is None:
+                            continue  # Pinnacle doesn't post this exact spread line
+                        _, fair = pin_match
+                        books_detail   = {"pinnacle": fair}
+                        books_used     = ["pinnacle"]
+                        consensus_prob = fair
+
+                elif direction in ("total_over", "total_under"):
+                    total_info = game_info.get("total", {})
+                    if total_info.get("over_point") is not None:
+                        # ── Prefer exact Pinnacle line match over equivalence rule ──
+                        # Check all stored Pinnacle lines for an exact or near-exact match
+                        # to the Kalshi threshold. This ensures the fair value shown
+                        # matches what you'd see looking up that specific line on Pinnacle,
+                        # avoiding confusion when Pinnacle's main line differs from Kalshi's.
+                        pin_lines    = total_info.get("pin_lines", {})
+                        exact_match  = None
+                        for pin_pt, pin_probs in pin_lines.items():
+                            if abs(pin_pt - threshold) <= 0.25:
+                                exact_match = (pin_pt, pin_probs)
+                                break
+
+                        if exact_match:
+                            # Use the Pinnacle line that directly matches Kalshi threshold
+                            pin_total       = exact_match[0]
+                            po              = exact_match[1]["over_prob"]
+                            pu              = exact_match[1]["under_prob"]
+                            total_fair_src  = "exact"   # Pinnacle has this exact line
+                        else:
+                            # No exact match — Gaussian fallback for small gaps only.
+                            # The most common case: Pinnacle posts an integer line
+                            # (e.g. 8.0) while Kalshi markets are at half-points
+                            # (8.5). A 0.5-run step is safe to extrapolate.
+                            # Anything larger risks park/weather distortion (Coors
+                            # Field etc.) so we skip it entirely.
+                            pin_total  = total_info["over_point"]
+                            pin_over_p = total_info["over_prob"]
+                            total_gap  = abs(threshold - pin_total)
+                            if total_gap > 0.5:
+                                continue   # gap too large — skip, no inference
+                            po = _gaussian_total_fair(
+                                pin_over_prob=pin_over_p,
+                                pin_line=pin_total,
+                                kalshi_threshold=threshold,
+                                std=total_std,
+                            )
+                            pu             = 1.0 - po
+                            total_fair_src = "gaussian_halfstep"
+
+                        books_used  = total_info.get("books_used", [])
+                        books_detail = {
+                            bk: td["over_prob"]
+                            for bk, td in total_info.get("per_book", {}).items()
+                        }
+                        consensus_prob = po
+                        # Direct no-vig probability from Pinnacle's matching line
+                        fair = po if direction == "total_over" else pu
+
+                elif direction == "moneyline":
+                    # Look up this team's no-vig win probability from h2h consensus
+                    h2h = game_info.get("h2h", {})
+                    h2h_entry = h2h.get(team_name)
+                    if h2h_entry is None:
+                        # Try normalized name match
+                        for k, v in h2h.items():
+                            if _norm(k) == _norm(team_name):
+                                h2h_entry = v
+                                break
+                    if h2h_entry is None:
+                        continue
+                    consensus_prob, bk_detail = h2h_entry
+                    books_detail   = bk_detail
+                    books_used     = list(books_detail.keys())
+                    # Fair value = no-vig P(this team wins)
+                    fair = consensus_prob
+
+                if fair is None:
+                    continue
+
+                # Safety: require at least Pinnacle, or 2+ books
+                if "pinnacle" not in books_used and len(books_used) < 2:
+                    continue
+
+                # ── EV calculation with haircut ───────────────────────────
+                # Use the ASK price for the side being bought (tradeable edge)
+                yes_raw_edge = fair - yes_ask
+                no_raw_edge  = (1 - fair) - (1 - yes_bid)
+
+                # Apply 25% haircut to raw edge
+                yes_adj = yes_raw_edge * (1 - EV_HAIRCUT)
+                no_adj  = no_raw_edge  * (1 - EV_HAIRCUT)
+
+                best_adj = max(yes_adj, no_adj)
+                if best_adj < EDGE_THRESHOLD:
+                    continue
+                # Cap: edges above MAX_EDGE are almost certainly line mismatches
+                # or stale book data — not real market opportunities.
+                if best_adj > MAX_EDGE:
+                    continue
+
+                if yes_adj >= no_adj:
+                    side      = "YES"
+                    k_side    = yes_ask
+                    f_side    = fair
+                    raw_edge  = yes_raw_edge
+                    adj_edge  = yes_adj
+                else:
+                    side      = "NO"
+                    k_side    = 1 - yes_bid
+                    f_side    = 1 - fair
+                    raw_edge  = no_raw_edge
+                    adj_edge  = no_adj
+
+                # Price floor: skip markets priced below MIN_KALSHI_PRICE.
+                # Data shows 0/18 wins on sub-15¢ markets — likely threshold
+                # mismatches (e.g. Kalshi ">2.5 runs" vs Pinnacle ">8.5 total").
+                if k_side < MIN_KALSHI_PRICE:
+                    continue
+
+                matchup   = f"{game_info['away']} @ {game_info['home']}"
+                # For moneylines, use team_name instead of threshold (no line to dedup on)
+                dedup_key = (_norm(matchup), mkt_type,
+                             _norm(team_name) if mkt_type == "moneyline" else threshold,
+                             side)
+                if dedup_key in seen_edges:
+                    continue
+                seen_edges.add(dedup_key)
+
+                # ── Book-consensus validation ─────────────────────────────
+                # books_detail always stores the CANONICAL direction probability:
+                #   • total markets  → over_prob  (YES on OVER market)
+                #   • spread markets → fav_cover_prob (YES on FAV-covers market)
+                #
+                # For markets where Kalshi YES = the OPPOSITE canonical direction
+                # (total_under or underdog-spread), we must flip the per-book
+                # probabilities before passing to the validator so it compares
+                # the right side against k_side.
+                #
+                # "canonical_yes_flip" = True when books_detail represents the
+                # OPPOSITE of what Kalshi's YES side means.
+                canonical_yes_flip = (
+                    direction == "total_under"
+                    or (direction == "spread_team"
+                        and fav_spread_info is not None
+                        and not mkt_team_is_fav)
+                )
+                if canonical_yes_flip:
+                    # Re-express books_detail as P(Kalshi YES wins) per book
+                    books_for_validation = {
+                        b: round(1.0 - p, 4) for b, p in books_detail.items()
+                    }
+                else:
+                    books_for_validation = books_detail
+
+                consensus_valid, consensus_reason = _validate_book_consensus(
+                    books_for_validation, side, k_side
+                )
+                if not consensus_valid:
+                    book_str_rej = "  ".join(
+                        f"{b}={p:.1%}" for b, p in sorted(books_for_validation.items())
+                    )
+                    print(
+                        f"  ✗ {mkt_type:<6} {matchup:<35} {side}  "
+                        f"REJECTED — {consensus_reason}  [{book_str_rej}]"
+                    )
+                    continue
+
+                pin_line = None
+                if direction == "spread_team" and fav_spread_info:
+                    _, (_, fav_pt, _) = fav_spread_info
+                    pin_line = fav_pt
+                elif direction in ("total_over", "total_under"):
+                    pin_line = game_info.get("total", {}).get("over_point")
+
+                raw_title = mkt.get("title") or mkt.get("yes_sub_title") or mkt.get("ticker", "")
+                if threshold is None:
+                    prop_label = raw_title
+                elif str(threshold) in raw_title:
+                    prop_label = raw_title
+                else:
+                    prop_label = f"{raw_title} (>{threshold})"
+
+                # ── Confidence score ──────────────────────────────────────
+                confidence = _book_confidence(books_detail)
+
+                # ── Diagnostic log ────────────────────────────────────────
+                book_str = "  ".join(f"{b}={p:.1%}" for b, p in sorted(books_detail.items()))
+                print(
+                    f"  ✓ {mkt_type:<6} {matchup:<35} {side}  "
+                    f"kalshi={k_side:.1%}  fair={f_side:.1%}  "
+                    f"raw={raw_edge:+.1%}  adj={adj_edge:+.1%}  "
+                    f"conf={confidence:.0%}  [{book_str}]  [{consensus_reason}]"
+                )
+
+                # ── Consensus YES/NO probabilities (renormalised to sum to 1) ────
+                # consensus_prob is always the OVER/fav-cover (canonical) probability.
+                # For total_under / underdog-spread markets, Kalshi YES = canonical NO,
+                # so flip to get the true P(Kalshi YES wins).
+                if canonical_yes_flip:
+                    cons_yes = round(1.0 - consensus_prob, 4) if consensus_prob else None
+                else:
+                    cons_yes = round(consensus_prob, 4) if consensus_prob else None
+                cons_no = round(1.0 - cons_yes, 4) if cons_yes is not None else None
+
+                # per_book_novig: use the already-corrected books_for_validation dict
+                # so YES/NO labels in the UI match the actual Kalshi market direction.
+                per_book_novig = _build_per_book_novig(books_for_validation, side)
+
+                edges.append({
+                    "ticker":               mkt.get("ticker", ""),
+                    "title":                prop_label,
+                    "matchup":              matchup,
+                    "side":                 side,
+                    "kalshi":               round(k_side, 4),
+                    "fair":                 round(f_side, 4),
+                    "raw_edge":             round(raw_edge, 4),
+                    "edge":                 round(adj_edge, 4),   # post-haircut — used for display/filter
+                    "confidence":           confidence,           # book-agreement score 0-1
+                    "mkt_type":             mkt_type,
+                    "pin_line":             pin_line,
+                    "fair_source":          total_fair_src,  # always "exact" — every edge backed by a direct Pinnacle line
+                    "books_used":           books_used,
+                    "books_detail":         books_detail,
+                    "per_book_novig":       per_book_novig,       # {book: {yes_prob, no_prob, yes_american, no_american}}
+                    "consensus_yes":        cons_yes,             # weighted-consensus P(YES)
+                    "consensus_no":         cons_no,              # weighted-consensus P(NO)  — always 1 - cons_yes
+                    "consensus_yes_american": prob_to_american(cons_yes) if cons_yes else None,
+                    "consensus_no_american":  prob_to_american(cons_no)  if cons_no  else None,
+                    "consensus_prob":       cons_yes,             # legacy alias
+                    "is_valid_consensus":   True,                 # always True here — invalids were discarded above
+                    "consensus_reason":     consensus_reason,     # e.g. "Confirmed by Pinnacle + DraftKings"
+                    "kalshi_price_ts":      now_utc.isoformat(),
+                })
+
+    if no_price_count:
+        print(f"  (skipped {no_price_count} markets with no price)")
+
+    # ── 3. Sort by confidence × adj_edge, correlation-control, top N ─────
+    # Confidence-weighted score: rewards bets where all books agree AND edge is large.
+    # A 10% edge where DK/FD/Pinnacle all agree outranks a 12% edge where only one
+    # book has data or books are far apart.
+    edges.sort(key=lambda x: x["confidence"] * x["edge"], reverse=True)
+    edges = _apply_correlation_control(edges)
+    edges = edges[:TOP_BETS_PER_CYCLE]
+
+    # ── 4. Print final table ──────────────────────────────────────────────
+    if not edges:
+        print(f"\n  No edges ≥ {EDGE_THRESHOLD:.0%} (adj.) found.")
+    else:
+        print(f"\n  Top {len(edges)} edge(s) — sorted by confidence × adj.EV:")
+        print(f"  {'TYPE':<7} {'MATCHUP':<35} {'PROP':<35} {'SIDE':<4} "
+              f"{'PRICE':>7} {'FAIR':>7} {'RAW':>7} {'ADJ':>7} {'CONF':>6} {'BOOKS'}")
+        print(f"  {'─'*7} {'─'*35} {'─'*35} {'─'*4} {'─'*7} {'─'*7} {'─'*7} {'─'*7} {'─'*6} {'─'*20}")
+        for e in edges:
+            bks = ",".join(e.get("books_used", []))
+            stars = "★★★" if e["confidence"] >= 0.8 else "★★" if e["confidence"] >= 0.5 else "★"
+            print(
+                f"  {e['mkt_type']:<7} {e['matchup']:<35} {e['title'][:35]:<35} "
+                f"{e['side']:<4} {e['kalshi']:>6.1%} {e['fair']:>6.1%} "
+                f"\033[90m{e['raw_edge']:>+6.1%}\033[0m "
+                f"\033[92m{e['edge']:>+6.1%}\033[0m "
+                f"{stars:>4}  {bks}"
+            )
+
+    return edges
+
+
+# ── Player-props helpers ──────────────────────────────────────────────────────
+PLAYER_PROP_MARKETS = (
+    "pitcher_strikeouts,batter_hits,batter_home_runs,batter_total_bases,batter_rbis"
+)
+
+MLB_PROP_SERIES: Dict[str, str] = {
+    "KXMLBKS":  "pitcher_strikeouts",
+    "KXMLBHIT": "batter_hits",
+    # "KXMLBHR":  "batter_home_runs",   # disabled — too rare (~8-12%/game) to model reliably
+    "KXMLBTB":  "batter_total_bases",
+    "KXMLBRBI": "batter_rbis",
+}
+
+
+def _norm_player(name: str) -> str:
+    return re.sub(r"[^a-z]", "", name.lower())
+
+
+def _find_player_in_title(title: str, prop_lookup: Dict[str, dict]) -> Optional[dict]:
+    title_norm = re.sub(r"[^a-z]", "", title.lower())
+    for key, pp in prop_lookup.items():
+        if key and key in title_norm:
+            return pp
+    for key, pp in prop_lookup.items():
+        last = re.sub(r"[^a-z]", "", pp["player"].split()[-1].lower())
+        if len(last) > 3 and last in title_norm:
+            return pp
+    return None
+
+
+def build_all_player_props(
+    odds_sport: str,
+    odds_events: List[dict],
+    needed_teams: Optional[set] = None,
+) -> Dict[str, Dict[str, dict]]:
+    """
+    Fetch player-prop odds for all books and build a weighted-consensus
+    no-vig over probability per (player, prop_type).
+
+    Returns: { player_norm: { prop_type: {player, line, over_prob, lambda} } }
+    """
+    now = datetime.now(timezone.utc)
+    target_events = []
+    for ev in odds_events:
+        ct_str = ev.get("commence_time", "")
+        try:
+            ct = datetime.fromisoformat(ct_str.replace("Z", "+00:00"))
+            if ct <= now or (ct - now).total_seconds() > 172800:
+                continue
+        except ValueError:
+            continue
+        if needed_teams:
+            home_n = _norm(ev.get("home_team", ""))
+            away_n = _norm(ev.get("away_team", ""))
+            if not (home_n in needed_teams or away_n in needed_teams):
+                continue
+        target_events.append(ev)
+
+    target_events.sort(key=lambda e: e.get("commence_time", ""))
+    target_events = target_events[:MAX_PROP_EVENTS]
+
+    player_lookup: Dict[str, Dict[str, dict]] = {}
+    fetched = 0
+
+    for ev in target_events:
+        try:
+            edata = fetch_player_prop_odds_event(odds_sport, ev["id"])
+            time.sleep(0.3)
+        except Exception as e:
+            print(f"    ERROR fetching props for {ev.get('away_team')} @ {ev.get('home_team')}: {e}")
+            continue
+
+        # Accumulate per-book, per-player, per-prop-type prices
+        # accum[player_norm][prop_type][book_key] = {player, line, over_price, under_price}
+        accum: Dict[str, Dict[str, Dict[str, dict]]] = {}
+
+        for bm in edata.get("bookmakers", []):
+            bkey = bm["key"]
+            if bkey not in BOOK_WEIGHTS:
+                continue
+            for mkt in bm.get("markets", []):
+                mtype    = mkt.get("key", "")
+                outcomes = mkt.get("outcomes", [])
+                for o in outcomes:
+                    direction = (o.get("name") or "").lower()
+                    pname     = (o.get("description") or "").strip()
+                    pt        = float(o.get("point") or 0)
+                    price     = o.get("price", 0)
+                    if not pname or direction not in ("over", "under"):
+                        continue
+                    key = _norm_player(pname)
+                    accum.setdefault(key, {}).setdefault(mtype, {}).setdefault(bkey, {
+                        "player": pname, "line": pt,
+                        "over_price": None, "under_price": None,
+                    })
+                    if direction == "over":
+                        accum[key][mtype][bkey]["over_price"] = price
+                        accum[key][mtype][bkey]["line"]       = pt
+                    else:
+                        accum[key][mtype][bkey]["under_price"] = price
+
+        # Convert per-book prices → weighted consensus no-vig over probability
+        for player_key, props in accum.items():
+            for mtype, book_entries in props.items():
+                book_probs: Dict[str, float] = {}
+                ref_line: Optional[float] = None
+
+                for bkey, be in book_entries.items():
+                    op = be.get("over_price")
+                    up = be.get("under_price")
+                    if op is None or up is None:
+                        continue
+                    po, _ = no_vig_prob(op, up)
+                    book_probs[bkey] = po
+                    if ref_line is None:
+                        ref_line = be["line"]
+                    if bkey == "pinnacle":
+                        ref_line = be["line"]  # prefer Pinnacle's line
+
+                if not book_probs or ref_line is None:
+                    continue
+
+                # Safety: require Pinnacle or 2+ books for props too
+                if "pinnacle" not in book_probs and len(book_probs) < 2:
+                    continue
+
+                consensus_po, _ = _weighted_consensus(book_probs)
+
+                lam = poisson_lambda_from_line(ref_line, consensus_po)
+                if lam is None:
+                    continue
+
+                entry = {
+                    "player":       next(iter(book_entries.values()))["player"],
+                    "line":         ref_line,
+                    "over_prob":    consensus_po,
+                    "lambda":       lam,
+                    "books_used":   list(book_probs.keys()),
+                    "books_detail": book_probs,
+                }
+                player_lookup.setdefault(player_key, {})[mtype] = entry
+
+        fetched += 1
+        print(f"    [{fetched}] {ev.get('away_team')} @ {ev.get('home_team')} — props fetched")
+
+    print(f"  Built player index: {len(player_lookup)} players across {fetched} game(s)")
+    return player_lookup
+
+
+def scan_player_props(
+    odds_sport: str = "baseball_mlb",
+    abbr_map: Optional[Dict[str, str]] = None,
+    max_games: int = 15,
+) -> List[dict]:
+    """
+    Scan Kalshi MLB player-prop markets vs consensus no-vig props.
+    Applies EV haircut, minimum adjusted EV filter, and top-N cap.
+    """
+    if abbr_map is None:
+        abbr_map = MLB_ABBR
+
+    print(f"\n{'═'*70}")
+    print(f"  MLB Player Props  —  {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"  EV haircut: {EV_HAIRCUT:.0%}   Min adj. EV: {EDGE_THRESHOLD:.0%}")
+    print(f"{'═'*70}")
+
+    now_utc = datetime.now(timezone.utc)
+
+    # 1. Collect Kalshi prop markets
+    kalshi_props: List[dict] = []
+    for series, prop_type in MLB_PROP_SERIES.items():
+        try:
+            evts = fetch_kalshi_events(series)
+        except Exception as e:
+            print(f"  [{series}] ERROR: {e}")
+            continue
+        print(f"  [{series}] → {prop_type}: {len(evts)} event(s)")
+        for evt in evts:
+            exp_str = evt.get("expected_expiration_time") or evt.get("close_time") or ""
+            if exp_str:
+                try:
+                    exp_dt = datetime.fromisoformat(exp_str.replace("Z", "+00:00"))
+                    if exp_dt < now_utc:
+                        continue
+                except ValueError:
+                    pass
+
+            ev_ticker = evt.get("event_ticker", "")
+            game_dt   = _parse_ticker_game_time(ev_ticker)
+            if game_dt is not None and game_dt <= now_utc:
+                continue  # in-progress game
+
+            ev_title = evt.get("title", "") or ""
+            try:
+                time.sleep(0.15)
+                mkts = fetch_event_markets(ev_ticker)
+            except Exception:
+                continue
+            for mkt in mkts:
+                prices = kalshi_prices(mkt)
+                if prices is None:
+                    continue
+                yes_bid, yes_ask = prices
+                prop_mid = (yes_bid + yes_ask) / 2
+                if prop_mid < PROP_MIN_PRICE or prop_mid > PROP_MAX_PRICE:
+                    continue
+                floor_str = mkt.get("floor_strike")
+                try:
+                    threshold = float(floor_str) if floor_str is not None else None
+                except (TypeError, ValueError):
+                    threshold = None
+                if threshold is None:
+                    continue
+                kalshi_props.append({
+                    "series":    series,
+                    "prop_type": prop_type,
+                    "ev_title":  ev_title,
+                    "mkt_title": mkt.get("title") or ev_title or "",
+                    "ticker":    mkt.get("ticker", ""),
+                    "threshold": threshold,
+                    "yes_bid":   yes_bid,
+                    "yes_ask":   yes_ask,
+                })
+
+    if not kalshi_props:
+        print("  No open Kalshi prop markets found.")
+        return []
+    print(f"  Kalshi prop markets collected: {len(kalshi_props)}")
+
+    # 2. Build needed-teams set
+    needed_teams: set = set()
+    for series in MLB_PROP_SERIES:
+        try:
+            evts = fetch_kalshi_events(series)
+        except Exception:
+            continue
+        for evt in evts:
+            away_raw, home_raw = _parse_mlb_event(evt.get("event_ticker", ""), abbr_map)
+            lu = build_city_lookup(abbr_map)
+            for raw in [away_raw, home_raw]:
+                if raw:
+                    needed_teams.add(_norm(raw))
+                    full = lu.get(_norm(raw))
+                    if full:
+                        needed_teams.add(_norm(full))
+
+    # 3. Fetch Odds API event list
+    try:
+        odds_events = fetch_odds_events_list(odds_sport)
+    except Exception as e:
+        print(f"  ERROR — Odds API events list: {e}")
+        return []
+
+    # 4. Build player prop consensus index
+    player_lookup = build_all_player_props(odds_sport, odds_events, needed_teams or None)
+    if not player_lookup:
+        print("  No player prop data available — skipping.")
+        return []
+
+    # 5. Match Kalshi markets → consensus fair value
+    edges:      List[dict] = []
+    seen_edges: set        = set()
+
+    for kp in kalshi_props:
+        prop_type    = kp["prop_type"]
+        search_title = kp["mkt_title"] or kp["ev_title"]
+
+        prop_sublookup = {
+            k: v[prop_type]
+            for k, v in player_lookup.items()
+            if prop_type in v
+        }
+        if not prop_sublookup:
+            continue
+
+        matched = _find_player_in_title(search_title, prop_sublookup)
+        if matched is None:
+            continue
+
+        # Reject if Kalshi threshold differs from reference line by > 0.6
+        if abs(matched["line"] - kp["threshold"]) > 0.6:
+            continue
+
+        lam       = matched["lambda"]
+        threshold = kp["threshold"]
+        t_int     = int(threshold)
+
+        fair_over  = 1.0 - poisson_cdf(t_int, lam)
+        fair_under = 1.0 - fair_over
+
+        yes_bid, yes_ask = kp["yes_bid"], kp["yes_ask"]
+        yes_raw  = fair_over  - yes_ask
+        no_raw   = fair_under - (1.0 - yes_bid)
+
+        yes_adj  = yes_raw * (1 - EV_HAIRCUT)
+        no_adj   = no_raw  * (1 - EV_HAIRCUT)
+
+        best_adj = max(yes_adj, no_adj)
+        if best_adj < EDGE_THRESHOLD:
+            continue
+        if best_adj > MAX_EDGE:
+            continue
+
+        if yes_adj >= no_adj:
+            side, k_side, f_side, raw_edge, adj_edge = "YES", yes_ask,     fair_over,  yes_raw, yes_adj
+        else:
+            side, k_side, f_side, raw_edge, adj_edge = "NO",  1 - yes_bid, fair_under, no_raw,  no_adj
+
+        # Price floor — same rule as game-line scanner
+        if k_side < MIN_KALSHI_PRICE:
+            continue
+
+        matchup   = search_title.split(":")[0].strip() if ":" in search_title else search_title
+        dedup_key = (kp["ticker"], side)
+        if dedup_key in seen_edges:
+            continue
+        seen_edges.add(dedup_key)
+
+        books_detail = matched.get("books_detail", {})
+
+        # ── Book-consensus validation ─────────────────────────────────────
+        consensus_valid, consensus_reason = _validate_book_consensus(
+            books_detail, side, k_side
+        )
+        if not consensus_valid:
+            book_str_rej = "  ".join(f"{b}={p:.1%}" for b, p in sorted(books_detail.items()))
+            print(
+                f"  ✗ prop  {matched['player']:<25} {side}  "
+                f"REJECTED — {consensus_reason}  [{book_str_rej}]"
+            )
+            continue
+
+        confidence   = _book_confidence(books_detail)
+        book_str     = "  ".join(f"{b}={p:.1%}" for b, p in sorted(books_detail.items()))
+        print(
+            f"  ✓ prop  {matched['player']:<25} {side}  "
+            f"kalshi={k_side:.1%}  fair={f_side:.1%}  "
+            f"raw={raw_edge:+.1%}  adj={adj_edge:+.1%}  conf={confidence:.0%}  "
+            f"[{book_str}]  [{consensus_reason}]"
+        )
+
+        # ── Consensus YES/NO for prop (over = YES side) ─────────────────
+        prop_cons_yes = round(matched["over_prob"], 4)
+        prop_cons_no  = round(1.0 - matched["over_prob"], 4)
+        prop_per_book = _build_per_book_novig(books_detail, side)
+
+        edges.append({
+            "ticker":               kp["ticker"],
+            "title":                f"{search_title} (line {matched['line']})",
+            "matchup":              matchup,
+            "side":                 side,
+            "kalshi":               round(k_side, 4),
+            "fair":                 round(f_side, 4),
+            "raw_edge":             round(raw_edge, 4),
+            "edge":                 round(adj_edge, 4),
+            "confidence":           confidence,
+            "mkt_type":             "prop",
+            "pin_line":             matched["line"],
+            "prop_type":            prop_type,
+            "books_used":           matched.get("books_used", []),
+            "books_detail":         books_detail,
+            "per_book_novig":       prop_per_book,
+            "consensus_yes":        prop_cons_yes,
+            "consensus_no":         prop_cons_no,
+            "consensus_yes_american": prob_to_american(prop_cons_yes),
+            "consensus_no_american":  prob_to_american(prop_cons_no),
+            "consensus_prob":       prop_cons_yes,   # legacy alias
+            "is_valid_consensus":   True,
+            "consensus_reason":     consensus_reason,  # e.g. "Confirmed by Pinnacle + FanDuel"
+            "kalshi_price_ts":      now_utc.isoformat(),
+        })
+
+    # Sort by confidence × adj_edge, correlation-control, top N
+    edges.sort(key=lambda x: x["confidence"] * x["edge"], reverse=True)
+    edges = _apply_correlation_control(edges)
+    edges = edges[:TOP_BETS_PER_CYCLE]
+
+    if not edges:
+        print(f"  No player-prop edges ≥ {EDGE_THRESHOLD:.0%} (adj.) found.")
+    else:
+        print(f"\n  Top {len(edges)} prop edge(s) — sorted by confidence × adj.EV:")
+        print(f"  {'PROP TYPE':<22} {'PLAYER / TITLE':<42} {'SIDE':<4} {'RAW':>6} {'ADJ':>6} {'CONF':>5}")
+        for e in edges:
+            stars = "★★★" if e["confidence"] >= 0.8 else "★★" if e["confidence"] >= 0.5 else "★"
+            print(
+                f"  {e['prop_type']:<22} {e['title'][:42]:<42} "
+                f"{e['side']:<4} {e['raw_edge']:>+5.1%} "
+                f"\033[92m{e['edge']:>+5.1%}\033[0m  {stars}"
+            )
+    return edges
+
+
+# ── Main ──────────────────────────────────────────────────────────────────────
+def run_once() -> int:
+    mlb_edges = scan_sport(
+        label         = "MLB — Run Line & Totals",
+        spread_series = "KXMLBSPREAD",
+        total_series  = "KXMLBTOTAL",
+        odds_sport    = "baseball_mlb",
+        abbr_map      = MLB_ABBR,
+        spread_std    = MLB_SPREAD_STD,
+        total_std     = MLB_TOTAL_STD,
+    )
+    nba_edges = scan_sport(
+        label         = "NBA — Spread & Totals",
+        spread_series = "KXNBASPREAD",
+        total_series  = "KXNBATOTAL",
+        odds_sport    = "basketball_nba",
+        abbr_map      = NBA_ABBR,
+        spread_std    = NBA_SPREAD_STD,
+        total_std     = NBA_TOTAL_STD,
+    )
+    total = len(mlb_edges) + len(nba_edges)
+    print(f"\n  Total edges flagged (adj. ≥{EDGE_THRESHOLD*100:.0f}%): {total}")
+    return total
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Kalshi EV scanner — MLB & NBA")
+    parser.add_argument(
+        "--loop", type=int, default=0, metavar="SECONDS",
+        help="Re-run every N seconds (0 = run once)",
+    )
+    args = parser.parse_args()
+
+    print("╔══════════════════════════════════════════════════════════════════╗")
+    print("║          Kalshi EV Scanner  —  MLB & NBA  (v2)                  ║")
+    print("║  Sources : Pinnacle (70%) + DraftKings (20%) + FanDuel (10%)    ║")
+    print(f"║  EV      : raw edge × {1-EV_HAIRCUT:.0%} haircut ≥ {EDGE_THRESHOLD*100:.0f}% to flag              ║")
+    print(f"║  Output  : Top {TOP_BETS_PER_CYCLE} bets, max {MAX_BETS_PER_GROUP} per game group                      ║")
+    print("║  Markets : KXMLBSPREAD, KXMLBTOTAL, KXNBASPREAD, KXNBATOTAL    ║")
+    print("╚══════════════════════════════════════════════════════════════════╝")
+
+    if args.loop <= 0:
+        run_once()
+    else:
+        print(f"  Loop mode: every {args.loop}s  (Ctrl-C to stop)\n")
+        try:
+            while True:
+                run_once()
+                print(f"\n  Sleeping {args.loop}s…\n")
+                time.sleep(args.loop)
+        except KeyboardInterrupt:
+            print("\n  Stopped.")
+
+
+if __name__ == "__main__":
+    main()

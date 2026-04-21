@@ -1,0 +1,18 @@
+# Private keys — never commit
+mannyxolo.txt
+
+# Local env — set these in Railway dashboard instead
+.env
+
+# Runtime data files — reset on each deploy, that's fine
+ev_history.json
+ev_bets.json
+my_bets.json
+ev_alerted_keys.json
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/

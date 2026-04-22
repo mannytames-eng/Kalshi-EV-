@@ -132,6 +132,15 @@ def _load_bets() -> list:
         with open(BETS_FILE, "r") as f:
             return json.load(f)
     except (FileNotFoundError, json.JSONDecodeError):
+        seed = os.environ.get("EV_BETS_SEED")
+        if seed:
+            try:
+                import base64 as _b64
+                bets = json.loads(_b64.b64decode(seed).decode())
+                _save_bets(bets)
+                return bets
+            except Exception:
+                pass
         return []
 
 def _save_bets(bets: list):

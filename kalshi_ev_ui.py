@@ -18,9 +18,13 @@ from typing import List, Optional
 from dotenv import load_dotenv
 
 # ── Portable base directory — works on Mac and any Linux VPS ─────────────────
-# All data files (bets, history, keys) live next to this script.
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-load_dotenv(os.path.join(BASE_DIR, ".env"))
+# On Railway a persistent volume is mounted at /data — use it for all data files
+# so they survive service restarts/redeploys.  Falls back to script directory locally.
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+_RAILWAY_DATA = "/data"
+BASE_DIR  = _RAILWAY_DATA if os.path.isdir(_RAILWAY_DATA) and os.environ.get("RAILWAY_ENVIRONMENT") else _SCRIPT_DIR
+DATA_DIR  = BASE_DIR   # data files (bets, history, keys) — persistent on Railway
+load_dotenv(os.path.join(_SCRIPT_DIR, ".env"))   # .env lives next to the script always
 
 # ── Import scanner logic ──────────────────────────────────────────────────────
 sys.path.insert(0, BASE_DIR)
@@ -56,10 +60,22 @@ PORT = int(os.environ.get("PORT", 8000))   # Railway injects PORT; falls back to
 #   • Pre-game peak  (11 AM–10 PM ET, 11h): every 4 min  → 165 refreshes
 #   • Overnight      (10 PM–11 AM ET, 13h): every 20 min →  39 refreshes
 #   Total: ~204/day × 2 = 408 credits/day = ~12,240/month (well under 20k)
+def _et_offset_hours() -> int:
+    """Return the current US Eastern offset from UTC as a positive integer.
+    EDT (UTC-4): April 1 – October 31  (covers entire MLB/NBA season)
+    EST (UTC-5): November 1 – March 31
+    Uses the same rule as _parse_ticker_start_time so ET conversions are always consistent.
+    """
+    return 4 if 4 <= datetime.now(timezone.utc).month <= 10 else 5
+
+def _et_hour() -> int:
+    """Return the current hour in US Eastern Time (0–23)."""
+    from datetime import timedelta as _td
+    return (datetime.now(timezone.utc) - _td(hours=_et_offset_hours())).hour
+
 def _odds_refresh_interval() -> int:
     """Return seconds until next odds refresh based on current ET hour."""
-    from datetime import timezone as _tz, timedelta as _td
-    et_hour = (datetime.now(_tz.utc) - _td(hours=4)).hour   # UTC-4 (ET summer/EDT)
+    et_hour = _et_hour()
     if 11 <= et_hour < 22:   # 11 AM – 10 PM ET: game window
         return 4 * 60
     return 20 * 60           # overnight: slow down
@@ -71,9 +87,9 @@ REFRESH_SECONDS       = 2 * 60     # re-scan Kalshi every 2 min    (0 credits)
 #   Kalshi scans : 0 credits (cached) =     0
 #   ─────────────────────────────────────────
 #   Total                            = 11,040  (45% under 20k budget)
-HISTORY_FILE    = os.path.join(BASE_DIR, "ev_history.json")
-BETS_FILE       = os.path.join(BASE_DIR, "ev_bets.json")
-MY_BETS_FILE    = os.path.join(BASE_DIR, "my_bets.json")
+HISTORY_FILE    = os.path.join(DATA_DIR, "ev_history.json")
+BETS_FILE       = os.path.join(DATA_DIR, "ev_bets.json")
+MY_BETS_FILE    = os.path.join(DATA_DIR, "my_bets.json")
 MAX_HISTORY     = 500       # cap stored scan snapshots
 PERF_BANKROLL        = 1000.0    # bankroll for ROI % display
 
@@ -117,7 +133,7 @@ def _load_history() -> list:
 def _save_history(history: list):
     try:
         import tempfile, os as _os
-        fd, tmp = tempfile.mkstemp(dir=BASE_DIR, suffix=".tmp")
+        fd, tmp = tempfile.mkstemp(dir=DATA_DIR, suffix=".tmp")
         with _os.fdopen(fd, "w") as f:
             json.dump(history[-MAX_HISTORY:], f)
         _os.replace(tmp, HISTORY_FILE)
@@ -146,7 +162,7 @@ def _load_bets() -> list:
 def _save_bets(bets: list):
     try:
         import tempfile, os as _os
-        fd, tmp = tempfile.mkstemp(dir=BASE_DIR, suffix=".tmp")
+        fd, tmp = tempfile.mkstemp(dir=DATA_DIR, suffix=".tmp")
         with _os.fdopen(fd, "w") as f:
             json.dump(bets, f, indent=2)
         _os.replace(tmp, BETS_FILE)
@@ -156,7 +172,7 @@ def _save_bets(bets: list):
 _bets: list = _load_bets()
 _bets_lock = threading.RLock()   # reentrant — _add_new_bets holds this while calling _paper_kelly_stake → _compute_paper_balance
 
-# --- One-time backfill: ensure every bet has closing_yes_pct and clv fields ---
+# --- One-time backfill: ensure every bet has closing_yes_pct, closing_pin_pct, clv ---
 _backfilled = False
 for _b in _bets:
     if _b.get("closing_yes_pct") is None and _b.get("kalshi_yes_at_flag") is not None:
@@ -164,6 +180,9 @@ for _b in _bets:
         _backfilled = True
     if _b.get("clv") is None:
         _b["clv"] = 0.0
+        _backfilled = True
+    if "closing_pin_pct" not in _b:
+        _b["closing_pin_pct"] = None   # Pinnacle side-prob at close; CLV loop fills this in
         _backfilled = True
 if _backfilled:
     _save_bets(_bets)
@@ -301,10 +320,13 @@ def _add_new_bets(edges: list):
                 "kalshi_price":       e["kalshi"],
                 "kalshi_yes_at_flag": kalshi_yes_at_flag,
                 "flagged_at":         datetime.now(timezone.utc).isoformat(),
+                "game_time":          _parse_ticker_start_time(e["ticker"]).isoformat()
+                                      if _parse_ticker_start_time(e["ticker"]) else None,
                 "status":             "open",
                 "resolved_at":        None,
                 "pnl":                None,
                 "closing_yes_pct":    kalshi_yes_at_flag,   # init to entry; CLV loop overwrites
+                "closing_pin_pct":    None,                 # Pinnacle side-prob at close; CLV loop fills
                 "clv":                0.0,                  # init to 0; CLV loop overwrites
                 "paper_stake":        paper_stake,           # Kelly-sized virtual wager
                 "paper_pnl":          None,                  # set on resolution
@@ -337,12 +359,18 @@ def _build_score_index() -> dict:
             if home not in sc or away not in sc:
                 continue
             hs, as_ = sc[home], sc[away]
-            key = _n(away + "@" + home)
-            index[key] = {
+            game_date = g.get("commence_time", "")[:10]   # "YYYY-MM-DD"
+            # Keyed by teams + date — prevents same-series games from cross-resolving
+            key_dated   = _n(away + "@" + home) + "_" + game_date
+            key_undated = _n(away + "@" + home)   # fallback for old callers
+            entry = {
                 "home_score": hs, "away_score": as_,
                 "total": hs + as_, "margin": hs - as_,
                 "home": home, "away": away,
+                "game_date": game_date,
             }
+            index[key_dated]   = entry
+            index[key_undated] = entry   # undated always points to most-recent game
     return index
 
 
@@ -354,11 +382,23 @@ def _resolve_from_score(bet: dict, score_index: dict) -> Optional[bool]:
     import re
     def _n(s): return re.sub(r"[^a-z0-9]", "", s.lower())
 
-    matchup = bet.get("matchup", "")
-    key = _n(matchup.replace(" @ ", "@"))
-    game = score_index.get(key)
+    matchup  = bet.get("matchup", "")
+    # Parse game date from ticker so we never resolve against the wrong day's
+    # result (e.g. same teams in a 3-game series, yesterday's score ≠ today's).
+    ticker    = bet.get("ticker", "")
+    game_date = _parse_ticker_date(ticker)   # "YYYY-MM-DD" or None
+    base_key  = _n(matchup.replace(" @ ", "@"))
+    dated_key = base_key + "_" + game_date if game_date else None
+
+    # Prefer the date-specific entry; fall back to undated only if no dated match
+    game = (score_index.get(dated_key) if dated_key else None) or score_index.get(base_key)
     if game is None:
         return None
+    # If we got an undated match, verify the game date matches the ticker date
+    # to avoid cross-series contamination.
+    if dated_key and game.get("game_date") and game_date:
+        if game["game_date"] != game_date:
+            return None   # wrong day — don't resolve yet
 
     mkt_type = bet.get("mkt_type", "")
     side     = bet.get("side", "")
@@ -416,11 +456,28 @@ def _check_resolutions():
     if not open_bets:
         return
 
-    # MLB games average ~3h but many end in 2.5h; check after 2.5h so results
-    # show up quickly after the final out.
-    cutoff = datetime.now(timezone.utc).timestamp() - 2.5 * 3600
-    to_check = [b for b in open_bets
-                if datetime.fromisoformat(b["flagged_at"]).timestamp() < cutoff]
+    # Guard: only attempt resolution when the game could plausibly have finished.
+    # Primary check — game start time from ticker + 3.5h buffer.
+    # This prevents doubleheader confusion (game-1 score resolving game-2 bet on
+    # the same date) and timezone mismatches in the ticker time encoding.
+    # Fallback (when ticker time can't be parsed): flagged_at + 4h.
+    from datetime import timedelta as _td
+    now_utc = datetime.now(timezone.utc)
+    def _game_should_be_over(bet: dict) -> bool:
+        game_start = _parse_ticker_start_time(bet.get("ticker", ""))
+        if game_start:
+            # game_start is true UTC (ET→UTC conversion done in _parse_ticker_start_time).
+            # Add 3.5h for typical game duration + buffer before attempting resolution.
+            return now_utc >= game_start + _td(hours=3.5)
+        # Fallback when ticker time can't be parsed: must be flagged ≥6h ago.
+        # Bets are typically flagged hours before game start, so 6h is conservative
+        # enough to avoid premature resolution even for day games.
+        flagged = datetime.fromisoformat(bet["flagged_at"])
+        if flagged.tzinfo is None:
+            flagged = flagged.replace(tzinfo=timezone.utc)
+        return now_utc >= flagged + _td(hours=6)
+
+    to_check = [b for b in open_bets if _game_should_be_over(b)]
 
     if not to_check:
         return
@@ -446,14 +503,19 @@ def _check_resolutions():
                     kelly_pnl = round(ps * (1 - k) / k, 2) if side_won else round(-ps, 2)
                     b["pnl"]       = kelly_pnl   # unified: pnl IS kelly pnl
                     b["paper_pnl"] = kelly_pnl
-                    # CLV
-                    closing_yes = b.get("closing_yes_pct")
-                    entry_yes   = b.get("kalshi_yes_at_flag")
-                    if closing_yes is not None and entry_yes is not None:
-                        b["clv"] = round(
-                            closing_yes - entry_yes if b["side"] == "YES"
-                            else entry_yes - closing_yes, 1
-                        )
+                    # CLV — prefer true CLV vs Pinnacle; fall back to Kalshi drift
+                    closing_pin = b.get("closing_pin_pct")
+                    entry_k     = b.get("kalshi_price", 0) * 100
+                    if closing_pin is not None and entry_k:
+                        b["clv"] = round(closing_pin - entry_k, 1)
+                    else:
+                        closing_yes = b.get("closing_yes_pct")
+                        entry_yes   = b.get("kalshi_yes_at_flag")
+                        if closing_yes is not None and entry_yes is not None:
+                            b["clv"] = round(
+                                closing_yes - entry_yes if b["side"] == "YES"
+                                else entry_yes - closing_yes, 1
+                            )
                     break
         score_resolved_ids.add(bet["id"])
         resolved += 1
@@ -471,24 +533,41 @@ def _check_resolutions():
             side_won = (result == "yes" and bet["side"] == "YES") or \
                        (result == "no"  and bet["side"] == "NO")
             k = bet["kalshi_price"]
-            # CLV: prefer the live-captured closing_yes_pct already stored on the bet.
-            # Fall back to the scanner's last_kalshi_pct only if nothing was captured.
+            # CLV — primary: true CLV vs Pinnacle closing line.
+            # Grab the stored closing_pin_pct (filled by _capture_clv_prices).
+            # Fall back to last_pin_pct in edge history, then Kalshi drift.
             with _bets_lock:
+                bet_pin_close = next(
+                    (b.get("closing_pin_pct") for b in _bets if b["id"] == bet["id"]),
+                    None,
+                )
                 bet_closing = next(
                     (b.get("closing_yes_pct") for b in _bets if b["id"] == bet["id"]),
                     None,
                 )
+            if bet_pin_close is None:
+                ek = _edge_key(bet)
+                with _edge_history_lock:
+                    hist = _edge_price_history.get(ek, {})
+                    bet_pin_close = hist.get("last_pin_pct")
             if bet_closing is None:
                 ek = _edge_key(bet)
                 with _edge_history_lock:
                     hist = _edge_price_history.get(ek, {})
                     bet_closing = hist.get("last_kalshi_pct")
-            closing_yes = bet_closing
+
+            entry_k   = bet.get("kalshi_price", 0) * 100
             entry_yes = bet.get("kalshi_yes_at_flag")
             clv = None
-            if closing_yes is not None and entry_yes is not None:
-                clv = round(closing_yes - entry_yes if bet["side"] == "YES"
-                            else entry_yes - closing_yes, 1)
+            if bet_pin_close is not None and entry_k:
+                # True CLV: Pinnacle side-prob at close minus Kalshi entry price.
+                # Positive = sharp market agreed your edge was real at close.
+                clv = round(bet_pin_close - entry_k, 1)
+            elif bet_closing is not None and entry_yes is not None:
+                # Fallback: Kalshi drift (side-appropriate ask/bid prices)
+                clv = round(bet_closing - entry_yes if bet["side"] == "YES"
+                            else entry_yes - bet_closing, 1)
+            closing_yes = bet_closing
             with _bets_lock:
                 for b in _bets:
                     if b["id"] == bet["id"]:
@@ -496,6 +575,7 @@ def _check_resolutions():
                         b["resolved_at"]     = datetime.now(timezone.utc).isoformat()
                         b["resolved_by"]     = "kalshi"
                         b["closing_yes_pct"] = closing_yes
+                        b["closing_pin_pct"] = bet_pin_close
                         b["clv"]             = clv
                         # Kelly P&L — unified: pnl IS paper_pnl
                         ps = b.get("paper_stake") or 0.0
@@ -767,7 +847,7 @@ def _load_my_bets() -> list:
 def _save_my_bets(bets: list):
     try:
         import tempfile, os as _os
-        fd, tmp = tempfile.mkstemp(dir=BASE_DIR, suffix=".tmp")
+        fd, tmp = tempfile.mkstemp(dir=DATA_DIR, suffix=".tmp")
         with _os.fdopen(fd, "w") as f:
             json.dump(bets, f, indent=2)
         _os.replace(tmp, MY_BETS_FILE)
@@ -856,12 +936,28 @@ def _settle_my_bets():
     if not open_bets:
         return
 
+    from datetime import timedelta as _td2
+    now_utc = datetime.now(timezone.utc)
+
     score_index = _build_score_index()
     resolved = 0
 
     for bet in open_bets:
-        mkey = _re.sub(r"[^a-z0-9]", "", bet["matchup"].replace(" @ ", "@").lower())
-        game = score_index.get(mkey)
+        # Same game-over guard as _check_resolutions — prevent premature settlement
+        game_start = _parse_ticker_start_time(bet.get("ticker", ""))
+        if game_start:
+            if now_utc < game_start + _td2(hours=3.5):
+                continue
+        # Use dated key for score lookup to prevent cross-series contamination
+        import re as _re2
+        game_date = _parse_ticker_date(bet.get("ticker", ""))
+        mkey_base = _re.sub(r"[^a-z0-9]", "", bet["matchup"].replace(" @ ", "@").lower())
+        mkey_dated = mkey_base + "_" + game_date if game_date else None
+        game = (score_index.get(mkey_dated) if mkey_dated else None) or score_index.get(mkey_base)
+        # Reject if date doesn't match
+        if game and mkey_dated and game.get("game_date") and game_date:
+            if game["game_date"] != game_date:
+                game = None
         settled = False
 
         if game:
@@ -908,7 +1004,7 @@ def _settle_my_bets():
 
 
 # ── Twilio SMS alerts ─────────────────────────────────────────────────────────
-_ALERT_MIN    = float(os.getenv("ALERT_MIN_EDGE", "0.05"))  # Discord alerts at ≥5% (display threshold)
+_ALERT_MIN    = float(os.getenv("ALERT_MIN_EDGE", "0.03"))  # Discord alerts at ≥3% edge (matches .env default)
 _BET_SIZE     = float(os.getenv("ALERT_BET_SIZE", "20"))
 
 # ── Discord webhook alert config ───────────────────────────────────────────────
@@ -920,7 +1016,7 @@ _DISCORD_WEBHOOK = os.getenv(
 # ── Persistent alert dedup — survives server restarts ────────────────────────
 # Each entry is "<matchup>|<title>|<side>|<game_date>" keyed by YYYY-MM-DD game
 # date so the same teams+threshold on different days can each fire once.
-_ALERTED_KEYS_FILE = os.path.join(BASE_DIR, "ev_alerted_keys.json")
+_ALERTED_KEYS_FILE = os.path.join(DATA_DIR, "ev_alerted_keys.json")
 
 def _load_alerted_keys() -> set:
     """Load persisted alert keys, pruning entries older than 14 days."""
@@ -945,7 +1041,7 @@ def _save_alerted_keys(keys: set):
         today = datetime.now(timezone.utc).date().isoformat()
         for k in keys:
             existing.setdefault(k, today)
-        fd, tmp = tempfile.mkstemp(dir=BASE_DIR, suffix=".tmp")
+        fd, tmp = tempfile.mkstemp(dir=DATA_DIR, suffix=".tmp")
         with _os.fdopen(fd, "w") as f:
             json.dump(existing, f)
         _os.replace(tmp, _ALERTED_KEYS_FILE)
@@ -973,7 +1069,18 @@ _ZERO_EDGE_ALERT_SCANS = 60         # 60 × 2-min scan = 2 hours of silence
 # thread is considered HUNG (blocked on network I/O but still alive) — fire
 # alert + force-restart it regardless of is_alive() status.
 _scan_stale_alerted    = False      # suppresses duplicate stale alerts
-_SCAN_STALE_MINUTES    = 10         # minutes without a scan = hung thread
+_SCAN_STALE_MINUTES    = 20         # minutes without a scan = hung thread (20 min allows for cold-start on Railway)
+_watchdog_last_tick: float = 0.0    # epoch seconds of last watchdog loop tick — exposed in /api/scan
+
+# ── Kalshi auth failure detector ──────────────────────────────────────────────
+_kalshi_auth_failed    = False      # set True on first 401; cleared on successful scan
+_kalshi_auth_alerted   = False      # suppresses duplicate auth-failure Discord alerts
+
+# ── Odds staleness detector ────────────────────────────────────────────────────
+# Fires a Discord alert when the odds index hasn't refreshed in >2 hours during
+# game hours — catches a silent odds-thread hang that watchdog misses (thread alive but stuck).
+_odds_stale_alerted    = False      # suppresses duplicate odds-stale alerts
+_ODDS_STALE_MINUTES    = 120        # 2 hours without an odds refresh = alert
 
 # ── Discord alert log (visible in UI) ─────────────────────────────────────────
 _discord_log: List[dict] = []
@@ -1273,6 +1380,53 @@ def _send_scan_stale_alert(minutes: float) -> None:
     print(f"  Scan-stale alert sent ({minutes:.0f} min since last scan): {'✓' if ok else 'FAILED'}")
 
 
+def _send_auth_failed_alert(status_code: int) -> None:
+    """Fire a Discord alert when Kalshi returns 401/403 — API key or private key issue."""
+    ts = datetime.now().strftime("%-I:%M %p")
+    embed = {
+        "color": 0xE74C3C,
+        "author": {"name": f"Kalshi EV Scanner  •  {ts}  •  AUTH FAILURE"},
+        "title": f"🔑 Kalshi API auth failed (HTTP {status_code})",
+        "description": (
+            f"Every Kalshi API call is returning **HTTP {status_code}**.\n\n"
+            "The scanner is running but **cannot fetch any markets** — "
+            "no edges will be found until this is fixed.\n\n"
+            "**Possible causes:**\n"
+            "• `KALSHI_API_KEY` env var is missing or wrong\n"
+            "• `mannyxolo.txt` private key file is missing or corrupted\n"
+            "• Kalshi rotated your API credentials\n"
+            "• Clock skew on the server (signature timestamp rejected)"
+        ),
+        "footer": {"text": "Fires once per auth-failure episode — clears when scans resume"},
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+    content = f"🔑 Kalshi auth failed (HTTP {status_code}) — scanner cannot fetch markets"
+    ok = send_discord(embed, content)
+    print(f"  Auth-failed alert sent (HTTP {status_code}): {'✓' if ok else 'FAILED'}")
+
+
+def _send_odds_stale_alert(minutes: float) -> None:
+    """Fire a Discord alert when the odds index hasn't refreshed in >2 hours."""
+    ts = datetime.now().strftime("%-I:%M %p")
+    embed = {
+        "color": 0xFF9800,   # orange
+        "author": {"name": f"Kalshi EV Scanner  •  {ts}  •  ODDS STALE"},
+        "title": f"⚠️ Odds index stale — {minutes:.0f} min since last refresh",
+        "description": (
+            f"The Odds API index hasn't updated in **{minutes:.0f} minutes** during game hours.\n\n"
+            "Edges may be based on stale book lines. Common causes:\n"
+            "• Odds API monthly quota exhausted (check your dashboard)\n"
+            "• Odds API returned an error / rate-limited\n"
+            "• `odds` background thread is hung on a slow request"
+        ),
+        "footer": {"text": "Fires once per stale episode — clears when odds refresh resumes"},
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+    content = f"⚠️ Odds index stale {minutes:.0f}min — possible Odds API quota/error"
+    ok = send_discord(embed, content)
+    print(f"  Odds-stale alert sent ({minutes:.0f} min since last refresh): {'✓' if ok else 'FAILED'}")
+
+
 def _run_odds_refresh():
     """
     Fetch fresh book odds (Pinnacle + DK + FanDuel) and update the cached indices.
@@ -1523,10 +1677,7 @@ def _run_scan():
         # during game hours (10 AM – 11 PM PT), fire a health-check alert so
         # a silent pipeline failure doesn't go unnoticed for days.
         global _zero_edge_streak, _zero_edge_alerted
-        pt_hour = datetime.now(timezone.utc).hour - 7  # UTC → PT (approx)
-        if pt_hour < 0:
-            pt_hour += 24
-        in_game_hours = 10 <= pt_hour <= 23   # 10 AM – 11 PM PT
+        in_game_hours = 10 <= _et_hour() <= 23   # 10 AM – 11 PM ET
 
         if len(edges) > 0:
             _zero_edge_streak  = 0
@@ -1542,6 +1693,46 @@ def _run_scan():
         with _lock:
             _state["error"]    = str(exc)
             _state["scanning"] = False
+
+        # ── Kalshi auth failure detection ─────────────────────────────────────
+        global _kalshi_auth_failed, _kalshi_auth_alerted
+        exc_str = str(exc)
+        is_auth_error = ("401" in exc_str or "403" in exc_str or
+                         "Unauthorized" in exc_str or "Forbidden" in exc_str)
+        if is_auth_error:
+            _kalshi_auth_failed = True
+            if not _kalshi_auth_alerted:
+                _kalshi_auth_alerted = True
+                status = 401 if "401" in exc_str else 403
+                _send_auth_failed_alert(status)
+        else:
+            # Non-auth error — clear auth flags so a real auth failure later still fires
+            _kalshi_auth_failed   = False
+            _kalshi_auth_alerted  = False
+
+    # ── Odds staleness check (runs every scan cycle, outside the try block) ──
+    global _odds_stale_alerted
+    in_game_hours_now = 10 <= _et_hour() <= 23
+    with _odds_cache_lock:
+        odds_age_min = (time.time() - _last_odds_refresh) / 60 if _last_odds_refresh else None
+    if odds_age_min is not None and in_game_hours_now:
+        if odds_age_min >= _ODDS_STALE_MINUTES and not _odds_stale_alerted:
+            _odds_stale_alerted = True
+            _send_odds_stale_alert(odds_age_min)
+        elif odds_age_min < _ODDS_STALE_MINUTES:
+            _odds_stale_alerted = False   # reset when odds refresh resumes
+
+    # ── Prune _edge_price_history to prevent memory growth ───────────────────
+    # Keep only entries seen in the last 48 hours
+    _EDGE_HISTORY_TTL = 48 * 3600
+    now_ts = time.time()
+    with _edge_history_lock:
+        stale_keys = [k for k, v in _edge_price_history.items()
+                      if now_ts - v.get("last_ts", now_ts) > _EDGE_HISTORY_TTL]
+        for k in stale_keys:
+            del _edge_price_history[k]
+    if stale_keys:
+        print(f"  Pruned {len(stale_keys)} stale edge price history entries")
 
 
 def _background_loop():
@@ -1621,26 +1812,54 @@ def _capture_clv_prices():
             if bid_c <= 0 or ask_c <= 0:
                 continue
 
-            yes_mid_pct = round((bid_c + ask_c) / 2.0, 1)
+            # Use the side-appropriate transactable price, not the mid.
+            # Entry was captured as: YES bets → YES ask, NO bets → YES bid.
+            # Comparing to the mid would introduce a structural negative bias
+            # equal to ~half the spread (typically 2–4 pp) on every bet.
+            side = bet.get("side", "YES")
+            yes_close_pct = round(ask_c if side == "YES" else bid_c, 1)
 
             # Safety guard: reject prices that have collapsed to in-game extremes.
             # A market at 97¢+ or 3¢- means the outcome is effectively decided —
             # that's a live game price, not a pre-game closing line.
             # This prevents contamination if game_start parsing ever fails.
-            if yes_mid_pct >= 97.0 or yes_mid_pct <= 3.0:
+            if yes_close_pct >= 97.0 or yes_close_pct <= 3.0:
                 continue
+
+            # True CLV: compare entry Kalshi price to the last known Pinnacle
+            # probability for this bet's side.  `last_pin_pct` is already
+            # side-aligned (YES prob for YES bets, NO prob for NO bets) and is
+            # updated every scan cycle (~2 min during game hours).
+            # Formula: closing_pin_pct − entry_kalshi_pct
+            #   • Positive = Pinnacle valued the side MORE than you paid → +EV ✓
+            #   • Negative = Pinnacle valued the side LESS than you paid → −EV
+            # Falls back to Kalshi drift when Pinnacle data is unavailable.
+            ek = _edge_key(bet)
+            with _edge_history_lock:
+                pin_hist    = _edge_price_history.get(ek, {})
+                closing_pin = pin_hist.get("last_pin_pct")   # side-specific Pinnacle %
 
             with _bets_lock:
                 for b in _bets:
                     if b["id"] == bet["id"]:
-                        b["closing_yes_pct"] = yes_mid_pct
-                        entry_yes = b.get("kalshi_yes_at_flag")
-                        if entry_yes is not None:
-                            b["clv"] = round(
-                                yes_mid_pct - entry_yes if b["side"] == "YES"
-                                else entry_yes - yes_mid_pct,
-                                1,
-                            )
+                        b["closing_yes_pct"] = yes_close_pct
+                        b["closing_pin_pct"] = closing_pin   # persist for resolution time
+
+                        entry_k = b.get("kalshi_price", 0) * 100   # effective bet-side entry price
+                        if closing_pin is not None and entry_k:
+                            # Primary: true CLV vs Pinnacle closing line.
+                            # Unified formula works for both YES and NO because
+                            # closing_pin and entry_k are both in bet-side probability.
+                            b["clv"] = round(closing_pin - entry_k, 1)
+                        else:
+                            # Fallback: Kalshi drift using matched ask/bid prices
+                            entry_yes = b.get("kalshi_yes_at_flag")
+                            if entry_yes is not None:
+                                b["clv"] = round(
+                                    yes_close_pct - entry_yes if side == "YES"
+                                    else entry_yes - yes_close_pct,
+                                    1,
+                                )
                         break
             updated += 1
         except Exception as exc:
@@ -2828,6 +3047,11 @@ function renderPerformance(d) {
         ? `<span class="pnl-neu">open</span>`
         : '<span class="pnl-neu">—</span>';
     const ts = fmtDate(b.flagged_at);
+    // Game time — parse ticker start time if stored, otherwise derive from ticker
+    const gameTimeIso = b.game_time || null;
+    const gameTimeCell = gameTimeIso
+      ? (() => { const d = new Date(gameTimeIso); return `<span style="font-size:10px;color:var(--muted);" title="${d.toLocaleString()}">${d.toLocaleDateString('en-US',{month:'short',day:'numeric'})} ${d.toLocaleTimeString('en-US',{hour:'numeric',minute:'2-digit',timeZoneName:'short'})}</span>`; })()
+      : '<span style="color:var(--muted);font-size:10px;">—</span>';
     const clvCell = b.clv != null
       ? `<span class="${b.clv >= 0 ? 'pnl-pos' : 'pnl-neg'}">${b.clv >= 0 ? '+' : ''}${b.clv}%</span>`
       : '—';
@@ -2841,6 +3065,7 @@ function renderPerformance(d) {
       : '<span style="font-size:10px;color:var(--muted);">pin only</span>';
     return `<tr>
       <td>${ts}</td>
+      <td>${gameTimeCell}</td>
       <td>${b.matchup}</td>
       <td class="prop-col">${b.title}</td>
       <td class="side-${b.side.toLowerCase()}">${b.side}</td>
@@ -2856,7 +3081,7 @@ function renderPerformance(d) {
 
   let perfTableHtml = `<table>
     <thead><tr>
-      <th>Flagged</th><th>Matchup</th><th>Prop</th><th>Side</th>
+      <th>Flagged</th><th>Game Time</th><th>Matchup</th><th>Prop</th><th>Side</th>
       <th class="num" title="Adjusted EV after 25% haircut (raw shown in tooltip)">Adj. EV</th>
       <th class="num">Price</th>
       <th class="num" title="Books that contributed to consensus probability">Sources</th>
@@ -3204,7 +3429,14 @@ class Handler(BaseHTTPRequestHandler):
 
         elif path == "/api/scan":
             with _lock:
-                payload = json.dumps(_state).encode()
+                state_copy = dict(_state)
+            # Augment with watchdog / odds health info for observability
+            with _odds_cache_lock:
+                odds_age_sec = int(time.time() - _last_odds_refresh) if _last_odds_refresh else None
+            state_copy["watchdog_last_tick"] = int(_watchdog_last_tick) if _watchdog_last_tick else None
+            state_copy["odds_age_sec"]       = odds_age_sec
+            state_copy["kalshi_auth_failed"] = _kalshi_auth_failed
+            payload = json.dumps(state_copy).encode()
             self._send(200, "application/json", payload)
 
         elif path == "/api/history":
@@ -3385,63 +3617,66 @@ if __name__ == "__main__":
                                increments the scan counter, so is_alive() lies.
                                We fire a Discord alert and force-restart anyway.
         """
-        global _scan_stale_alerted
+        global _scan_stale_alerted, _watchdog_last_tick
         while True:
             time.sleep(60)
+            try:
+                _watchdog_last_tick = time.time()
 
-            # ── Mode 1: restart dead threads ─────────────────────────────────
-            for i, (name, target, th) in enumerate(_bg_threads):
-                if not th.is_alive():
-                    print(f"  ⚠️  Thread '{name}' died — restarting...")
-                    new_th = threading.Thread(target=target, name=name, daemon=True)
-                    new_th.start()
-                    _bg_threads[i] = (name, target, new_th)
+                # ── Mode 1: restart dead threads ─────────────────────────────
+                for i, (name, target, th) in enumerate(_bg_threads):
+                    if not th.is_alive():
+                        print(f"  ⚠️  Thread '{name}' died — restarting...")
+                        new_th = threading.Thread(target=target, name=name, daemon=True)
+                        new_th.start()
+                        _bg_threads[i] = (name, target, new_th)
 
-            # ── Mode 2: detect hung scan thread (alive but not scanning) ─────
-            pt_hour = datetime.now(timezone.utc).hour - 7   # UTC → PT approx
-            if pt_hour < 0:
-                pt_hour += 24
-            in_game_hours = 10 <= pt_hour <= 23   # 10 AM – 11 PM PT
+                # ── Mode 2: detect hung scan thread (alive but not scanning) ─
+                in_game_hours = 10 <= _et_hour() <= 23   # 10 AM – 11 PM ET
 
-            with _lock:
-                last_scan_iso = _state.get("last_scan")
+                with _lock:
+                    last_scan_iso = _state.get("last_scan")
 
-            stale_min = None
-            if last_scan_iso:
-                try:
-                    last_dt   = datetime.fromisoformat(last_scan_iso)
-                    # make naive UTC comparable
-                    now_utc   = datetime.now(timezone.utc)
-                    if last_dt.tzinfo is None:
-                        last_dt = last_dt.replace(tzinfo=timezone.utc)
-                    stale_min = (now_utc - last_dt).total_seconds() / 60
-                except Exception:
-                    pass
+                stale_min = None
+                if last_scan_iso:
+                    try:
+                        last_dt   = datetime.fromisoformat(last_scan_iso)
+                        # make naive UTC comparable
+                        now_utc   = datetime.now(timezone.utc)
+                        if last_dt.tzinfo is None:
+                            last_dt = last_dt.replace(tzinfo=timezone.utc)
+                        stale_min = (now_utc - last_dt).total_seconds() / 60
+                    except Exception:
+                        pass
 
-            if stale_min is not None and in_game_hours:
-                if stale_min >= _SCAN_STALE_MINUTES:
-                    if not _scan_stale_alerted:
-                        _scan_stale_alerted = True
-                        print(f"  🚨 Scan thread hung — {stale_min:.0f} min since last scan. "
-                              f"Force-restarting...")
-                        _send_scan_stale_alert(stale_min)
-                        # Force-start a fresh scan thread (old one may still be alive but
-                        # effectively blocked; daemon threads can't be killed, but the new
-                        # thread will take over and both produce scans — harmless duplicate)
-                        for i, (name, target, th) in enumerate(_bg_threads):
-                            if name == "scan":
-                                new_th = threading.Thread(
-                                    target=target, name="scan-restart", daemon=True
-                                )
-                                new_th.start()
-                                _bg_threads[i] = (name, target, new_th)
-                                print(f"  Scan thread force-restarted (old thread left to drain)")
-                                break
-                else:
-                    # Scan is fresh — clear stale flag
-                    if _scan_stale_alerted:
-                        _scan_stale_alerted = False
-                        print(f"  ✓ Scan thread recovered — last scan {stale_min:.1f} min ago")
+                if stale_min is not None and in_game_hours:
+                    if stale_min >= _SCAN_STALE_MINUTES:
+                        if not _scan_stale_alerted:
+                            _scan_stale_alerted = True
+                            print(f"  🚨 Scan thread hung — {stale_min:.0f} min since last scan. "
+                                  f"Force-restarting...")
+                            _send_scan_stale_alert(stale_min)
+                            # Force-start a fresh scan thread (old one may still be alive but
+                            # effectively blocked; daemon threads can't be killed, but the new
+                            # thread will take over and both produce scans — harmless duplicate)
+                            for i, (name, target, th) in enumerate(_bg_threads):
+                                if name == "scan":
+                                    new_th = threading.Thread(
+                                        target=target, name="scan-restart", daemon=True
+                                    )
+                                    new_th.start()
+                                    _bg_threads[i] = (name, target, new_th)
+                                    print(f"  Scan thread force-restarted (old thread left to drain)")
+                                    break
+                    else:
+                        # Scan is fresh — clear stale flag
+                        if _scan_stale_alerted:
+                            _scan_stale_alerted = False
+                            print(f"  ✓ Scan thread recovered — last scan {stale_min:.1f} min ago")
+
+            except Exception as _wd_exc:
+                # Never let the watchdog die — log and continue
+                print(f"  ⚠️  Watchdog internal error (continuing): {_wd_exc}")
 
     _start_bg_threads()
 

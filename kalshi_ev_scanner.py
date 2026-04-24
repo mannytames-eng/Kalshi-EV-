@@ -46,14 +46,23 @@ KALSHI_BASE = "https://api.elections.kalshi.com/trade-api/v2"
 ODDS_BASE   = "https://api.the-odds-api.com/v4"
 
 # ── EV / filtering constants ────────────────────────────────────────────────
-# All thresholds apply to the POST-haircut adjusted edge.
-EDGE_THRESHOLD     = 0.03    # ≥3% adjusted EV — everything above is logged to paper portfolio
-                             # (UI display is filtered to ≥5% separately in kalshi_ev_ui.py)
-MAX_EDGE           = 0.20    # reject edges >20% post-haircut — almost certainly
-                             # a stale line or data mismatch, not real EV.
-                             # Real market makers close gaps this large in seconds.
-EV_HAIRCUT         = 0.10    # discount raw edge by 10% for model uncertainty (reduced from 25% for data collection phase)
-TOP_BETS_PER_CYCLE = 25      # surface up to 25 qualifying bets per scan (all go to paper portfolio)
+# All thresholds apply to the POST-fee, POST-haircut adjusted edge.
+#
+# Edge pipeline (applied in order):
+#   1. raw_edge   = fair_prob − kalshi_ask          (gross probability gap)
+#   2. fee_adj    = raw_edge − KALSHI_FEE_RATE × fair_prob × (1 − kalshi_ask)
+#                                                   (subtract Kalshi profit fee)
+#   3. adj_edge   = fee_adj × (1 − EV_HAIRCUT)     (model-uncertainty discount)
+#
+# Kalshi charges ~7% of profits on winning trades (verify at kalshi.com/fees).
+# For a typical 52% fair / 45¢ entry, this costs ~2pp of the apparent edge.
+# A raw gap of 3% becomes ~0.9% true EV — still positive but thin.
+KALSHI_FEE_RATE    = 0.07    # Kalshi profit fee (7% of winnings) — update if tier changes
+EDGE_THRESHOLD     = 0.02    # ≥2% fee+haircut-adjusted EV to flag (was 3% pre-fee-model)
+                             # Equivalent to ~3.5–4% raw gap before fees and haircut.
+MAX_EDGE           = 0.20    # reject edges >20% — almost certainly a stale line
+EV_HAIRCUT         = 0.10    # model-uncertainty discount (separate from fee)
+TOP_BETS_PER_CYCLE = 25      # surface up to 25 qualifying bets per scan
 MAX_BETS_PER_GROUP = 2       # max bets per (matchup, mkt_type) group
 
 # Minimum Kalshi price for any side we'll consider betting.
@@ -106,8 +115,13 @@ def _parse_ticker_date(ticker: str) -> Optional[str]:
 
 def _parse_ticker_start_time(ticker: str) -> Optional[datetime]:
     """Extract the game start datetime (UTC) from a Kalshi ticker.
-    e.g. KXMLBTOTAL-26APR131840LAANYY-10 → 2026-04-13 18:40 UTC
+    e.g. KXMLBTOTAL-26APR131840LAANYY-10 → 2026-04-13 22:40 UTC (18:40 ET → UTC)
+
+    Kalshi encodes all times in US Eastern Time (ET).
+    MLB season (Apr–Oct) and NBA playoffs (Apr–Jun) are always EDT = UTC−4.
+    Nov–Mar uses EST = UTC−5; we detect this from the month.
     Returns None if no time component found."""
+    from datetime import timedelta as _td2
     m = re.search(r"-(\d{2})([A-Z]{3})(\d{2})(\d{2})(\d{2})", ticker)
     if not m:
         return None
@@ -116,8 +130,11 @@ def _parse_ticker_start_time(ticker: str) -> Optional[datetime]:
     if not month_num:
         return None
     try:
-        return datetime(2000 + int(yy), month_num, int(dd),
-                        int(hh), int(mm), tzinfo=timezone.utc)
+        # Kalshi times are Eastern Time.  EDT (UTC−4) covers Apr 1 – Oct 31;
+        # EST (UTC−5) covers Nov 1 – Mar 31.  Convert to UTC by adding the offset.
+        et_offset_hours = 4 if 4 <= month_num <= 10 else 5
+        dt_et = datetime(2000 + int(yy), month_num, int(dd), int(hh), int(mm))
+        return (dt_et + _td2(hours=et_offset_hours)).replace(tzinfo=timezone.utc)
     except ValueError:
         return None
 
@@ -900,11 +917,13 @@ def recheck_ev(ticker: str, fair_prob: float, side: str) -> Optional[dict]:
     if side == "YES":
         raw_edge = fair_prob - yes_ask
         k_price  = yes_ask
+        fee_cost = KALSHI_FEE_RATE * fair_prob * (1 - yes_ask)
     else:
         raw_edge = (1 - fair_prob) - (1 - yes_bid)
         k_price  = 1 - yes_bid
+        fee_cost = KALSHI_FEE_RATE * (1 - fair_prob) * yes_bid
 
-    adj_edge = raw_edge * (1 - EV_HAIRCUT)
+    adj_edge = (raw_edge - fee_cost) * (1 - EV_HAIRCUT)
 
     if adj_edge < EDGE_THRESHOLD or adj_edge > MAX_EDGE or k_price < MIN_KALSHI_PRICE:
         print(f"  recheck_ev: {ticker} {side} — edge {adj_edge:.1%} out of range [{EDGE_THRESHOLD:.0%}–{MAX_EDGE:.0%}] or price {k_price:.2f} below floor, discarding")
@@ -1079,14 +1098,17 @@ def validate_bet(edge: dict, max_age_seconds: int = 600) -> dict:
         result["fair_now"] = round(fair_now * 100, 1)
         result["fair_moved"] = 0.0
 
-    # ── 4. Recompute edge ─────────────────────────────────────────────────────
+    # ── 4. Recompute edge (fee-adjusted then haircut) ─────────────────────────
     if side == "YES":
-        raw_now = fair_now - kalshi_now
+        raw_now  = fair_now - kalshi_now
+        fee_now  = KALSHI_FEE_RATE * fair_now * (1 - kalshi_now)
     else:
-        raw_now = (1 - fair_now) - (1 - kalshi_now)
+        raw_now  = (1 - fair_now) - (1 - kalshi_now)
+        fee_now  = KALSHI_FEE_RATE * (1 - fair_now) * kalshi_now
 
-    adj_now = raw_now * (1 - EV_HAIRCUT)
-    result["edge_now"] = round(adj_now * 100, 2)
+    adj_now = (raw_now - fee_now) * (1 - EV_HAIRCUT)
+    result["edge_now"]     = round(adj_now * 100, 2)
+    result["raw_edge_now"] = round(raw_now * 100, 2)   # gross gap before fees
 
     # ── 5. Verdict ────────────────────────────────────────────────────────────
     issues = []
@@ -1224,20 +1246,15 @@ _MONTH_NUM = {"JAN":1,"FEB":2,"MAR":3,"APR":4,"MAY":5,"JUN":6,
               "JUL":7,"AUG":8,"SEP":9,"OCT":10,"NOV":11,"DEC":12}
 
 def _parse_ticker_game_time(ticker: str) -> Optional[datetime]:
-    m = re.search(r"-(\d{2})([A-Z]{3})(\d{2})(\d{4})?", ticker)
-    if not m:
-        return None
-    yy, mon, dd, hhmm = m.group(1), m.group(2), m.group(3), m.group(4)
-    month = _MONTH_NUM.get(mon)
-    if not month:
-        return None
-    try:
-        year = 2000 + int(yy)
-        day  = int(dd)
-        hh, mm = (int(hhmm[:2]), int(hhmm[2:])) if hhmm else (0, 0)
-        return datetime(year, month, day, hh, mm, tzinfo=timezone.utc)
-    except ValueError:
-        return None
+    """Return the game start time as UTC, or None if unavailable/unparseable.
+
+    Delegates to _parse_ticker_start_time for proper ET→UTC conversion.
+    Returns None (not midnight UTC) when the ticker has no time component,
+    so callers don't erroneously treat same-day NBA markets as already in-progress.
+    NBA tickers omit the time (e.g. KXNBATOTAL-26APR26CLETOR) — returning
+    midnight UTC would cause every same-day game to be skipped.
+    """
+    return _parse_ticker_start_time(ticker)
 
 
 def _norm(s: str) -> str:
@@ -1312,6 +1329,7 @@ def _find_game(
 # ── Event ticker parsers ──────────────────────────────────────────────────────
 def _parse_nba_event(ticker: str, abbr_map: Dict[str, str]) -> Tuple[Optional[str], Optional[str]]:
     suffix = re.sub(r"^KX\w+?-\d+[A-Z]+\d+", "", ticker).lstrip("-")
+    suffix = suffix.split("-")[0]  # strip market suffix like -OKC4 (spread threshold)
     for i in range(2, len(suffix) - 1):
         a, b = suffix[:i], suffix[i:]
         na = _abbr_to_name(a, abbr_map)
@@ -1601,6 +1619,7 @@ def scan_sport(
                 consensus_prob = None
                 total_fair_src = "exact"   # all edges require a direct Pinnacle line
 
+                mkt_team_is_fav = False   # set below when spread fav is identified
                 if direction == "spread_team" and team_name:
                     fav_spread_info = None
                     for candidate in [home_name, away_name, team_name]:
@@ -1627,6 +1646,7 @@ def scan_sport(
 
                     if fav_spread_info:
                         fav_name, (fav_cover_prob, fav_spread_pt, fav_books) = fav_spread_info
+                        mkt_team_is_fav = _norm(team_name or "") == _norm(fav_name or "")
                         # Require a direct Pinnacle alternate spread line at this
                         # exact threshold.  No inference — if Pinnacle doesn't post
                         # this line, skip.  Their alternate prices already embed all
@@ -1730,14 +1750,21 @@ def scan_sport(
                 if "pinnacle" not in books_used and len(books_used) < 2:
                     continue
 
-                # ── EV calculation with haircut ───────────────────────────
-                # Use the ASK price for the side being bought (tradeable edge)
+                # ── EV calculation: fee deduction then uncertainty haircut ──
+                # Use ASK for YES entry, BID-complement for NO entry.
                 yes_raw_edge = fair - yes_ask
                 no_raw_edge  = (1 - fair) - (1 - yes_bid)
 
-                # Apply 25% haircut to raw edge
-                yes_adj = yes_raw_edge * (1 - EV_HAIRCUT)
-                no_adj  = no_raw_edge  * (1 - EV_HAIRCUT)
+                # Step 1: subtract Kalshi profit fee (charged on winnings only).
+                # fee_cost = KALSHI_FEE_RATE × fair_prob × (1 − entry_price)
+                yes_fee  = KALSHI_FEE_RATE * fair        * (1 - yes_ask)
+                no_fee   = KALSHI_FEE_RATE * (1 - fair)  * yes_bid
+                yes_fee_adj = yes_raw_edge - yes_fee
+                no_fee_adj  = no_raw_edge  - no_fee
+
+                # Step 2: apply model-uncertainty haircut
+                yes_adj = yes_fee_adj * (1 - EV_HAIRCUT)
+                no_adj  = no_fee_adj  * (1 - EV_HAIRCUT)
 
                 best_adj = max(yes_adj, no_adj)
                 if best_adj < EDGE_THRESHOLD:
@@ -2208,8 +2235,10 @@ def scan_player_props(
         yes_raw  = fair_over  - yes_ask
         no_raw   = fair_under - (1.0 - yes_bid)
 
-        yes_adj  = yes_raw * (1 - EV_HAIRCUT)
-        no_adj   = no_raw  * (1 - EV_HAIRCUT)
+        yes_fee  = KALSHI_FEE_RATE * fair_over  * (1 - yes_ask)
+        no_fee   = KALSHI_FEE_RATE * fair_under * yes_bid
+        yes_adj  = (yes_raw - yes_fee) * (1 - EV_HAIRCUT)
+        no_adj   = (no_raw  - no_fee)  * (1 - EV_HAIRCUT)
 
         best_adj = max(yes_adj, no_adj)
         if best_adj < EDGE_THRESHOLD:

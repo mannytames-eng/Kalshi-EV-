@@ -1895,15 +1895,24 @@ def _capture_clv_prices():
             # Freeze CLV at game start time — do NOT update with in-game prices.
             # Kalshi keeps markets "active" during the game, so status alone can't
             # tell us if the game has started. Parse the start time from the ticker;
-            # fall back to close_time - 2.5h for NBA tickers that embed no time.
+            # fall back to close_time - 4.0h for NBA, 3.5h for MLB.
             game_start = _parse_ticker_start_time(bet["ticker"])
+            if game_start is None:
+                # Use game_time stored on the bet if available
+                gt = bet.get("game_time")
+                if gt:
+                    try:
+                        game_start = datetime.fromisoformat(gt.replace("Z", "+00:00"))
+                    except (ValueError, AttributeError):
+                        pass
             if game_start is None:
                 close_str = mkt.get("close_time") or mkt.get("expected_expiration_time")
                 if close_str:
                     try:
                         from datetime import timedelta as _tdc
                         close_dt = datetime.fromisoformat(close_str.replace("Z", "+00:00"))
-                        game_start = close_dt - _tdc(hours=2.5)
+                        is_nba   = bet["ticker"].upper().startswith("KXNBA")
+                        game_start = close_dt - _tdc(hours=4.0 if is_nba else 3.5)
                     except (ValueError, AttributeError):
                         pass
             if game_start and datetime.now(timezone.utc) >= game_start:
@@ -1931,10 +1940,11 @@ def _capture_clv_prices():
             yes_close_pct = round(ask_c if side == "YES" else bid_c, 1)
 
             # Safety guard: reject prices that have collapsed to in-game extremes.
-            # A market at 97¢+ or 3¢- means the outcome is effectively decided —
-            # that's a live game price, not a pre-game closing line.
-            # This prevents contamination if game_start parsing ever fails.
-            if yes_close_pct >= 97.0 or yes_close_pct <= 3.0:
+            # Pre-game markets rarely close below 8¢ or above 92¢ — anything
+            # beyond those bounds is almost certainly a live in-game price
+            # reflecting a near-decided outcome, not a true closing line.
+            # This is a backstop for the game_start guard above.
+            if yes_close_pct >= 92.0 or yes_close_pct <= 8.0:
                 continue
 
             # True CLV: compare entry Kalshi price to the last known Pinnacle

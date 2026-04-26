@@ -3783,21 +3783,6 @@ class Handler(BaseHTTPRequestHandler):
                 if len(_bets) < before:
                     _save_bets(_bets)
             self._send(200, "application/json", json.dumps({"ok": True, "removed": before - len(_bets)}).encode())
-        elif path == "/api/admin/patch_bet":
-            length = int(self.headers.get("Content-Length", 0))
-            body   = json.loads(self.rfile.read(length))
-            bet_id = body.get("id")
-            fields = {k: v for k, v in body.items() if k != "id"}
-            patched = False
-            with _bets_lock:
-                for b in _bets:
-                    if b["id"] == bet_id:
-                        b.update(fields)
-                        patched = True
-                        break
-                if patched:
-                    _save_bets(_bets)
-            self._send(200, "application/json", json.dumps({"ok": True, "patched": patched}).encode())
         else:
             self._send(404, "text/plain", b"Not found")
 

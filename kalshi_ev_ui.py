@@ -1566,6 +1566,10 @@ def _run_odds_refresh():
 
 def _background_odds_loop():
     """Refresh book-odds cache on an adaptive schedule (costs 3 credits/refresh)."""
+    # On Railway, give the HTTP server 10 s to start accepting connections before
+    # making any outbound network calls — keeps cold-start inside the healthcheck window.
+    if os.environ.get("RAILWAY_ENVIRONMENT"):
+        time.sleep(10)
     try:
         _run_odds_refresh()      # run immediately so first Kalshi scan has data
     except Exception as exc:

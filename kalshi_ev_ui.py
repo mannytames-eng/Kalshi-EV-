@@ -3601,6 +3601,11 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         path = self.path.split("?")[0]
 
+        if path == "/health":
+            # Lightweight Railway healthcheck — no locks, no state, instant 200
+            self._send(200, "application/json", b'{"ok":true}')
+            return
+
         if path == "/":
             # Force-bust browser cache: redirect bare / to /?v=<timestamp>
             from urllib.parse import urlparse, parse_qs

@@ -123,9 +123,10 @@ def _load_pin_prices() -> dict:
 
 def _save_pin_prices():
     try:
+        import tempfile as _tempfile
         with _edge_history_lock:
             snapshot = dict(_edge_price_history)
-        fd, tmp = tempfile.mkstemp(dir=DATA_DIR, suffix=".tmp")
+        fd, tmp = _tempfile.mkstemp(dir=DATA_DIR, suffix=".tmp")
         with os.fdopen(fd, "w") as f:
             json.dump(snapshot, f)
         os.replace(tmp, PIN_PRICES_FILE)

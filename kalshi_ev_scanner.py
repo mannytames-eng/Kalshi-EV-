@@ -442,12 +442,14 @@ def fetch_odds_events_list(sport: str) -> List[dict]:
     return r.json()
 
 
-def fetch_player_prop_odds_event(sport: str, event_id: str) -> dict:
+def fetch_player_prop_odds_event(sport: str, event_id: str, markets: str = None) -> dict:
     """
     Fetch player-prop odds for one event from all books.
     Falls back through books if earlier ones have no data.
     Costs 1 Odds API credit per call.
     """
+    if markets is None:
+        markets = "pitcher_strikeouts,batter_hits,batter_home_runs,batter_total_bases,batter_rbis"
     all_books = ",".join(BOOK_WEIGHTS.keys())
     # Try all books together first (one credit, richest data)
     r = requests.get(
@@ -455,7 +457,7 @@ def fetch_player_prop_odds_event(sport: str, event_id: str) -> dict:
         params={
             "apiKey":     ODDS_API_KEY,
             "bookmakers": all_books,
-            "markets":    PLAYER_PROP_MARKETS,
+            "markets":    markets,
             "oddsFormat": "american",
         },
         timeout=15,
@@ -1564,6 +1566,17 @@ def scan_sport(
 
             # Skip in-progress games (Kalshi live prices ≠ pre-game book prices)
             game_dt = _parse_ticker_game_time(ev_ticker)
+            if game_dt is None and exp_str:
+                # NBA tickers have no time component — estimate start from expiration.
+                # NBA games run ~2.5h + buffer → use 4h offset.
+                # MLB games run ~3h + buffer → use 3.5h offset.
+                try:
+                    from datetime import timedelta as _tde
+                    exp_dt_g = datetime.fromisoformat(exp_str.replace("Z", "+00:00"))
+                    is_nba   = "NBA" in series.upper()
+                    game_dt  = exp_dt_g - _tde(hours=4.0 if is_nba else 3.5)
+                except (ValueError, AttributeError):
+                    pass
             if game_dt and game_dt < now_utc:
                 continue
 
@@ -1945,6 +1958,7 @@ def scan_sport(
 PLAYER_PROP_MARKETS = (
     "pitcher_strikeouts,batter_hits,batter_home_runs,batter_total_bases,batter_rbis"
 )
+NBA_PLAYER_PROP_MARKETS = "player_points,player_assists,player_threes"
 
 MLB_PROP_SERIES: Dict[str, str] = {
     "KXMLBKS":  "pitcher_strikeouts",
@@ -1952,6 +1966,12 @@ MLB_PROP_SERIES: Dict[str, str] = {
     # "KXMLBHR":  "batter_home_runs",   # disabled — too rare (~8-12%/game) to model reliably
     "KXMLBTB":  "batter_total_bases",
     "KXMLBRBI": "batter_rbis",
+}
+
+NBA_PROP_SERIES: Dict[str, str] = {
+    "KXNBAPTS": "player_points",
+    "KXNBAAST": "player_assists",
+    "KXNBA3PT": "player_threes",
 }
 
 
@@ -1975,6 +1995,7 @@ def build_all_player_props(
     odds_sport: str,
     odds_events: List[dict],
     needed_teams: Optional[set] = None,
+    markets: str = None,
 ) -> Dict[str, Dict[str, dict]]:
     """
     Fetch player-prop odds for all books and build a weighted-consensus
@@ -1982,6 +2003,8 @@ def build_all_player_props(
 
     Returns: { player_norm: { prop_type: {player, line, over_prob, lambda} } }
     """
+    if markets is None:
+        markets = "pitcher_strikeouts,batter_hits,batter_home_runs,batter_total_bases,batter_rbis"
     now = datetime.now(timezone.utc)
     target_events = []
     for ev in odds_events:
@@ -2007,7 +2030,7 @@ def build_all_player_props(
 
     for ev in target_events:
         try:
-            edata = fetch_player_prop_odds_event(odds_sport, ev["id"])
+            edata = fetch_player_prop_odds_event(odds_sport, ev["id"], markets=markets)
             time.sleep(0.3)
         except Exception as e:
             print(f"    ERROR fetching props for {ev.get('away_team')} @ {ev.get('home_team')}: {e}")
@@ -2094,16 +2117,28 @@ def scan_player_props(
     odds_sport: str = "baseball_mlb",
     abbr_map: Optional[Dict[str, str]] = None,
     max_games: int = 15,
+    prop_series: Optional[Dict[str, str]] = None,
+    prop_markets: Optional[str] = None,
+    sport_label: str = "MLB",
+    mkt_type_label: str = "prop",
+    parse_event_fn=None,
 ) -> List[dict]:
     """
-    Scan Kalshi MLB player-prop markets vs consensus no-vig props.
-    Applies EV haircut, minimum adjusted EV filter, and top-N cap.
+    Scan Kalshi player-prop markets vs consensus no-vig props.
+    Sport-agnostic — pass prop_series, prop_markets, and sport_label for each sport.
+    Defaults to MLB configuration.
     """
     if abbr_map is None:
         abbr_map = MLB_ABBR
+    if prop_series is None:
+        prop_series = MLB_PROP_SERIES
+    if prop_markets is None:
+        prop_markets = PLAYER_PROP_MARKETS
+    if parse_event_fn is None:
+        parse_event_fn = _parse_mlb_event
 
     print(f"\n{'═'*70}")
-    print(f"  MLB Player Props  —  {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"  {sport_label} Player Props  —  {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"  EV haircut: {EV_HAIRCUT:.0%}   Min adj. EV: {EDGE_THRESHOLD:.0%}")
     print(f"{'═'*70}")
 
@@ -2111,7 +2146,7 @@ def scan_player_props(
 
     # 1. Collect Kalshi prop markets
     kalshi_props: List[dict] = []
-    for series, prop_type in MLB_PROP_SERIES.items():
+    for series, prop_type in prop_series.items():
         try:
             evts = fetch_kalshi_events(series)
         except Exception as e:
@@ -2130,6 +2165,14 @@ def scan_player_props(
 
             ev_ticker = evt.get("event_ticker", "")
             game_dt   = _parse_ticker_game_time(ev_ticker)
+            if game_dt is None and exp_str:
+                try:
+                    from datetime import timedelta as _tde
+                    exp_dt_g = datetime.fromisoformat(exp_str.replace("Z", "+00:00"))
+                    is_nba   = any(s in ev_ticker.upper() for s in ("NBA", "KXNBA"))
+                    game_dt  = exp_dt_g - _tde(hours=4.0 if is_nba else 3.5)
+                except (ValueError, AttributeError):
+                    pass
             if game_dt is not None and game_dt <= now_utc:
                 continue  # in-progress game
 
@@ -2172,13 +2215,13 @@ def scan_player_props(
 
     # 2. Build needed-teams set
     needed_teams: set = set()
-    for series in MLB_PROP_SERIES:
+    for series in prop_series:
         try:
             evts = fetch_kalshi_events(series)
         except Exception:
             continue
         for evt in evts:
-            away_raw, home_raw = _parse_mlb_event(evt.get("event_ticker", ""), abbr_map)
+            away_raw, home_raw = parse_event_fn(evt.get("event_ticker", ""), abbr_map)
             lu = build_city_lookup(abbr_map)
             for raw in [away_raw, home_raw]:
                 if raw:
@@ -2195,7 +2238,7 @@ def scan_player_props(
         return []
 
     # 4. Build player prop consensus index
-    player_lookup = build_all_player_props(odds_sport, odds_events, needed_teams or None)
+    player_lookup = build_all_player_props(odds_sport, odds_events, needed_teams or None, markets=prop_markets)
     if not player_lookup:
         print("  No player prop data available — skipping.")
         return []
@@ -2299,7 +2342,7 @@ def scan_player_props(
             "raw_edge":             round(raw_edge, 4),
             "edge":                 round(adj_edge, 4),
             "confidence":           confidence,
-            "mkt_type":             "prop",
+            "mkt_type":             mkt_type_label,
             "pin_line":             matched["line"],
             "prop_type":            prop_type,
             "books_used":           matched.get("books_used", []),
@@ -2333,6 +2376,19 @@ def scan_player_props(
                 f"\033[92m{e['edge']:>+5.1%}\033[0m  {stars}"
             )
     return edges
+
+
+def scan_nba_player_props() -> List[dict]:
+    """Scan Kalshi NBA player-prop markets (points, assists, 3-pointers)."""
+    return scan_player_props(
+        odds_sport      = "basketball_nba",
+        abbr_map        = NBA_ABBR,
+        prop_series     = NBA_PROP_SERIES,
+        prop_markets    = NBA_PLAYER_PROP_MARKETS,
+        sport_label     = "NBA",
+        mkt_type_label  = "nba_prop",
+        parse_event_fn  = _parse_nba_event,
+    )
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────

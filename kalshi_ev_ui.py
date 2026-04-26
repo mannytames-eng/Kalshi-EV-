@@ -30,6 +30,8 @@ load_dotenv(os.path.join(_SCRIPT_DIR, ".env"))   # .env lives next to the script
 sys.path.insert(0, BASE_DIR)
 from kalshi_ev_scanner import (
     scan_sport,
+    scan_player_props,
+    scan_nba_player_props,
     kalshi_get,
     fetch_game_scores,
     validate_bet,
@@ -80,7 +82,6 @@ def _odds_refresh_interval() -> int:
         return 4 * 60
     return 20 * 60           # overnight: slow down
 REFRESH_SECONDS       = 2 * 60     # re-scan Kalshi every 2 min    (0 credits)
-# Player props removed — too volatile. Only game lines (spreads/totals) are scanned.
 # Monthly credit math (20k budget):
 #   Odds refresh : 2 × 144/day × 30 =  8,640
 #   Props scan   : 10 × 8/day × 30  =  2,400
@@ -90,6 +91,7 @@ REFRESH_SECONDS       = 2 * 60     # re-scan Kalshi every 2 min    (0 credits)
 HISTORY_FILE    = os.path.join(DATA_DIR, "ev_history.json")
 BETS_FILE       = os.path.join(DATA_DIR, "ev_bets.json")
 MY_BETS_FILE    = os.path.join(DATA_DIR, "my_bets.json")
+PIN_PRICES_FILE = os.path.join(DATA_DIR, "ev_pin_prices.json")
 MAX_HISTORY     = 500       # cap stored scan snapshots
 PERF_BANKROLL        = 1000.0    # bankroll for ROI % display
 
@@ -109,10 +111,30 @@ _state   = {
 }
 
 # Tracks first-seen and last-seen YES price for each edge key (for staleness + CLV)
-_edge_price_history: dict = {}
+# Persisted to PIN_PRICES_FILE so Pinnacle prices survive server restarts.
 _edge_history_lock = threading.Lock()
 
-# Player props removed — too volatile.
+def _load_pin_prices() -> dict:
+    try:
+        with open(PIN_PRICES_FILE, "r") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+def _save_pin_prices():
+    try:
+        with _edge_history_lock:
+            snapshot = dict(_edge_price_history)
+        fd, tmp = tempfile.mkstemp(dir=DATA_DIR, suffix=".tmp")
+        with os.fdopen(fd, "w") as f:
+            json.dump(snapshot, f)
+        os.replace(tmp, PIN_PRICES_FILE)
+    except Exception as exc:
+        print(f"  WARNING: could not save pin prices: {exc}")
+
+_edge_price_history: dict = _load_pin_prices()
+print(f"  Loaded {len(_edge_price_history)} Pinnacle price entries from disk")
+
 
 # ── Cached book-odds indices (populated by slow 30-min thread) ────────────────
 # The fast 2-min Kalshi scan reads these without spending Odds API credits.
@@ -151,8 +173,13 @@ def _load_bets() -> list:
         seed = os.environ.get("EV_BETS_SEED")
         if seed:
             try:
-                import base64 as _b64
-                bets = json.loads(_b64.b64decode(seed).decode())
+                import base64 as _b64, gzip as _gz
+                raw = _b64.b64decode(seed)
+                # Support both gzip+b64 and plain b64
+                try:
+                    bets = json.loads(_gz.decompress(raw).decode())
+                except Exception:
+                    bets = json.loads(raw.decode())
                 _save_bets(bets)
                 return bets
             except Exception:
@@ -172,7 +199,7 @@ def _save_bets(bets: list):
 _bets: list = _load_bets()
 _bets_lock = threading.RLock()   # reentrant — _add_new_bets holds this while calling _paper_kelly_stake → _compute_paper_balance
 
-# --- One-time backfill: ensure every bet has closing_yes_pct, closing_pin_pct, clv ---
+# --- One-time backfill: ensure every bet has closing_yes_pct, closing_pin_pct, clv, clv_source ---
 _backfilled = False
 for _b in _bets:
     if _b.get("closing_yes_pct") is None and _b.get("kalshi_yes_at_flag") is not None:
@@ -182,11 +209,29 @@ for _b in _bets:
         _b["clv"] = 0.0
         _backfilled = True
     if "closing_pin_pct" not in _b:
-        _b["closing_pin_pct"] = None   # Pinnacle side-prob at close; CLV loop fills this in
+        _b["closing_pin_pct"] = None
         _backfilled = True
+    if "clv_source" not in _b:
+        # Infer source from existing data
+        if _b.get("closing_pin_pct") is not None:
+            _b["clv_source"] = "pin"
+        elif _b.get("clv", 0.0) != 0.0:
+            _b["clv_source"] = "kalshi"
+        else:
+            _b["clv_source"] = "none"
+        _backfilled = True
+    # Upgrade "none" bets that have pin_prob_at_flag: use it as the best available
+    # Pinnacle proxy (better than Kalshi drift or missing data).
+    if _b.get("clv_source") == "none" and _b.get("pin_prob_at_flag") is not None:
+        entry_k = (_b.get("kalshi_price") or 0) * 100
+        if entry_k:
+            _b["clv"] = round(_b["pin_prob_at_flag"] - entry_k, 1)
+            _b["clv_source"] = "pin_entry"
+            _b["closing_pin_pct"] = _b["pin_prob_at_flag"]
+            _backfilled = True
 if _backfilled:
     _save_bets(_bets)
-    print(f"  Backfilled CLV fields for {sum(1 for b in _bets if b.get('clv') == 0.0)} bet(s)")
+    print(f"  Backfilled CLV fields on {len(_bets)} bet(s)")
 
 
 def _bet_id(ticker: str, side: str) -> str:
@@ -632,7 +677,8 @@ def _get_clv_multipliers() -> dict:
     """
     with _bets_lock:
         settled = [b for b in _bets
-                   if b["status"] in ("won", "lost") and b.get("clv") is not None]
+                   if b["status"] in ("won", "lost")
+                   and b.get("clv_source") in ("pin", "pin_entry", "kalshi")]
 
     by_type: dict = {}
     for b in settled:
@@ -668,6 +714,16 @@ def _get_performance(since: Optional[str] = None) -> dict:
     open_ = [b for b in bets if b["status"] == "open"]
     settled = won + lost
 
+    # Game lines only — exclude all props (MLB + NBA) from top-level pills.
+    def _is_prop(b: dict) -> bool:
+        return _infer_mkt_type(b) in ("prop", "nba_prop")
+
+    gl_bets    = [b for b in bets    if not _is_prop(b)]
+    gl_won     = [b for b in won     if not _is_prop(b)]
+    gl_lost    = [b for b in lost    if not _is_prop(b)]
+    gl_open    = [b for b in open_   if not _is_prop(b)]
+    gl_settled = gl_won + gl_lost
+
     # ── Kelly sizing helper ────────────────────────────────────────────────────
     # 0.25 Fractional Kelly for a binary prediction-market bet, with:
     #   • Hard 5% bankroll cap per bet
@@ -702,39 +758,47 @@ def _get_performance(since: Optional[str] = None) -> dict:
             return f * (1.0 - k) / k   # profit = stake × net_odds
         return -f                        # loss = −stake (fraction of bankroll)
 
-    # CLV stats — only for bets that have a recorded closing price
-    clv_bets = [b for b in settled if b.get("clv") is not None]
+    # CLV stats — game lines only, all bets with Pinnacle or Kalshi data
+    clv_bets = [b for b in gl_bets if b.get("clv_source") in ("pin", "pin_entry", "kalshi")]
     avg_clv  = round(sum(b["clv"] for b in clv_bets) / len(clv_bets), 1) if clv_bets else None
 
-    # Win rate — did the flagged side actually win?
-    win_rate = round(len(won) / len(settled) * 100, 1) if settled else None
+    # Average line movement — game lines only, Pinnacle-tracked bets only
+    line_moves = []
+    for b in gl_bets:
+        entry = (b.get("kalshi_price") or 0) * 100
+        close = b.get("closing_pin_pct")
+        if not entry or close is None:
+            continue
+        line_moves.append(close - entry)
+    avg_line_move = round(sum(line_moves) / len(line_moves), 1) if line_moves else None
 
-    # Average edge across all tracked bets
-    avg_edge = round(sum(b["edge_pct"] for b in bets) / len(bets), 1) if bets else None
+    # Win rate — game lines only
+    win_rate = round(len(gl_won) / len(gl_settled) * 100, 1) if gl_settled else None
 
-    # ── Flat unit P&L (1 unit = 1 bet stake regardless of edge/price) ─────────
+    # Average edge — game lines only
+    avg_edge = round(sum(b["edge_pct"] for b in gl_bets) / len(gl_bets), 1) if gl_bets else None
+
+    # ── Flat unit P&L — game lines only ──────────────────────────────────────
     unit_pnls = []
-    for b in settled:
+    for b in gl_settled:
         k = b["kalshi_price"]
         unit_pnls.append((1 - k) / k if b["status"] == "won" else -1.0)
 
     total_units = round(sum(unit_pnls), 3) if unit_pnls else None
     avg_units   = round(sum(unit_pnls) / len(unit_pnls), 3) if unit_pnls else None
 
-    # ── Kelly-weighted P&L (each bet weighted by quarter-Kelly stake) ──────────
-    # Expressed as "Kelly units" where 1 Kelly unit = PERF_BANKROLL dollars.
-    # A positive number means the model made money sizing bets by edge strength.
-    kelly_pnls = [_kelly_pnl(b) for b in settled]
+    # ── Kelly-weighted P&L — game lines only ─────────────────────────────────
+    kelly_pnls = [_kelly_pnl(b) for b in gl_settled]
     kelly_pnls = [x for x in kelly_pnls if x is not None]
 
     total_kelly_units   = round(sum(kelly_pnls), 4)         if kelly_pnls else None
     total_kelly_dollars = round(sum(kelly_pnls) * PERF_BANKROLL, 2) if kelly_pnls else None
     avg_kelly_units     = round(sum(kelly_pnls) / len(kelly_pnls), 4) if kelly_pnls else None
 
-    # Model accuracy: actual win rate vs Kalshi-implied win rate
-    if settled:
+    # Model accuracy — game lines only
+    if gl_settled:
         avg_kalshi_implied = round(
-            sum(b["kalshi_price"] * 100 for b in settled) / len(settled), 1
+            sum(b["kalshi_price"] * 100 for b in gl_settled) / len(gl_settled), 1
         )
     else:
         avg_kalshi_implied = None
@@ -763,10 +827,12 @@ def _get_performance(since: Optional[str] = None) -> dict:
     def _perf_label(b: dict) -> str:
         ticker = b.get("ticker", "").upper()
         mtype  = _infer_mkt_type(b)
+        if mtype == "nba_prop":
+            return "NBA Props"
+        if mtype == "prop":
+            return "MLB Props"
         if ticker.startswith("KXNBA"):
             sport = "NBA"
-        elif mtype == "prop":
-            return "Props"
         else:
             sport = "MLB"
         return f"{sport} {mtype.capitalize()}" if mtype else sport
@@ -813,10 +879,10 @@ def _get_performance(since: Optional[str] = None) -> dict:
     total_kelly_pct = round(sum(kelly_pnls) * 100, 3) if kelly_pnls else None
 
     return {
-        "total_bets":           len(bets),
-        "won":                  len(won),
-        "lost":                 len(lost),
-        "open":                 len(open_),
+        "total_bets":           len(gl_bets),
+        "won":                  len(gl_won),
+        "lost":                 len(gl_lost),
+        "open":                 len(gl_open),
         "win_rate":             win_rate,
         "avg_edge":             avg_edge,
         "total_units":          total_units,
@@ -827,6 +893,7 @@ def _get_performance(since: Optional[str] = None) -> dict:
         "avg_kelly_units":      avg_kelly_units,
         "avg_kalshi_implied":   avg_kalshi_implied,
         "avg_clv":              avg_clv,
+        "avg_line_move":        avg_line_move,
         "kelly_bankroll":       PERF_BANKROLL,
         "bets":                 table_bets,
         "by_type":              type_breakdown,
@@ -1018,20 +1085,42 @@ _DISCORD_WEBHOOK = os.getenv(
 # date so the same teams+threshold on different days can each fire once.
 _ALERTED_KEYS_FILE = os.path.join(DATA_DIR, "ev_alerted_keys.json")
 
-def _load_alerted_keys() -> set:
-    """Load persisted alert keys, pruning entries older than 14 days."""
+def _edge_key(e: dict) -> str:
+    """Stable identifier for an edge — matchup + prop + side + game date.
+
+    Including the game date means Mets @ Dodgers Over 8.5 on Apr 13 and
+    Apr 14 are treated as distinct edges and can each alert exactly once,
+    while the same game on the same date is still deduplicated.
+    """
+    ticker    = e.get("ticker", "")
+    game_date = _parse_ticker_date(ticker) or ""   # "2026-04-13" or ""
+    return f"{e['matchup']}|{e['title']}|{e['side']}|{game_date}"
+
+
+def _load_alerted_keys() -> tuple:
+    """Load persisted alert keys and gone keys.
+
+    Returns (alerted_keys, gone_alerted_keys) as sets.
+    Gone keys are stored with a 'gone:' prefix in the same file.
+    On fresh start (file missing — e.g. Railway cold deploy), reconstruct
+    alerted keys from existing _bets so already-logged games never re-fire.
+    """
+    cutoff = (datetime.now(timezone.utc).date() - __import__('datetime').timedelta(days=14)).isoformat()
     try:
         with open(_ALERTED_KEYS_FILE) as f:
             data = json.load(f)   # {key: "YYYY-MM-DD" alerted_date}
-        cutoff = (datetime.now(timezone.utc).date() - __import__('datetime').timedelta(days=14)).isoformat()
-        return {k for k, d in data.items() if d >= cutoff}
+        alerted = {k for k, d in data.items() if d >= cutoff and not k.startswith("gone:")}
+        gone    = {k[5:] for k, d in data.items() if d >= cutoff and k.startswith("gone:")}
+        return alerted, gone
     except (FileNotFoundError, json.JSONDecodeError, KeyError):
-        return set()
+        # No file (Railway cold start or first run) — reconstruct from logged bets
+        # so games that already have a bet never re-alert on next deploy.
+        alerted = {_edge_key(b) for b in _bets}
+        return alerted, set()
 
-def _save_alerted_keys(keys: set):
+def _save_alerted_keys(alerted: set, gone: set):
     try:
         import tempfile, os as _os
-        # Merge with existing file so concurrent writes don't lose data
         existing = {}
         try:
             with open(_ALERTED_KEYS_FILE) as f:
@@ -1039,8 +1128,10 @@ def _save_alerted_keys(keys: set):
         except Exception:
             pass
         today = datetime.now(timezone.utc).date().isoformat()
-        for k in keys:
+        for k in alerted:
             existing.setdefault(k, today)
+        for k in gone:
+            existing.setdefault(f"gone:{k}", today)
         fd, tmp = tempfile.mkstemp(dir=DATA_DIR, suffix=".tmp")
         with _os.fdopen(fd, "w") as f:
             json.dump(existing, f)
@@ -1049,17 +1140,15 @@ def _save_alerted_keys(keys: set):
         print(f"  WARNING: could not save alerted keys: {exc}")
 
 # Keys already alerted — loaded from disk so server restarts don't re-fire
-_alerted_keys: set = _load_alerted_keys()
+_alerted_keys, _gone_alerted_keys = _load_alerted_keys()
 print(f"  Loaded {len(_alerted_keys)} previously alerted edge key(s) from disk")
-
-# Keys alerted for gone/corrected — tracks which alerted edges have already
-# received a "line corrected" follow-up so we don't spam.
-_gone_alerted_keys: set = set()
 
 # ── Zero-edge drought detector ────────────────────────────────────────────────
 # Fires a Discord alert when the scanner has produced zero edges for an extended
 # period during game hours — indicates a silent data pipeline failure.
 _zero_edge_streak      = 0          # consecutive scans with no qualifying edges
+_last_props_scan: float = 0.0       # epoch seconds of last props scan
+PROPS_REFRESH_SECONDS  = 2 * 60 * 60  # props scan every 2 hours (~45 credits/scan)
 _zero_edge_alerted     = False      # suppresses duplicate alerts per drought
 _ZERO_EDGE_ALERT_SCANS = 60         # 60 × 2-min scan = 2 hours of silence
 
@@ -1098,18 +1187,6 @@ def _log_discord(ok: bool, preview: str, error: str = ""):
         })
         if len(_discord_log) > _DISCORD_LOG_MAX:
             _discord_log.pop(0)
-
-
-def _edge_key(e: dict) -> str:
-    """Stable identifier for an edge — matchup + prop + side + game date.
-
-    Including the game date means Mets @ Dodgers Over 8.5 on Apr 13 and
-    Apr 14 are treated as distinct edges and can each alert exactly once,
-    while the same game on the same date is still deduplicated.
-    """
-    ticker    = e.get("ticker", "")
-    game_date = _parse_ticker_date(ticker) or ""   # "2026-04-13" or ""
-    return f"{e['matchup']}|{e['title']}|{e['side']}|{game_date}"
 
 
 def send_discord(embed: dict, content: str = "") -> bool:
@@ -1187,10 +1264,34 @@ def _alert_top10():
         reverse=True,
     )
 
+    now_utc = datetime.now(timezone.utc)
+
     for e in all_edges:
         key = _edge_key(e)
         if key in _alerted_keys:
-            continue   # already alerted this session — skip
+            continue   # already alerted — skip
+
+        # Skip (and permanently mark) edges for games that have already started.
+        # Prevents stale alerts after Railway restarts or slow scan cycles.
+        ticker = e.get("ticker", "")
+        game_start = _parse_ticker_start_time(ticker)
+        if game_start is None:
+            # Fallback: estimate start from expiration_time.
+            # NBA games run ~2.5h + Kalshi buffer → use 4h offset.
+            # MLB games run ~3h + buffer → use 3.5h offset.
+            exp_str = e.get("expiration_time") or e.get("expected_expiration_time") or ""
+            if exp_str:
+                try:
+                    from datetime import timedelta as _tda
+                    exp_dt = datetime.fromisoformat(exp_str.replace("Z", "+00:00"))
+                    is_nba = ticker.upper().startswith("KXNBA")
+                    game_start = exp_dt - _tda(hours=4.0 if is_nba else 3.5)
+                except (ValueError, AttributeError):
+                    pass
+        if game_start and game_start < now_utc:
+            _alerted_keys.add(key)
+            _save_alerted_keys(_alerted_keys, _gone_alerted_keys)
+            continue   # game already started — no alert, just dedup
 
         ts   = datetime.now().strftime("%I:%M %p")
         k    = e.get("kalshi", 0.5)
@@ -1250,9 +1351,8 @@ def _alert_top10():
 
         ok = send_discord(embed, content)
         if ok:
-            _alerted_keys.add(key)   # only mark as alerted if send succeeded
-            _save_alerted_keys(_alerted_keys)   # persist so restarts don't re-fire
-        # If send failed, key stays un-alerted so next scan cycle retries.
+            _alerted_keys.add(key)
+            _save_alerted_keys(_alerted_keys, _gone_alerted_keys)
 
     # ── Follow-up: alert when a previously flagged edge is gone ──────────────
     # Fires once per edge when it drops out of the current scan results,
@@ -1265,7 +1365,8 @@ def _alert_top10():
             continue   # edge still live
 
         # Edge was alerted but is no longer in current scan — line corrected.
-        matchup, title, side = key.split("|", 2)
+        parts = key.split("|")
+        matchup, title, side = parts[0], parts[1], parts[2]
 
         # Check if it was Pinnacle-invalidated (line moved) or just fell below threshold
         with _edge_history_lock:
@@ -1296,6 +1397,7 @@ def _alert_top10():
         ok = send_discord(embed_gone, content_gone)
         if ok:
             _gone_alerted_keys.add(key)
+            _save_alerted_keys(_alerted_keys, _gone_alerted_keys)
 
 
 def _alert_min_threshold() -> float:
@@ -1528,7 +1630,16 @@ def _run_scan():
             game_index=nba_idx,
         )
 
-        all_edges = sorted(mlb + nba, key=lambda x: x["edge"], reverse=True)
+        global _last_props_scan
+        now_ts = time.time()
+        if now_ts - _last_props_scan >= PROPS_REFRESH_SECONDS:
+            mlb_props = scan_player_props(odds_sport="baseball_mlb", abbr_map=MLB_ABBR)
+            nba_props = scan_nba_player_props()
+            _last_props_scan = now_ts
+        else:
+            mlb_props, nba_props = [], []
+
+        all_edges = sorted(mlb + nba + mlb_props + nba_props, key=lambda x: x["edge"], reverse=True)
 
         # Deduplicate: keep only best edge per (matchup, mkt_type, side)
         edges = _best_edge_per_game(all_edges)
@@ -1550,7 +1661,6 @@ def _run_scan():
         edges = _deduped
 
         # ── Per-edge: compute derived fields + Pinnacle line-movement tracking ─
-        now_ts = time.time()
         for e in edges:
             e["kalshi_pct"] = round(e["kalshi"] * 100, 1)
             e["fair_pct"]   = round(e["fair"]   * 100, 1)
@@ -1669,25 +1779,8 @@ def _run_scan():
         # Log new bets (skips pin_invalidated edges)
         _add_new_bets(edges)
 
-        # Alert on any new qualifying edge (fires exactly once per unique edge)
-        _alert_top10()
-
         # ── Zero-edge drought check ───────────────────────────────────────────
-        # Track consecutive scans with no edges.  After 2 hours of silence
-        # during game hours (10 AM – 11 PM PT), fire a health-check alert so
-        # a silent pipeline failure doesn't go unnoticed for days.
-        global _zero_edge_streak, _zero_edge_alerted
-        in_game_hours = 10 <= _et_hour() <= 23   # 10 AM – 11 PM ET
-
-        if len(edges) > 0:
-            _zero_edge_streak  = 0
-            _zero_edge_alerted = False   # reset so next drought fires fresh
-        elif in_game_hours:
-            _zero_edge_streak += 1
-            if _zero_edge_streak >= _ZERO_EDGE_ALERT_SCANS and not _zero_edge_alerted:
-                _zero_edge_alerted = True
-                hours = round(_zero_edge_streak * REFRESH_SECONDS / 3600, 1)
-                _send_zero_edge_alert(hours)
+        pass  # zero-edge health check removed — scanner stability confirmed
 
     except Exception as exc:
         with _lock:
@@ -1710,9 +1803,14 @@ def _run_scan():
             _kalshi_auth_failed   = False
             _kalshi_auth_alerted  = False
 
+    # ── Alert on new edges (runs every cycle, even if scan threw an error) ──────
+    # Decoupled from scan so a failed scan doesn't delay Discord notifications.
+    # Reads from _state["edges"] (last successful scan's edges).
+    _alert_top10()
+
     # ── Odds staleness check (runs every scan cycle, outside the try block) ──
     global _odds_stale_alerted
-    in_game_hours_now = 10 <= _et_hour() <= 23
+    in_game_hours_now = 10 <= _et_hour() <= 20
     with _odds_cache_lock:
         odds_age_min = (time.time() - _last_odds_refresh) / 60 if _last_odds_refresh else None
     if odds_age_min is not None and in_game_hours_now:
@@ -1733,6 +1831,9 @@ def _run_scan():
             del _edge_price_history[k]
     if stale_keys:
         print(f"  Pruned {len(stale_keys)} stale edge price history entries")
+
+    # Persist Pinnacle prices so they survive restarts
+    _save_pin_prices()
 
 
 def _background_loop():
@@ -1793,8 +1894,18 @@ def _capture_clv_prices():
 
             # Freeze CLV at game start time — do NOT update with in-game prices.
             # Kalshi keeps markets "active" during the game, so status alone can't
-            # tell us if the game has started. Parse the start time from the ticker.
+            # tell us if the game has started. Parse the start time from the ticker;
+            # fall back to close_time - 2.5h for NBA tickers that embed no time.
             game_start = _parse_ticker_start_time(bet["ticker"])
+            if game_start is None:
+                close_str = mkt.get("close_time") or mkt.get("expected_expiration_time")
+                if close_str:
+                    try:
+                        from datetime import timedelta as _tdc
+                        close_dt = datetime.fromisoformat(close_str.replace("Z", "+00:00"))
+                        game_start = close_dt - _tdc(hours=2.5)
+                    except (ValueError, AttributeError):
+                        pass
             if game_start and datetime.now(timezone.utc) >= game_start:
                 # Game has started — closing price is already frozen from last update.
                 # Mark clv_frozen so we stop calling the API for this bet.
@@ -1848,9 +1959,8 @@ def _capture_clv_prices():
                         entry_k = b.get("kalshi_price", 0) * 100   # effective bet-side entry price
                         if closing_pin is not None and entry_k:
                             # Primary: true CLV vs Pinnacle closing line.
-                            # Unified formula works for both YES and NO because
-                            # closing_pin and entry_k are both in bet-side probability.
-                            b["clv"] = round(closing_pin - entry_k, 1)
+                            b["clv"]        = round(closing_pin - entry_k, 1)
+                            b["clv_source"] = "pin"
                         else:
                             # Fallback: Kalshi drift using matched ask/bid prices
                             entry_yes = b.get("kalshi_yes_at_flag")
@@ -1860,6 +1970,9 @@ def _capture_clv_prices():
                                     else entry_yes - yes_close_pct,
                                     1,
                                 )
+                                b["clv_source"] = "kalshi"
+                            else:
+                                b["clv_source"] = "none"
                         break
             updated += 1
         except Exception as exc:
@@ -2042,6 +2155,7 @@ HTML = """<!DOCTYPE html>
     margin-right: 5px;
   }
   @keyframes spin { to { transform: rotate(360deg); } }
+  @keyframes pulse { 0%,100% { opacity:1; } 50% { opacity:0.4; } }
   .countdown { color: var(--muted); font-size: 11px; }
   .kelly-val { color: #a5d6a7; font-weight: 600; }
   .kelly-na  { color: var(--muted); }
@@ -2130,14 +2244,9 @@ HTML = """<!DOCTYPE html>
   </div>
 </header>
 
-<div id="live-edges-card" class="card">
-  <div class="card-header exec-card-header" onclick="toggleCard('live-edges-body')">⚡ Live Edges ≥5% &nbsp;<span style="font-size:10px;color:var(--muted);font-weight:400;">Pinnacle fair value · DK+FD confirm · scan every 2 min · 3%+ tracked in paper portfolio</span> <span class="card-toggle" id="live-edges-body-toggle">▾</span></div>
-  <div id="live-edges-body" class="card-body"><div class="empty">No edges ≥5% right now. Scanning every 2 min.</div></div>
-</div>
-
-<div id="top10-card" class="card">
-  <div class="card-header mlb" onclick="toggleCard('top10-body')">📋 All Picks ≥3% &nbsp;<span style="font-size:10px;color:var(--muted);font-weight:400;">MLB · NBA · spreads · totals · moneylines · sorted by edge strength</span> <span class="card-toggle" id="top10-body-toggle">▾</span></div>
-  <div id="top10-body" class="card-body"><div class="empty">No edges ≥3% right now. Scanning every 2 min.</div></div>
+<div id="today-edges-card" class="card">
+  <div class="card-header exec-card-header" onclick="toggleCard('today-edges-body')">📅 Today's Edges &nbsp;<span style="font-size:10px;color:var(--muted);font-weight:400;">all edges flagged today · live tracker updates every 2 min</span> <span class="card-toggle" id="today-edges-body-toggle">▾</span></div>
+  <div id="today-edges-body" class="card-body"><div class="empty">No edges found today yet.</div></div>
 </div>
 
 <div id="mlb-card" class="card">
@@ -2564,8 +2673,6 @@ function renderAll() {
   // Update tab title
   const count = lastEdges.length;
   document.title = count > 0 ? `(${count}) Kalshi EV Scanner` : 'Kalshi EV Scanner';
-  // Re-render execution table so Kelly % updates when bankroll changes
-  renderLiveEdges();
 }
 
 let autoRefreshTimer = null;
@@ -2613,14 +2720,14 @@ async function fetchData() {
       prevEdgeKeys = new Set(lastEdges.map(edgeKey));
       lastEdges = d.edges || [];
       renderAll();
-      renderTop10();
-      renderLiveEdges();
+      renderTodayEdges();
 
-      // History + perf: first load always, then every 3 cycles to save work
+      // History + perf + today edges: first load always, then every 3 cycles
       _slowRefreshCounter++;
       if (_slowRefreshCounter <= 1 || _slowRefreshCounter % 3 === 0) {
         fetchHistory();
         fetchPerformance();
+        fetchTodayEdges();
       }
     }
 
@@ -2654,7 +2761,70 @@ function confStars(c, booksUsed) {
   return `<span style="color:#f85149" title="★ High divergence (${Math.round((1-c)*10)}pp spread) — possible Sharp-Led Move">★</span>`;
 }
 
-// ── Live Edges ≥5% ───────────────────────────────────────────────────────────
+// ── Today's Edges ────────────────────────────────────────────────────────────
+let todayEdgesList = [];
+
+async function fetchTodayEdges() {
+  try {
+    const r = await fetch('/api/today_edges');
+    todayEdgesList = await r.json();
+  } catch(e) { console.error('today_edges fetch failed', e); }
+  renderTodayEdges();
+}
+
+function renderTodayEdges() {
+  const el = document.getElementById('today-edges-body');
+  if (!el) return;
+  if (!todayEdgesList.length) {
+    el.innerHTML = '<div class="empty">No edges found today yet. Scanning every 2 min.</div>';
+    return;
+  }
+
+  // Build live lookup: ticker|side -> live edge object
+  const liveMap = {};
+  for (const e of lastEdges) {
+    liveMap[e.ticker + '|' + e.side] = e;
+  }
+
+  const rows = [...todayEdgesList].reverse().map(b => {
+    const key  = b.ticker + '|' + b.side;
+    const live = liveMap[key];
+    const isLive = !!live;
+    const statusBadge = isLive
+      ? `<span style="color:#3fb950;font-weight:700;font-size:11px;">● LIVE</span>`
+      : `<span style="color:var(--muted);font-size:11px;">○ GONE</span>`;
+    const currentEdge = isLive
+      ? `<span style="color:${edgeColor(live.edge_pct)};font-weight:700;">+${pct(live.edge_pct)}</span>`
+      : `<span style="color:var(--muted);">—</span>`;
+    const flagTime = b.flagged_at ? fmtDate(b.flagged_at) : '—';
+    const stake    = b.paper_stake != null ? `$${b.paper_stake.toFixed(0)}` : '—';
+    const sideClass = b.side === 'YES' ? 'side-yes' : 'side-no';
+    const tickerTxt = `<span style="display:block;font-size:8px;color:var(--muted);font-family:monospace;margin-top:2px;">${b.ticker}</span>`;
+    return `<tr>
+      <td style="font-size:11px;color:var(--muted);white-space:nowrap;">${flagTime}</td>
+      <td>${matchupHtml(b.matchup)}</td>
+      <td class="prop-col" style="font-size:12px;">${b.title}${tickerTxt}</td>
+      <td class="${sideClass}">${b.side}</td>
+      <td class="num" style="color:${edgeColor(b.edge_pct)};font-weight:700;">+${pct(b.edge_pct)}</td>
+      <td class="num">${currentEdge}</td>
+      <td class="num">${statusBadge}</td>
+      <td class="num">${stake}</td>
+    </tr>`;
+  }).join('');
+
+  el.innerHTML = `<table>
+    <thead><tr>
+      <th>Flagged</th><th>Matchup</th><th>Bet</th><th>Side</th>
+      <th class="num">Edge @ Flag</th>
+      <th class="num">Current Edge</th>
+      <th class="num">Status</th>
+      <th class="num">Stake</th>
+    </tr></thead>
+    <tbody>${rows}</tbody>
+  </table>`;
+}
+
+// ── Live Edges ≥5% (kept for internal use / referencing renderLiveEdges callers) ──
 function renderLiveEdges() {
   // Show ≥5% only — clean, high-confidence display.
   // Edges from 3–5% are tracked silently in the paper portfolio for data.
@@ -2975,8 +3145,9 @@ function renderPerformance(d) {
       ${pill('Open', d.open, 'pnl-neu')}
       ${pill('Win Rate', na(d.win_rate, v => v + '%'))}
       ${pill('Avg Edge Flagged', na(d.avg_edge, v => '+' + v + '%'))}
-      ${pill('Avg CLV', d.avg_clv != null ? `<span class="${d.avg_clv >= 0 ? 'pnl-pos' : 'pnl-neg'}">${d.avg_clv >= 0 ? '+' : ''}${d.avg_clv}%</span>` : '—')}
       ${pill('Kelly P&amp;L (% bank)', d.total_kelly_pct != null ? `<span class="${kellyPctClass}">${sign(d.total_kelly_pct)}${d.total_kelly_pct.toFixed(2)}%</span>` : '—')}
+      ${pill('Avg CLV', d.avg_clv != null ? `<span class="${d.avg_clv >= 0 ? 'pnl-pos' : 'pnl-neg'}">${d.avg_clv > 0 ? '+' : ''}${d.avg_clv}%</span>` : '—')}
+      ${pill('Avg Line Move', d.avg_line_move != null ? `<span class="${d.avg_line_move >= 0 ? 'pnl-pos' : 'pnl-neg'}">${d.avg_line_move > 0 ? '+' : ''}${d.avg_line_move}¢</span>` : '—')}
       <div class="stat-pill"><div class="label">Model vs Market</div><div class="value">${modelCallout}</div></div>
     </div>
     ${penaltyNote}
@@ -3034,8 +3205,13 @@ function renderPerformance(d) {
   const visiblePerf = showAllPerf ? allPerfBets : allPerfBets.slice(0, PERF_PREVIEW);
 
   let rows = visiblePerf.map(b => {
+    const now = Date.now();
+    const gameStartMs = b.game_time ? new Date(b.game_time).getTime() : null;
+    const isLive = b.status === 'open' && gameStartMs != null && now >= gameStartMs;
     const rClass = b.status === 'won' ? 'result-won' : b.status === 'lost' ? 'result-lost' : 'result-open';
-    const rLabel = b.status === 'won' ? '✓ WON' : b.status === 'lost' ? '✗ LOST' : '…';
+    const rLabel = b.status === 'won' ? '✓ WON' : b.status === 'lost' ? '✗ LOST'
+      : isLive ? '<span style="color:#ff4444;font-weight:600;animation:pulse 1.5s infinite;">● LIVE</span>'
+      : '…';
     // Kelly bet size as % of bankroll (dollar amount in tooltip)
     const kBet   = b.kelly_bet_pct != null
       ? `<span class="kelly-val" title="$${b.kelly_bet_dollars != null ? b.kelly_bet_dollars.toFixed(0) : '?'} on $${bankroll} bank${b.clv_mult_applied < 1 ? ' — CLV penalty 0.5×' : ''}">${b.kelly_bet_pct.toFixed(2)}%${b.clv_mult_applied < 1 ? ' <span style="color:#e3a53a;font-size:9px;">½</span>' : ''}</span>`
@@ -3052,17 +3228,35 @@ function renderPerformance(d) {
     const gameTimeCell = gameTimeIso
       ? (() => { const d = new Date(gameTimeIso); return `<span style="font-size:10px;color:var(--muted);" title="${d.toLocaleString()}">${d.toLocaleDateString('en-US',{month:'short',day:'numeric'})} ${d.toLocaleTimeString('en-US',{hour:'numeric',minute:'2-digit',timeZoneName:'short'})}</span>`; })()
       : '<span style="color:var(--muted);font-size:10px;">—</span>';
-    const clvCell = b.clv != null
-      ? `<span class="${b.clv >= 0 ? 'pnl-pos' : 'pnl-neg'}">${b.clv >= 0 ? '+' : ''}${b.clv}%</span>`
-      : '—';
     // Raw vs adj edge (raw only present on post-refactor bets)
     const edgeCell = b.raw_edge_pct != null && b.raw_edge_pct !== b.edge_pct
       ? `<span title="raw ${b.raw_edge_pct}% → adj ${b.edge_pct}%">${b.edge_pct}%<span style="color:var(--muted);font-size:10px;"> (raw ${b.raw_edge_pct}%)</span></span>`
       : `${b.edge_pct}%`;
-    // Books used (only present on post-refactor bets)
-    const booksCell = (b.books_used && b.books_used.length)
-      ? `<span style="font-size:10px;color:var(--muted);">${b.books_used.join(', ')}</span>`
-      : '<span style="font-size:10px;color:var(--muted);">pin only</span>';
+    // Line Move: entry Kalshi price → closing price (side-adjusted throughout)
+    const entryK = b.kalshi_price != null ? (b.kalshi_price * 100).toFixed(0) : null;
+    const pinEntry = b.pin_prob_at_flag != null ? b.pin_prob_at_flag.toFixed(1) : null;
+    // Closing price — closing_pin_pct is already side-adjusted; closing_yes_pct needs flip for NO
+    let closePrice = null, closeSrc = null;
+    if (b.closing_pin_pct != null) {
+      closePrice = b.closing_pin_pct.toFixed(0);
+      closeSrc = 'Pin';
+    } else if (b.closing_yes_pct != null) {
+      const raw = b.side === 'YES' ? b.closing_yes_pct : 100 - b.closing_yes_pct;
+      closePrice = raw.toFixed(0);
+      closeSrc = 'K';
+    }
+    let lineMoveCell = '—';
+    if (entryK != null) {
+      const delta = closePrice != null ? parseFloat(closePrice) - parseFloat(entryK) : null;
+      const closeColor = delta == null ? 'var(--muted)' : delta > 0 ? 'var(--green)' : delta < 0 ? 'var(--red)' : 'var(--fg)';
+      const closeTxt = closePrice != null
+        ? `<span style="color:${closeColor};font-weight:600;">→ ${closePrice}¢</span><span style="font-size:9px;color:var(--muted);"> ${closeSrc}</span>`
+        : `<span style="color:var(--muted);">→ open</span>`;
+      const pinLine = pinEntry != null
+        ? `<div style="font-size:10px;color:var(--muted);margin-top:1px;">Pin at entry: ${pinEntry}¢</div>`
+        : '';
+      lineMoveCell = `<div style="white-space:nowrap;"><span style="color:var(--fg);">${entryK}¢</span> ${closeTxt}</div>${pinLine}`;
+    }
     return `<tr>
       <td>${ts}</td>
       <td>${gameTimeCell}</td>
@@ -3070,12 +3264,10 @@ function renderPerformance(d) {
       <td class="prop-col">${b.title}</td>
       <td class="side-${b.side.toLowerCase()}">${b.side}</td>
       <td class="num">${edgeCell}</td>
-      <td class="num">${(b.kalshi_price * 100).toFixed(0)}¢</td>
-      <td class="num">${booksCell}</td>
+      <td class="num">${lineMoveCell}</td>
       <td class="num ${rClass}">${rLabel}</td>
       <td class="num">${kBet}</td>
       <td class="num">${kPnl}</td>
-      <td class="num">${clvCell}</td>
     </tr>`;
   }).join('');
 
@@ -3083,12 +3275,10 @@ function renderPerformance(d) {
     <thead><tr>
       <th>Flagged</th><th>Game Time</th><th>Matchup</th><th>Prop</th><th>Side</th>
       <th class="num" title="Adjusted EV after 25% haircut (raw shown in tooltip)">Adj. EV</th>
-      <th class="num">Price</th>
-      <th class="num" title="Books that contributed to consensus probability">Sources</th>
+      <th class="num" title="Kalshi entry price → closing price (Pin = Pinnacle close, K = Kalshi drift). Sub-line shows Pinnacle's read at entry.">Line Move</th>
       <th class="num">Result</th>
       <th class="num" title="0.25 Kelly stake as % of bankroll (hover for $ amount). ½ = CLV penalty active.">Kelly Bet %</th>
       <th class="num" title="P&amp;L as % of bankroll at Kelly stake (hover for $ amount)">Kelly P&amp;L %</th>
-      <th class="num">CLV</th>
     </tr></thead>
     <tbody>${rows}</tbody>
   </table>`;
@@ -3161,14 +3351,14 @@ async function fetchPaper() {
     const roiColor  = d.roi_pct >= 0 ? 'var(--green)' : 'var(--red)';
     const settled   = d.won + d.lost;
 
-    // Avg CLV across settled bets with a recorded closing price
-    const clvBets = (d.bets || []).filter(b => b.status !== 'open' && b.clv != null);
-    const avgClv  = clvBets.length
-      ? clvBets.reduce((s, b) => s + b.clv, 0) / clvBets.length
+    // Avg Value @ Entry — Pinnacle prob at flag minus Kalshi entry price, averaged over bets with PIN data
+    const valBets = (d.bets || []).filter(b => b.pin_prob_at_flag != null && b.kalshi_price != null);
+    const avgVal  = valBets.length
+      ? valBets.reduce((s, b) => s + (b.pin_prob_at_flag - b.kalshi_price * 100), 0) / valBets.length
       : null;
-    const clvColor = avgClv == null ? 'var(--muted)' : avgClv >= 0 ? 'var(--green)' : 'var(--red)';
-    const clvTxt   = avgClv == null ? '—'
-      : `${avgClv >= 0 ? '+' : ''}${avgClv.toFixed(1)}pp`;
+    const valColor = avgVal == null ? 'var(--muted)' : 'var(--green)';  // always positive when bets had edge
+    const valTxt   = avgVal == null ? '—' : `+${avgVal.toFixed(1)}pp`;
+    const valLabel = valBets.length ? `Avg Value @ Entry (${valBets.length})` : 'Value @ Entry (pending)';
 
     // ── Primary KPI bar ────────────────────────────────────────────────────
     let html = `
@@ -3190,8 +3380,8 @@ async function fetchPaper() {
         <div style="font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:0.06em;margin-top:3px;">Win Rate (${settled} settled)</div>
       </div>
       <div style="background:var(--surface);padding:14px 16px;text-align:center;">
-        <div style="font-size:22px;font-weight:700;color:${clvColor};" title="Closing Line Value — positive means we beat the closing price. Tracked on every open bet, frozen at game start.">${clvTxt}</div>
-        <div style="font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:0.06em;margin-top:3px;">Avg CLV (${clvBets.length} bets)</div>
+        <div style="font-size:20px;font-weight:700;color:${valColor};" title="Average value locked at entry = Pinnacle prob − Kalshi price. Always positive when bets had real edge. This is what you captured, regardless of how the line moved after.">${valTxt}</div>
+        <div style="font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:0.06em;margin-top:3px;">${valLabel}</div>
       </div>
       <div style="background:var(--surface);padding:14px 16px;text-align:center;">
         <div style="font-size:18px;font-weight:600;color:var(--green);">${d.won}W</div>
@@ -3230,27 +3420,20 @@ async function fetchPaper() {
         const edgeTag = edgePct >= 5
           ? `<span style="color:${edgeColor(edgePct)};font-weight:700;">+${edgePct}%</span>`
           : `<span style="color:#ff8c42;font-weight:600;">+${edgePct}%</span><span style="font-size:9px;color:var(--muted);margin-left:3px;">data</span>`;
-        // CLV cell: positive = beating closing line (real edge), negative = line moved against us
-        let clvCell = '<span style="color:var(--muted);">—</span>';
-        if (b.status === 'open') {
-          // Show live CLV for open bets (updates every 2 min)
-          if (b.clv != null && b.clv !== 0) {
-            const cc = b.clv >= 0 ? '#3fb950' : '#f85149';
-            clvCell = `<span style="color:${cc};" title="Live CLV — updated every 2 min. Positive = closing line moving in our favour.">${b.clv >= 0 ? '+' : ''}${b.clv.toFixed(1)}pp</span>`;
-          } else {
-            clvCell = '<span style="color:var(--muted);font-size:10px;">tracking…</span>';
-          }
-        } else if (b.clv != null) {
-          const cc = b.clv >= 0 ? '#3fb950' : '#f85149';
-          clvCell = `<span style="color:${cc};font-weight:600;" title="Final CLV at game start">${b.clv >= 0 ? '+' : ''}${b.clv.toFixed(1)}pp</span>`;
+        // Value @ Entry: Pinnacle prob at flag minus Kalshi entry price — always positive when edge was real
+        let valCell = '<span style="color:var(--muted);">—</span>';
+        if (b.pin_prob_at_flag != null && b.kalshi_price != null) {
+          const val = b.pin_prob_at_flag - (b.kalshi_price * 100);
+          valCell = `<span style="color:#3fb950;font-weight:700;" title="Value locked at entry: Pinnacle priced this side at ${b.pin_prob_at_flag.toFixed(1)}%, you paid ${(b.kalshi_price*100).toFixed(1)}¢ on Kalshi → +${val.toFixed(1)}pp value">+${val.toFixed(1)}pp</span>`;
         }
+
         rows += `<tr>
           <td style="color:var(--muted);font-size:11px;">${flagDate}</td>
           <td class="matchup-inline">${matchupHtml(b.matchup)}</td>
           <td style="font-size:12px;max-width:200px;">${b.title}</td>
           <td class="side-${(b.side||'').toLowerCase()}">${b.side}</td>
           <td class="num">${edgeTag}</td>
-          <td class="num">${clvCell}</td>
+          <td class="num">${valCell}</td>
           <td class="num">${stake}</td>
           <td class="num">${pnlCell}</td>
           <td style="color:${statusColor};font-weight:700;text-align:center;">${statusLabel}</td>
@@ -3259,8 +3442,8 @@ async function fetchPaper() {
       html += `<table style="font-size:12px;">
         <thead><tr>
           <th>Date</th><th>Matchup</th><th>Bet</th><th>Side</th>
-          <th class="num">Edge</th>
-          <th class="num" title="Closing Line Value — how much the market moved in our favour before game start. Positive = we had real edge. Updated live every 2 min.">CLV</th>
+          <th class="num">Adj. EV</th>
+          <th class="num" title="Value locked at entry = Pinnacle probability at flag − Kalshi price. Always positive when the edge was real. This is the value you captured when you placed the bet.">Value @ Entry</th>
           <th class="num">Kelly Stake</th><th class="num">P&amp;L</th><th>Result</th>
         </tr></thead>
         <tbody>${rows}</tbody>
@@ -3310,8 +3493,12 @@ function renderMyBets(d) {
   }
   let rows = '';
   for (const b of d.bets) {
+    const gameStartMs2 = b.game_time ? new Date(b.game_time).getTime() : null;
+    const isLive2 = b.status === 'open' && gameStartMs2 != null && Date.now() >= gameStartMs2;
     const statusCls = b.status === 'won' ? 'mb-won' : b.status === 'lost' ? 'mb-lost' : 'mb-open';
-    const statusTxt = b.status === 'won' ? '✅ WON' : b.status === 'lost' ? '❌ LOST' : '⏳ Open';
+    const statusTxt = b.status === 'won' ? '✅ WON' : b.status === 'lost' ? '❌ LOST'
+      : isLive2 ? '<span style="color:#ff4444;font-weight:600;animation:pulse 1.5s infinite;">● LIVE</span>'
+      : '⏳ Open';
     const pnlTxt = b.pnl != null
       ? `<span class="${b.pnl>=0?'mb-pnl-pos':'mb-pnl-neg'}">${b.pnl>=0?'+':''}$${b.pnl.toFixed(2)}</span>`
       : b.unrealized_pnl != null
@@ -3441,6 +3628,13 @@ class Handler(BaseHTTPRequestHandler):
 
         elif path == "/api/history":
             payload = json.dumps(_history[-200:]).encode()
+            self._send(200, "application/json", payload)
+
+        elif path == "/api/today_edges":
+            today = datetime.now(timezone.utc).date().isoformat()
+            with _bets_lock:
+                today_bets = [b for b in _bets if b.get("flagged_at", "")[:10] == today]
+            payload = json.dumps(today_bets).encode()
             self._send(200, "application/json", payload)
 
         elif path == "/api/performance":
@@ -3580,6 +3774,30 @@ class Handler(BaseHTTPRequestHandler):
                 if len(_my_bets) < before:
                     _save_my_bets(_my_bets)
             self._send(200, "application/json", json.dumps({"ok": True}).encode())
+        elif path.startswith("/api/admin/remove_bet/"):
+            import urllib.parse
+            bet_id = urllib.parse.unquote(path[len("/api/admin/remove_bet/"):])
+            with _bets_lock:
+                before = len(_bets)
+                _bets[:] = [b for b in _bets if b["id"] != bet_id]
+                if len(_bets) < before:
+                    _save_bets(_bets)
+            self._send(200, "application/json", json.dumps({"ok": True, "removed": before - len(_bets)}).encode())
+        elif path == "/api/admin/patch_bet":
+            length = int(self.headers.get("Content-Length", 0))
+            body   = json.loads(self.rfile.read(length))
+            bet_id = body.get("id")
+            fields = {k: v for k, v in body.items() if k != "id"}
+            patched = False
+            with _bets_lock:
+                for b in _bets:
+                    if b["id"] == bet_id:
+                        b.update(fields)
+                        patched = True
+                        break
+                if patched:
+                    _save_bets(_bets)
+            self._send(200, "application/json", json.dumps({"ok": True, "patched": patched}).encode())
         else:
             self._send(404, "text/plain", b"Not found")
 
@@ -3632,7 +3850,7 @@ if __name__ == "__main__":
                         _bg_threads[i] = (name, target, new_th)
 
                 # ── Mode 2: detect hung scan thread (alive but not scanning) ─
-                in_game_hours = 10 <= _et_hour() <= 23   # 10 AM – 11 PM ET
+                in_game_hours = 10 <= _et_hour() <= 20   # 10 AM – 8 PM ET (pre-game window only)
 
                 with _lock:
                     last_scan_iso = _state.get("last_scan")

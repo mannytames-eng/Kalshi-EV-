@@ -234,6 +234,22 @@ if _backfilled:
     _save_bets(_bets)
     print(f"  Backfilled CLV fields on {len(_bets)} bet(s)")
 
+# --- One-time data corrections for known bad values ---
+_data_fixed = False
+for _b in _bets:
+    # Spurs @ Blazers: closing_yes_pct was contaminated by live in-game price (4¢)
+    if _b.get("id") == "KXNBATOTAL-26APR26SASPOR-218|YES" and _b.get("closing_yes_pct") != 44.0:
+        _b["closing_yes_pct"] = 44.0
+        _data_fixed = True
+    # TB @ PIT: paper_pnl was set incorrectly via manual_correction
+    if _b.get("id") == "KXMLBTOTAL-26APR181605TBPIT-8|YES" and _b.get("paper_pnl") != 25.03:
+        _b["paper_pnl"] = 25.03
+        _b["pnl"]       = 25.03
+        _data_fixed = True
+if _data_fixed:
+    _save_bets(_bets)
+    print("  Applied one-time data corrections (Spurs closing_yes_pct, TB@PIT paper_pnl)")
+
 
 def _bet_id(ticker: str, side: str) -> str:
     return f"{ticker}|{side}"
@@ -1149,7 +1165,7 @@ print(f"  Loaded {len(_alerted_keys)} previously alerted edge key(s) from disk")
 # period during game hours — indicates a silent data pipeline failure.
 _zero_edge_streak      = 0          # consecutive scans with no qualifying edges
 _last_props_scan: float = 0.0       # epoch seconds of last props scan
-PROPS_REFRESH_SECONDS  = 2 * 60 * 60  # props scan every 2 hours (~45 credits/scan)
+PROPS_REFRESH_SECONDS  = 999 * 24 * 60 * 60  # props disabled until May 1 reset (too costly on limited credits)
 _zero_edge_alerted     = False      # suppresses duplicate alerts per drought
 _ZERO_EDGE_ALERT_SCANS = 60         # 60 × 2-min scan = 2 hours of silence
 

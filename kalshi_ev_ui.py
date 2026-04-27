@@ -2871,9 +2871,28 @@ function renderTodayEdges() {
       : '';
     const driftTxt = isActive && live.drift_pct != null && live.drift_pct !== 0
       ? `<span class="badge-drift">(${live.drift_pct > 0 ? '+' : ''}${live.drift_pct}%)</span>` : '';
+
+    // ── American odds at flag time ──────────────────────────────────────────
+    // Kalshi price at flag (stored as 0–1 decimal)
+    const flagKalshiAmer = b.kalshi_price != null ? kalshiToAmerican(b.kalshi_price) : '—';
+    // Pinnacle fair value at flag (stored as percentage, e.g. 53.1)
+    const flagFairAmer   = b.pin_prob_at_flag != null ? probToAmerican(b.pin_prob_at_flag / 100) : '—';
+    const flagOddsTxt = `<span style="font-size:10px;color:var(--muted);display:block;margin-top:2px;">
+      Kalshi <span style="color:var(--text);">${flagKalshiAmer}</span>
+      &nbsp;·&nbsp; Fair <span style="color:var(--text);">${flagFairAmer}</span>
+    </span>`;
+
+    // ── Current American odds (from live scan) ──────────────────────────────
+    const curKalshiAmer = isActive && live.kalshi != null ? kalshiToAmerican(live.kalshi) : null;
+    const curFairAmer   = isActive && live.fair   != null ? probToAmerican(live.fair)      : null;
     const currentEdge = isActive
-      ? `<span style="color:${edgeColor(live.edge_pct)};font-weight:700;">+${pct(live.edge_pct)}</span>`
+      ? `<span style="color:${edgeColor(live.edge_pct)};font-weight:700;">+${pct(live.edge_pct)}</span>
+         <span style="font-size:10px;color:var(--muted);display:block;margin-top:2px;">
+           Kalshi <span style="color:var(--text);">${curKalshiAmer || '—'}</span>
+           &nbsp;·&nbsp; Fair <span style="color:var(--text);">${curFairAmer || '—'}</span>
+         </span>`
       : `<span style="color:var(--muted);">—</span>`;
+
     const flagTime = b.flagged_at ? fmtDate(b.flagged_at) : '—';
     const stake    = b.paper_stake != null ? `$${b.paper_stake.toFixed(0)}` : '—';
     const sideClass = b.side === 'YES' ? 'side-yes' : 'side-no';
@@ -2883,7 +2902,7 @@ function renderTodayEdges() {
       <td>${matchupHtml(b.matchup)}</td>
       <td class="prop-col" style="font-size:12px;">${b.title}${staleBadge}${driftTxt}${tickerTxt}</td>
       <td class="${sideClass}">${b.side}</td>
-      <td class="num" style="color:${edgeColor(b.edge_pct)};font-weight:700;">+${pct(b.edge_pct)}</td>
+      <td class="num" style="color:${edgeColor(b.edge_pct)};font-weight:700;">+${pct(b.edge_pct)}${flagOddsTxt}</td>
       <td class="num">${currentEdge}</td>
       <td class="num">${statusBadge}</td>
       <td class="num">${stake}</td>

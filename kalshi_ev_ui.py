@@ -2906,13 +2906,41 @@ function renderTodayEdges() {
       🔗 Verify on Kalshi ↗
     </a>`;
 
+    // ── Game start time ────────────────────────────────────────────────────
+    // Primary: b.game_time (UTC ISO string). Fallback: parse ticker (ET times).
+    // Pattern in ticker: YY + MON + DD + HHMM  e.g. 26APR282005 → Apr 28 8:05 PM ET
+    function parseTickerTime(ticker) {
+      const MONTHS = {JAN:0,FEB:1,MAR:2,APR:3,MAY:4,JUN:5,JUL:6,AUG:7,SEP:8,OCT:9,NOV:10,DEC:11};
+      const m = ticker.match(/-(\d{2})(JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)(\d{2})(\d{2})(\d{2})/i);
+      if (!m) return null;
+      const yr = 2000 + parseInt(m[1]), mo = MONTHS[m[2].toUpperCase()];
+      const dy = parseInt(m[3]), hr = parseInt(m[4]), mn = parseInt(m[5]);
+      // Ticker times are ET — encode as UTC offset (EDT = UTC-4, EST = UTC-5)
+      // Use UTC-4 (EDT) for Apr–Oct games
+      return new Date(Date.UTC(yr, mo, dy, hr + 4, mn));
+    }
+    const gameStart = b.game_time ? new Date(b.game_time) : parseTickerTime(b.ticker);
+    let gameTimeBadge = '';
+    if (gameStart && !isNaN(gameStart)) {
+      const now = Date.now();
+      const diffMs = gameStart - now;
+      if (diffMs < 0) {
+        // Game has started
+        gameTimeBadge = `<span style="display:block;font-size:10px;color:#f85149;font-weight:700;margin-top:3px;">● IN PLAY — do not bet</span>`;
+      } else {
+        const opts = {month:'short', day:'numeric', hour:'numeric', minute:'2-digit', timeZoneName:'short'};
+        const label = gameStart.toLocaleString('en-US', opts);
+        gameTimeBadge = `<span style="display:block;font-size:10px;color:var(--muted);margin-top:3px;" title="Game start time">🕐 ${label}</span>`;
+      }
+    }
+
     const flagTime = b.flagged_at ? fmtDate(b.flagged_at) : '—';
     const stake    = b.paper_stake != null ? `$${b.paper_stake.toFixed(0)}` : '—';
     const sideClass = b.side === 'YES' ? 'side-yes' : 'side-no';
     const tickerTxt = `<span style="display:block;font-size:8px;color:var(--muted);font-family:monospace;margin-top:2px;">${b.ticker}</span>`;
     return `<tr>
       <td style="font-size:11px;color:var(--muted);white-space:nowrap;">${flagTime}</td>
-      <td>${matchupHtml(b.matchup)}</td>
+      <td>${matchupHtml(b.matchup)}${gameTimeBadge}</td>
       <td class="prop-col" style="font-size:12px;">${b.title}${staleBadge}${driftTxt}${tickerTxt}${kalshiLink}</td>
       <td class="${sideClass}">${b.side}</td>
       <td class="num" style="color:${edgeColor(b.edge_pct)};font-weight:700;">+${pct(b.edge_pct)}${flagOddsTxt}</td>

@@ -237,18 +237,57 @@ if _backfilled:
 # --- One-time data corrections for known bad values ---
 _data_fixed = False
 for _b in _bets:
-    # Spurs @ Blazers: closing_yes_pct was contaminated by live in-game price (4¢)
-    if _b.get("id") == "KXNBATOTAL-26APR26SASPOR-218|YES" and _b.get("closing_yes_pct") != 44.0:
-        _b["closing_yes_pct"] = 44.0
-        _data_fixed = True
     # TB @ PIT: paper_pnl was set incorrectly via manual_correction
     if _b.get("id") == "KXMLBTOTAL-26APR181605TBPIT-8|YES" and _b.get("paper_pnl") != 25.03:
         _b["paper_pnl"] = 25.03
         _b["pnl"]       = 25.03
         _data_fixed = True
+    # Spurs @ Blazers: CLV was calculated from in-game 4¢ price (-42.0 → +3.1 via pin_entry)
+    if _b.get("id") == "KXNBATOTAL-26APR26SASPOR-218|YES":
+        if _b.get("clv") != 3.1:
+            _b["clv"]             = 3.1
+            _b["clv_source"]      = "pin_entry"
+            _b["closing_pin_pct"] = 49.1
+            _data_fixed = True
+    # Marcus Smart: closing_yes_pct was in-game (88¢), CLV -33.0 → +4.8 via pin_entry
+    if _b.get("id") == "KXNBAAST-26APR26LALHOU-LALMSMART36-5|NO":
+        if _b.get("clv") != 4.8:
+            _b["closing_yes_pct"] = 55.0   # reset to entry (true pre-game close unknown)
+            _b["clv"]             = 4.8
+            _b["clv_source"]      = "pin_entry"
+            _b["closing_pin_pct"] = 49.8
+            _data_fixed = True
+    # NYY @ HOU: had pin_prob_at_flag but used Kalshi drift (-1.0 → +7.8 via pin_entry)
+    if _b.get("id") == "KXMLBTOTAL-26APR242010NYYHOU-9|NO":
+        if _b.get("clv") != 7.8:
+            _b["clv"]             = 7.8
+            _b["clv_source"]      = "pin_entry"
+            _b["closing_pin_pct"] = 52.8
+            _data_fixed = True
+    # LAD @ SF: had pin_prob_at_flag but used Kalshi drift (-1.0 → +8.1 via pin_entry)
+    if _b.get("id") == "KXMLBTOTAL-26APR231545LADSF-7|NO":
+        if _b.get("clv") != 8.1:
+            _b["clv"]             = 8.1
+            _b["clv_source"]      = "pin_entry"
+            _b["closing_pin_pct"] = 49.1
+            _data_fixed = True
+
+# --- Systemic fix: upgrade clv_source="kalshi" → "pin_entry" for any bet
+#     that has pin_prob_at_flag but no true Pinnacle close captured yet ---
+for _b in _bets:
+    if (_b.get("clv_source") == "kalshi"
+            and _b.get("pin_prob_at_flag") is not None
+            and _b.get("closing_pin_pct") is None):
+        _ek = (_b.get("kalshi_price") or 0) * 100
+        if _ek:
+            _b["clv"]             = round(_b["pin_prob_at_flag"] - _ek, 1)
+            _b["clv_source"]      = "pin_entry"
+            _b["closing_pin_pct"] = _b["pin_prob_at_flag"]
+            _data_fixed = True
+
 if _data_fixed:
     _save_bets(_bets)
-    print("  Applied one-time data corrections (Spurs closing_yes_pct, TB@PIT paper_pnl)")
+    print("  Applied one-time data corrections (CLV/pin_entry upgrades)")
 
 
 def _bet_id(ticker: str, side: str) -> str:

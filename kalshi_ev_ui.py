@@ -1987,8 +1987,13 @@ def _capture_clv_prices():
 
             # API returns prices as dollar decimals in yes_bid_dollars/yes_ask_dollars
             # (e.g. 0.33 = 33¢).  Multiply by 100 to get percentage points.
+            # Fallback to yes_bid/yes_ask integer fields (0–100 scale) if dollar
+            # fields are missing — same fallback logic as kalshi_prices() in scanner.
             bid_c = float(mkt.get("yes_bid_dollars") or 0) * 100
             ask_c = float(mkt.get("yes_ask_dollars") or 0) * 100
+            if bid_c <= 0 or ask_c <= 0:
+                bid_c = float(mkt.get("yes_bid") or 0)
+                ask_c = float(mkt.get("yes_ask") or 0)
             if bid_c <= 0 or ask_c <= 0:
                 continue
 

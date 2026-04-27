@@ -2859,11 +2859,19 @@ function renderTodayEdges() {
   const rows = [...todayEdgesList].reverse().map(b => {
     const key  = b.ticker + '|' + b.side;
     const live = liveMap[key];
-    const isLive = !!live;
-    const statusBadge = isLive
-      ? `<span style="color:#3fb950;font-weight:700;font-size:11px;">● LIVE</span>`
-      : `<span style="color:var(--muted);font-size:11px;">○ GONE</span>`;
-    const currentEdge = isLive
+    const isActive = !!live;
+    // "ACTIVE" = edge still showing in current scan (game may not have started yet)
+    // "GONE"   = edge no longer in scan (line moved, market closed, or game started)
+    const statusBadge = isActive
+      ? `<span style="color:#3fb950;font-weight:700;font-size:11px;" title="Edge still detected in latest scan">● ACTIVE</span>`
+      : `<span style="color:var(--muted);font-size:11px;" title="Edge no longer in current scan">○ GONE</span>`;
+    // Stale badge: Kalshi price has drifted ≥5pp against us since flagged
+    const staleBadge = isActive && live.stale
+      ? `<span class="badge-stale" title="Kalshi price drifted ${live.drift_pct != null ? Math.abs(live.drift_pct) : '?'}pp — line moved against you">STALE</span>`
+      : '';
+    const driftTxt = isActive && live.drift_pct != null && live.drift_pct !== 0
+      ? `<span class="badge-drift">(${live.drift_pct > 0 ? '+' : ''}${live.drift_pct}%)</span>` : '';
+    const currentEdge = isActive
       ? `<span style="color:${edgeColor(live.edge_pct)};font-weight:700;">+${pct(live.edge_pct)}</span>`
       : `<span style="color:var(--muted);">—</span>`;
     const flagTime = b.flagged_at ? fmtDate(b.flagged_at) : '—';
@@ -2873,7 +2881,7 @@ function renderTodayEdges() {
     return `<tr>
       <td style="font-size:11px;color:var(--muted);white-space:nowrap;">${flagTime}</td>
       <td>${matchupHtml(b.matchup)}</td>
-      <td class="prop-col" style="font-size:12px;">${b.title}${tickerTxt}</td>
+      <td class="prop-col" style="font-size:12px;">${b.title}${staleBadge}${driftTxt}${tickerTxt}</td>
       <td class="${sideClass}">${b.side}</td>
       <td class="num" style="color:${edgeColor(b.edge_pct)};font-weight:700;">+${pct(b.edge_pct)}</td>
       <td class="num">${currentEdge}</td>

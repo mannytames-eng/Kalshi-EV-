@@ -2882,16 +2882,29 @@ function renderTodayEdges() {
       &nbsp;·&nbsp; Fair <span style="color:var(--text);">${flagFairAmer}</span>
     </span>`;
 
-    // ── Current American odds (from live scan) ──────────────────────────────
+    // ── Current American odds (from last scan — up to 2 min old) ─────────────
     const curKalshiAmer = isActive && live.kalshi != null ? kalshiToAmerican(live.kalshi) : null;
     const curFairAmer   = isActive && live.fair   != null ? probToAmerican(live.fair)      : null;
-    const currentEdge = isActive
+    const lastScanEdge = isActive
       ? `<span style="color:${edgeColor(live.edge_pct)};font-weight:700;">+${pct(live.edge_pct)}</span>
          <span style="font-size:10px;color:var(--muted);display:block;margin-top:2px;">
            Kalshi <span style="color:var(--text);">${curKalshiAmer || '—'}</span>
            &nbsp;·&nbsp; Fair <span style="color:var(--text);">${curFairAmer || '—'}</span>
-         </span>`
+         </span>
+         <span style="font-size:9px;color:#e3a53a;display:block;margin-top:2px;">⚠ verify on Kalshi before placing</span>`
       : `<span style="color:var(--muted);">—</span>`;
+
+    // ── Kalshi direct link ──────────────────────────────────────────────────
+    // Derives the series ticker by stripping the last strike suffix (e.g. -8)
+    // URL: kalshi.com/markets/[series]/[market]  (both lowercase)
+    const seriesTicker = b.ticker.replace(/-\d+$/, '').toLowerCase();
+    const marketTicker = b.ticker.toLowerCase();
+    const kalshiUrl    = `https://kalshi.com/markets/${seriesTicker}/${marketTicker}`;
+    const kalshiLink   = `<a href="${kalshiUrl}" target="_blank" rel="noopener"
+      style="font-size:9px;color:#58a6ff;display:block;margin-top:3px;text-decoration:none;"
+      title="Open live market on Kalshi to verify current price before placing">
+      🔗 Verify on Kalshi ↗
+    </a>`;
 
     const flagTime = b.flagged_at ? fmtDate(b.flagged_at) : '—';
     const stake    = b.paper_stake != null ? `$${b.paper_stake.toFixed(0)}` : '—';
@@ -2900,10 +2913,10 @@ function renderTodayEdges() {
     return `<tr>
       <td style="font-size:11px;color:var(--muted);white-space:nowrap;">${flagTime}</td>
       <td>${matchupHtml(b.matchup)}</td>
-      <td class="prop-col" style="font-size:12px;">${b.title}${staleBadge}${driftTxt}${tickerTxt}</td>
+      <td class="prop-col" style="font-size:12px;">${b.title}${staleBadge}${driftTxt}${tickerTxt}${kalshiLink}</td>
       <td class="${sideClass}">${b.side}</td>
       <td class="num" style="color:${edgeColor(b.edge_pct)};font-weight:700;">+${pct(b.edge_pct)}${flagOddsTxt}</td>
-      <td class="num">${currentEdge}</td>
+      <td class="num">${lastScanEdge}</td>
       <td class="num">${statusBadge}</td>
       <td class="num">${stake}</td>
     </tr>`;
@@ -2913,7 +2926,7 @@ function renderTodayEdges() {
     <thead><tr>
       <th>Flagged</th><th>Matchup</th><th>Bet</th><th>Side</th>
       <th class="num">Edge @ Flag</th>
-      <th class="num">Current Edge</th>
+      <th class="num">Last Scan <span style="font-size:9px;font-weight:400;color:var(--muted);">(≤2 min)</span></th>
       <th class="num">Status</th>
       <th class="num">Stake</th>
     </tr></thead>

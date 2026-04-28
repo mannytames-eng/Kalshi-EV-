@@ -503,6 +503,25 @@ def _add_new_bets(edges: list):
             print(f"  Bet tracker: logged {added} new bet(s)")
 
 
+def _commence_to_et_date(utc_str: str) -> str:
+    """Convert an Odds API commence_time (UTC ISO string) to an ET date string.
+
+    Kalshi tickers encode the ET date (e.g. APR27 for a game at 8 PM ET on Apr 27,
+    even though that's Apr 28 00:05 UTC).  The Odds API commence_time is in UTC,
+    so taking [:10] gives the UTC date — off by one for any game starting ≥ 8 PM ET.
+    Subtracting the ET offset (EDT=4h, EST=5h) before slicing gives the correct date
+    that matches what _parse_ticker_date() returns from the Kalshi ticker.
+    """
+    from datetime import datetime as _dt, timezone as _tz, timedelta as _td
+    try:
+        dt_utc = _dt.fromisoformat(utc_str.replace("Z", "+00:00"))
+        month = dt_utc.month
+        et_offset = _td(hours=4 if 4 <= month <= 10 else 5)  # EDT or EST
+        return (dt_utc - et_offset).strftime("%Y-%m-%d")
+    except (ValueError, AttributeError):
+        return utc_str[:10]   # fallback: raw UTC date
+
+
 def _build_score_index() -> dict:
     """
     Fetch completed game scores (free, 0 credits) and return a lookup:
@@ -523,7 +542,10 @@ def _build_score_index() -> dict:
             if home not in sc or away not in sc:
                 continue
             hs, as_ = sc[home], sc[away]
-            game_date = g.get("commence_time", "")[:10]   # "YYYY-MM-DD"
+            # Use ET date to match _parse_ticker_date() — games at ≥8 PM ET cross
+            # midnight UTC, so commence_time[:10] (UTC) is one day ahead of the
+            # Kalshi ticker date (ET), causing the resolver to return None forever.
+            game_date = _commence_to_et_date(g.get("commence_time", ""))
             # Keyed by teams + date — prevents same-series games from cross-resolving
             key_dated   = _n(away + "@" + home) + "_" + game_date
             key_undated = _n(away + "@" + home)   # fallback for old callers

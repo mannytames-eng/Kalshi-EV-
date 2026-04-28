@@ -243,8 +243,42 @@ if _backfilled:
 # --- One-time data corrections for known bad values ---
 _data_fixed = False
 
-# DET@ORL Game 4 purge removed 2026-04-28: game was pre-game at flag time (5:11 PM ET,
-# tipoff ~7:30 PM ET). NO won 182-214.5. Bet restored to ev_bets.json with correct result.
+# DET@ORL Game 4: bet was pre-game (flagged 5:11 PM ET, tipoff ~7:30 PM ET).
+# Was incorrectly purged. NO won 182 vs 214.5. Restore to Railway volume if missing.
+_detorl_id = "KXNBATOTAL-26APR27DETORL-214|NO"
+if not any(b.get("id") == _detorl_id for b in _bets):
+    _bets.append({
+        "id": _detorl_id,
+        "ticker": "KXNBATOTAL-26APR27DETORL-214",
+        "matchup": "Detroit Pistons @ Orlando Magic",
+        "title": "Detroit @ Orlando Total Points (>214.5)",
+        "side": "NO",
+        "mkt_type": "total",
+        "edge_pct": 6.8,
+        "kalshi_price": 0.43,
+        "kalshi_yes_at_flag": 57.0,
+        "pin_prob_at_flag": 49.8,
+        "flagged_at": "2026-04-27T21:11:00+00:00",
+        "status": "won",
+        "resolved_at": "2026-04-28T03:05:42+00:00",
+        "resolved_by": "kalshi",
+        "pnl": 50.4,
+        "paper_stake": 38.02,
+        "paper_pnl": 50.4,
+        "kelly_bet_pct": 2.982,
+        "kelly_bet_dollars": 38.02,
+        "kelly_pnl": 0.02982,
+        "kelly_pnl_pct": 2.982,
+        "kelly_pnl_dollars": 50.4,
+        "clv_mult_applied": 1.0,
+        "closing_yes_pct": None,
+        "clv": 0.0,
+        "closing_pin_pct": None,
+        "clv_source": "none",
+        "_note": "kalshi_price ~0.43 estimated — REST API has no historical orderbook snapshots",
+    })
+    _data_fixed = True
+    print("  Restored DET@ORL NO bet (pre-game find, NO won 182 vs 214.5)")
 
 for _b in _bets:
     # TB @ PIT: paper_pnl was set incorrectly via manual_correction

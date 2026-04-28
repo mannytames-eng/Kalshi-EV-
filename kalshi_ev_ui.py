@@ -31,7 +31,6 @@ sys.path.insert(0, BASE_DIR)
 from kalshi_ev_scanner import (
     scan_sport,
     scan_player_props,
-    scan_nba_player_props,
     kalshi_get,
     fetch_game_scores,
     validate_bet,
@@ -76,10 +75,17 @@ def _et_hour() -> int:
     return (datetime.now(timezone.utc) - _td(hours=_et_offset_hours())).hour
 
 def _odds_refresh_interval() -> int:
-    """Return seconds until next odds refresh based on current ET hour."""
+    """Return seconds until next odds refresh based on current ET hour.
+
+    Budget rationale (shared API key — Railway + localhost use same pool):
+      10 min game hours: 11h × 6/hr × 2 = 132 credits/day Railway
+      20 min overnight:  13h × 3/hr × 2 =  78 credits/day Railway
+      Railway total: ~210/day = ~6,300/month
+      Both Railway + localhost 6h/day: ~7,740/month — well under 20k
+    """
     et_hour = _et_hour()
     if 11 <= et_hour < 22:   # 11 AM – 10 PM ET: game window
-        return 4 * 60
+        return 10 * 60       # 10 min — adequate for book line movements
     return 20 * 60           # overnight: slow down
 REFRESH_SECONDS       = 2 * 60     # re-scan Kalshi every 2 min    (0 credits)
 # Monthly credit math (20k budget):
@@ -1716,12 +1722,12 @@ def _run_scan():
         now_ts = time.time()
         if now_ts - _last_props_scan >= PROPS_REFRESH_SECONDS:
             mlb_props = scan_player_props(odds_sport="baseball_mlb", abbr_map=MLB_ABBR)
-            nba_props = scan_nba_player_props()
             _last_props_scan = now_ts
         else:
-            mlb_props, nba_props = [], []
+            mlb_props = []
 
-        all_edges = sorted(mlb + nba + mlb_props + nba_props, key=lambda x: x["edge"], reverse=True)
+        # NBA player props eliminated — too noisy, in-game contamination risk
+        all_edges = sorted(mlb + nba + mlb_props, key=lambda x: x["edge"], reverse=True)
 
         # Deduplicate: keep only best edge per (matchup, mkt_type, side)
         edges = _best_edge_per_game(all_edges)

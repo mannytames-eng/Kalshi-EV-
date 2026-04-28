@@ -236,6 +236,18 @@ if _backfilled:
 
 # --- One-time data corrections for known bad values ---
 _data_fixed = False
+
+# Remove in-game bets: DET@ORL Game 4 flagged during live game (invalid edges)
+_in_game_ids = {
+    "KXNBATOTAL-26APR27DETORL-214|NO",
+    "KXNBATOTAL-26APR27DETORL-214|YES",
+}
+_pre_purge = len(_bets)
+_bets = [_b for _b in _bets if _b.get("id") not in _in_game_ids]
+if len(_bets) < _pre_purge:
+    _data_fixed = True
+    print(f"  Purged {_pre_purge - len(_bets)} in-game bet(s) (DET@ORL flagged during live game)")
+
 for _b in _bets:
     # TB @ PIT: paper_pnl was set incorrectly via manual_correction
     if _b.get("id") == "KXMLBTOTAL-26APR181605TBPIT-8|YES" and _b.get("paper_pnl") != 25.03:

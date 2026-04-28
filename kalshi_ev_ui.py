@@ -281,6 +281,25 @@ if not any(b.get("id") == _detorl_id for b in _bets):
     print("  Restored DET@ORL NO bet (pre-game find, NO won 182 vs 214.5)")
 
 for _b in _bets:
+    # NYY@TEX Apr 27: game was NYY 4 TEX 2 = 6 total, YES on >7.5 = LOST.
+    # Kalshi ticker said APR28 (next day UTC) so auto-resolver never caught it.
+    if _b.get("id") == "KXMLBTOTAL-26APR282005NYYTEX-8|YES" and _b.get("status") == "open":
+        stake = _b.get("paper_stake", 13.44)
+        kpct  = _b.get("kelly_bet_pct", 1.127)
+        kdol  = _b.get("kelly_bet_dollars", 11.27)
+        _b["status"]            = "lost"
+        _b["resolved_at"]       = "2026-04-28T03:00:00+00:00"
+        _b["resolved_by"]       = "manual"
+        _b["pnl"]               = round(-stake, 2)
+        _b["paper_pnl"]         = round(-stake, 2)
+        _b["kelly_pnl"]         = round(-kpct / 100, 5)
+        _b["kelly_pnl_pct"]     = round(-kpct, 3)
+        _b["kelly_pnl_dollars"] = round(-kdol, 2)
+        _b["_note"]             = "Resolved manually: Apr 27 NYY 4 TEX 2 = 6 total, under 7.5. Ticker APR28 = UTC date mismatch, auto-resolver missed it."
+        _data_fixed = True
+        print("  Resolved NYY@TEX YES as LOST (Apr 27 game: 6 total vs 7.5 line)")
+
+for _b in _bets:
     # TB @ PIT: paper_pnl was set incorrectly via manual_correction
     if _b.get("id") == "KXMLBTOTAL-26APR181605TBPIT-8|YES" and _b.get("paper_pnl") != 25.03:
         _b["paper_pnl"] = 25.03

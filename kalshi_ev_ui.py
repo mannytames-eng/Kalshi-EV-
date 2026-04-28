@@ -335,6 +335,24 @@ for _b in _bets:
             _b["closing_pin_pct"] = 49.1
             _data_fixed = True
 
+# --- Kalshi-to-Kalshi CLV: 6 early spread bets (Apr 3–4) where closing_yes
+#     was a real capture (differs from entry). No Pinnacle data available.
+_kalshi_clv_map = {
+    "KXMLBSPREAD-26APR042105NYMSF-SF2|NO":   (70.0, 66.0),
+    "KXMLBSPREAD-26APR042138SEALAA-LAA2|NO": (76.0, 75.0),
+    "KXMLBSPREAD-26APR041905MIANYY-MIA2|NO": (75.0, 79.0),
+    "KXMLBSPREAD-26APR041610SDBOS-SD3|NO":   (79.0, 77.0),
+    "KXMLBSPREAD-26APR041610SDBOS-SD4|NO":   (86.0, 84.0),
+    "KXMLBSPREAD-26APR041310STLDET-STL4|NO": (87.0, 84.0),
+}
+for _b in _bets:
+    _pair = _kalshi_clv_map.get(_b.get("id", ""))
+    if _pair and _b.get("clv_source") == "none":
+        _ey, _cy = _pair
+        _b["clv"]        = round(_ey - _cy, 1)   # all NO bets: entry_yes - close_yes
+        _b["clv_source"] = "kalshi"
+        _data_fixed = True
+
 # --- Systemic fix: upgrade clv_source="kalshi" → "pin_entry" for any bet
 #     that has pin_prob_at_flag but no true Pinnacle close captured yet ---
 for _b in _bets:

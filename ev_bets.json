@@ -142,9 +142,9 @@
     "unit_pnl": null,
     "resolved_by": "kalshi",
     "closing_yes_pct": 66.0,
-    "clv": 0.0,
+    "clv": 4.0,
     "closing_pin_pct": null,
-    "clv_source": "none"
+    "clv_source": "kalshi"
   },
   {
     "id": "KXMLBSPREAD-26APR042138SEALAA-LAA2|NO",
@@ -161,9 +161,9 @@
     "unit_pnl": null,
     "resolved_by": "kalshi",
     "closing_yes_pct": 75.0,
-    "clv": 0.0,
+    "clv": 1.0,
     "closing_pin_pct": null,
-    "clv_source": "none"
+    "clv_source": "kalshi"
   },
   {
     "id": "KXMLBSPREAD-26APR041605BALPIT-BAL4|NO",
@@ -327,9 +327,9 @@
     "unit_pnl": null,
     "resolved_by": "kalshi",
     "closing_yes_pct": 79.0,
-    "clv": 0.0,
+    "clv": -4.0,
     "closing_pin_pct": null,
-    "clv_source": "none"
+    "clv_source": "kalshi"
   },
   {
     "id": "KXMLBSPREAD-26APR041605LADWSH-LAD4|NO",
@@ -402,9 +402,9 @@
     "unit_pnl": null,
     "resolved_by": "kalshi",
     "closing_yes_pct": 77.0,
-    "clv": 0.0,
+    "clv": 2.0,
     "closing_pin_pct": null,
-    "clv_source": "none"
+    "clv_source": "kalshi"
   },
   {
     "id": "KXMLBTOTAL-26APR041410TORCWS-5|NO",
@@ -439,9 +439,9 @@
     "unit_pnl": null,
     "resolved_by": "kalshi",
     "closing_yes_pct": 84.0,
-    "clv": 0.0,
+    "clv": 2.0,
     "closing_pin_pct": null,
-    "clv_source": "none"
+    "clv_source": "kalshi"
   },
   {
     "id": "KXMLBTOTAL-26APR041605HOUATH-5|NO",
@@ -642,9 +642,9 @@
     "unit_pnl": null,
     "resolved_by": "kalshi",
     "closing_yes_pct": 84.0,
-    "clv": 0.0,
+    "clv": 3.0,
     "closing_pin_pct": null,
-    "clv_source": "none"
+    "clv_source": "kalshi"
   },
   {
     "id": "KXMLBTOTAL-26APR041905MIANYY-3|NO",

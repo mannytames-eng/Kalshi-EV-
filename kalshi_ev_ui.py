@@ -1616,6 +1616,12 @@ def _run_odds_refresh():
                 _cached_mlb_index = mlb_idx
     except Exception as exc:
         print(f"  ERROR refreshing MLB odds index: {exc}")
+        # On 401 (credits exhausted), wipe the cache — stale odds produce phantom
+        # edges when compared against current Kalshi prices (especially in-game).
+        if "401" in str(exc):
+            with _odds_cache_lock:
+                _cached_mlb_index = None
+            print("  MLB odds cache cleared — will not scan until credits restore")
 
     try:
         nba_idx, _ = fetch_odds_index(
@@ -1626,6 +1632,10 @@ def _run_odds_refresh():
                 _cached_nba_index = nba_idx
     except Exception as exc:
         print(f"  ERROR refreshing NBA odds index: {exc}")
+        if "401" in str(exc):
+            with _odds_cache_lock:
+                _cached_nba_index = None
+            print("  NBA odds cache cleared — will not scan until credits restore")
 
     with _odds_cache_lock:
         _last_odds_refresh = time.time()

@@ -356,8 +356,8 @@ def fetch_event_markets(event_ticker: str) -> List[dict]:
     return data.get("markets", [])
 
 
-MIN_PRICE      = 0.03
-MAX_PRICE      = 0.97
+MIN_PRICE      = 0.12   # mid below 12% → likely in-game (pre-game markets rarely go this low)
+MAX_PRICE      = 0.88   # mid above 88% → likely in-game
 PROP_MIN_PRICE = 0.08
 PROP_MAX_PRICE = 0.92
 
@@ -1565,19 +1565,25 @@ def scan_sport(
                     pass
 
             # Skip in-progress games (Kalshi live prices ≠ pre-game book prices)
+            # Rule: if we cannot confirm the game hasn't started, skip it.
             game_dt = _parse_ticker_game_time(ev_ticker)
             if game_dt is None and exp_str:
                 # NBA tickers have no time component — estimate start from expiration.
-                # NBA games run ~2.5h + buffer → use 4h offset.
+                # NBA games run up to 3.5h (OT + delays) → use 5h offset (conservative).
                 # MLB games run ~3h + buffer → use 3.5h offset.
                 try:
                     from datetime import timedelta as _tde
                     exp_dt_g = datetime.fromisoformat(exp_str.replace("Z", "+00:00"))
                     is_nba   = "NBA" in series.upper()
-                    game_dt  = exp_dt_g - _tde(hours=4.0 if is_nba else 3.5)
+                    game_dt  = exp_dt_g - _tde(hours=5.0 if is_nba else 3.5)
                 except (ValueError, AttributeError):
                     pass
-            if game_dt and game_dt < now_utc:
+            # If game start time is still unknown, skip — never scan unknowns.
+            # Scanning a game of unknown start risks comparing in-game Kalshi
+            # prices against pre-game book lines, producing phantom edges.
+            if game_dt is None:
+                continue
+            if game_dt < now_utc:
                 continue
 
             if "MLB" in series:

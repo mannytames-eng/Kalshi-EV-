@@ -299,6 +299,27 @@ for _b in _bets:
         _data_fixed = True
         print("  Resolved NYY@TEX YES as LOST (Apr 27 game: 6 total vs 7.5 line)")
 
+# Donovan Mitchell NO: TOR@CLE Apr 29, under 3.5 assists → NO won.
+# NBA props were eliminated so Kalshi won't auto-resolve; manual fix required.
+_mitchell_id = "KXNBAAST-26APR29TORCLE-CLEDMITCHELL45-4|NO"
+for _b in _bets:
+    if _b.get("id") == _mitchell_id and _b.get("status") == "open":
+        _ps = _b.get("paper_stake", 59.6)
+        _k  = _b.get("kalshi_price", 0.31)
+        _kd = _b.get("kelly_bet_dollars", 50.0)
+        _kp = _b.get("kelly_bet_pct", 5.0)
+        _b["status"]             = "won"
+        _b["resolved_at"]        = "2026-04-30T03:00:00+00:00"
+        _b["resolved_by"]        = "manual"
+        _b["pnl"]               = round(_ps * (1 - _k) / _k, 2)
+        _b["paper_pnl"]         = round(_ps * (1 - _k) / _k, 2)
+        _b["kelly_pnl"]         = round(_kp * (1 - _k) / _k / 100, 5)
+        _b["kelly_pnl_pct"]     = round(_kp * (1 - _k) / _k, 3)
+        _b["kelly_pnl_dollars"] = round(_kd * (1 - _k) / _k, 2)
+        _b["_note"]             = "Resolved manually: TOR@CLE Apr 29, Mitchell under 3.5 assists. NO won."
+        _data_fixed = True
+        print("  Resolved Mitchell NO as WON (under 3.5 assists TOR@CLE Apr 29)")
+
 for _b in _bets:
     # TB @ PIT: paper_pnl was set incorrectly via manual_correction
     if _b.get("id") == "KXMLBTOTAL-26APR181605TBPIT-8|YES" and _b.get("paper_pnl") != 25.03:

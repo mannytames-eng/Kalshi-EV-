@@ -299,6 +299,33 @@ for _b in _bets:
         _data_fixed = True
         print("  Resolved NYY@TEX YES as LOST (Apr 27 game: 6 total vs 7.5 line)")
 
+# LAA@CWS Apr 27: 2-5 = 7 total. YES on >9.5 lost.
+# CHC@SD Apr 28: total over 7.5. NO (under) lost.
+# MIN@DEN Apr 27: DEN 125, MIN 113 = 238 total. NO on >222.5 lost.
+_late_losses = {
+    "KXMLBTOTAL-26APR271940LAACWS-10|YES": ("2026-04-28T04:00:00+00:00", "LAA 2 CWS 5 = 7 total, YES on >9.5 lost"),
+    "KXMLBTOTAL-26APR282140CHCSD-8|NO":    ("2026-04-29T05:00:00+00:00", "CHC@SD total over 7.5, NO (under) lost"),
+    "KXNBATOTAL-26APR27MINDEN-223|NO":     ("2026-04-28T03:30:00+00:00", "DEN 125 MIN 113 = 238 total, NO on >222.5 lost"),
+}
+for _b in _bets:
+    _ll = _late_losses.get(_b.get("id",""))
+    if _ll and _b.get("status") == "open":
+        _rat, _note = _ll
+        _ps  = _b.get("paper_stake", 0)
+        _kp  = _b.get("kelly_bet_pct", 0)
+        _kd  = _b.get("kelly_bet_dollars", 0)
+        _b["status"]             = "lost"
+        _b["resolved_at"]        = _rat
+        _b["resolved_by"]        = "manual"
+        _b["pnl"]               = round(-_ps, 2)
+        _b["paper_pnl"]         = round(-_ps, 2)
+        _b["kelly_pnl"]         = round(-_kp / 100, 5)
+        _b["kelly_pnl_pct"]     = round(-_kp, 3)
+        _b["kelly_pnl_dollars"] = round(-_kd, 2)
+        _b["_note"]             = _note
+        _data_fixed = True
+        print(f"  Resolved {_b['id']} as LOST")
+
 # Donovan Mitchell NO: TOR@CLE Apr 29, under 3.5 assists → NO won.
 # NBA props were eliminated so Kalshi won't auto-resolve; manual fix required.
 _mitchell_id = "KXNBAAST-26APR29TORCLE-CLEDMITCHELL45-4|NO"
@@ -840,7 +867,7 @@ def _infer_mkt_type(b: dict) -> str:
 
 # Minimum number of CLV data points before we apply a penalty multiplier.
 # Prevents over-reacting to a small sample of resolved bets.
-_CLV_PENALTY_MIN_SAMPLE = 40
+_CLV_PENALTY_MIN_SAMPLE = 10   # lowered from 40 — props have fewer bets, 40 was unreachable
 
 
 def _get_clv_multipliers() -> dict:
@@ -1328,7 +1355,7 @@ print(f"  Loaded {len(_alerted_keys)} previously alerted edge key(s) from disk")
 # period during game hours — indicates a silent data pipeline failure.
 _zero_edge_streak      = 0          # consecutive scans with no qualifying edges
 _last_props_scan: float = 0.0       # epoch seconds of last props scan
-PROPS_REFRESH_SECONDS  = 999 * 24 * 60 * 60  # props disabled until May 1 reset (too costly on limited credits)
+PROPS_REFRESH_SECONDS  = 8 * 60 * 60   # MLB props: scan every 8h (credits restored May 1)
 _zero_edge_alerted     = False      # suppresses duplicate alerts per drought
 _ZERO_EDGE_ALERT_SCANS = 60         # 60 × 2-min scan = 2 hours of silence
 

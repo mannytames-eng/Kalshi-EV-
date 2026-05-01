@@ -71,7 +71,7 @@ MAX_BETS_PER_GROUP = 2       # max bets per (matchup, mkt_type) group
 # ">8.5 runs") or rare-event props where model error is amplified.
 MIN_KALSHI_PRICE   = 0.15
 
-MAX_PROP_EVENTS = 10         # prop scan credit budget (see comment in UI)
+MAX_PROP_EVENTS = 5          # prop scan credit budget — conservative, MLB only
 
 # ── Book weights for consensus probability ───────────────────────────────────
 # Fair value is Pinnacle ONLY — the sharpest closing-line book.

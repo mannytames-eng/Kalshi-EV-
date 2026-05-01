@@ -77,16 +77,24 @@ def _et_hour() -> int:
 def _odds_refresh_interval() -> int:
     """Return seconds until next odds refresh based on current ET hour.
 
-    Budget rationale (shared API key — Railway + localhost use same pool):
-      10 min game hours: 11h × 6/hr × 2 = 132 credits/day Railway
-      20 min overnight:  13h × 3/hr × 2 =  78 credits/day Railway
-      Railway total: ~210/day = ~6,300/month
-      Both Railway + localhost 6h/day: ~7,740/month — well under 20k
+    Measured credit costs (May 2026 audit):
+      MLB odds call: 3 credits  |  NBA odds call: 3 credits
+      Props event call: 5 credits  |  Events list: 0 credits
+
+    Budget at 12/30-min intervals (Railway only — localhost killed):
+      Peak  (11h × 5/hr × 6): 330 credits/day
+      Off   (13h × 2/hr × 6): 156 credits/day
+      Game total: 486/day
+      Props (3 scans × 5 events × 5¢): 75/day
+      Grand total: 561/day × 31 = 17,391/month
+      Buffer: 2,609 credits (13% headroom under 20k)
+
+    10-min peak would project 21,855/month — over budget.
     """
     et_hour = _et_hour()
     if 11 <= et_hour < 22:   # 11 AM – 10 PM ET: game window
-        return 10 * 60       # 10 min — adequate for book line movements
-    return 20 * 60           # overnight: slow down
+        return 12 * 60       # 12 min peak — adequate, saves ~3,600 credits/month vs 10-min
+    return 30 * 60           # overnight: minimal traffic, slow way down
 REFRESH_SECONDS       = 2 * 60     # re-scan Kalshi every 2 min    (0 credits)
 # Monthly credit math (20k budget):
 #   Odds refresh : 2 × 144/day × 30 =  8,640

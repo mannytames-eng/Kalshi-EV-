@@ -570,6 +570,7 @@ def _add_new_bets(edges: list) -> list:
             bid = _bet_id(e["ticker"], e["side"])
             if bid in existing_ids:
                 continue   # exact same market already logged
+            existing_ids.add(bid)   # prevent same ticker appearing twice in one cycle
 
             game_date = _parse_ticker_date(e.get("ticker", ""))
             slot = (e.get("matchup", ""), e.get("mkt_type", ""), e.get("side", ""), game_date)
@@ -1614,20 +1615,18 @@ def _alert_top10(newly_logged: list = None):
         )
 
     now_utc = datetime.now(timezone.utc)
+    clv_mults = _get_clv_multipliers()
 
+    # ── Filter: skip already-alerted and started games ────────────────────────
+    to_alert = []
     for e in all_edges:
         key = _edge_key(e)
         if key in _alerted_keys:
             continue   # already alerted — skip
 
-        # Skip (and permanently mark) edges for games that have already started.
-        # Prevents stale alerts after Railway restarts or slow scan cycles.
         ticker = e.get("ticker", "")
         game_start = _parse_ticker_start_time(ticker)
         if game_start is None:
-            # Fallback: estimate start from expiration_time.
-            # NBA games run ~2.5h + Kalshi buffer → use 4h offset.
-            # MLB games run ~3h + buffer → use 3.5h offset.
             exp_str = e.get("expiration_time") or e.get("expected_expiration_time") or ""
             if exp_str:
                 try:
@@ -1638,69 +1637,91 @@ def _alert_top10(newly_logged: list = None):
                 except (ValueError, AttributeError):
                     pass
         if game_start and game_start < now_utc:
+            # Game already started — silence without alerting
             _alerted_keys.add(key)
             _save_alerted_keys(_alerted_keys, _gone_alerted_keys)
-            continue   # game already started — no alert, just dedup
+            continue
 
-        ts   = datetime.now().strftime("%I:%M %p")
-        k    = e.get("kalshi", 0.5)
-        ep   = round(e.get("edge_pct", e.get("edge", 0) * 100), 1)
-        side = e.get("side", "?")
+        to_alert.append(e)
 
-        # American odds
-        # e["fair"] = model probability for the bet side at the exact Kalshi threshold.
-        # This is the correct "consensus" price — it's calibrated to the specific bet line,
-        # not the book's main line (which can be at a different threshold for totals).
-        kalshi_amer = _prob_to_american_str(k)
-        fair_p      = e.get("fair", None)
-        cons_amer   = _prob_to_american_str(fair_p)   # fair value for this exact bet
+    # ── Group by game so one game → one Discord ping ──────────────────────────
+    # Multiple markets on the same game (e.g. Total YES + Spread YES) get
+    # bundled into a single embed instead of firing separate notifications.
+    import re as _re_alert
+    def _game_group_key(e: dict) -> str:
+        norm = _re_alert.sub(r"[^a-z0-9]", "", e.get("matchup", "").lower())
+        return f"{norm}|{_parse_ticker_date(e.get('ticker','')) or ''}"
 
-        # Confirming books (from consensus_reason: "Confirmed by Pinnacle + DraftKings")
-        conf_reason = e.get("consensus_reason", "")
-        conf_books  = conf_reason.replace("Confirmed by ", "").replace("Pinnacle", "PIN").replace("DraftKings", "DK").replace("FanDuel", "FD") if conf_reason else "PIN+?"
+    from collections import OrderedDict
+    groups: OrderedDict = OrderedDict()
+    for e in to_alert:
+        gk = _game_group_key(e)
+        groups.setdefault(gk, []).append(e)
 
-        # Kelly bet size
-        kelly_frac = _sms_kelly(e)
-        kelly_bet  = round(kelly_frac * PERF_BANKROLL, 2)
-        kelly_pct  = round(kelly_frac * 100, 2)
-        clv_mults  = _get_clv_multipliers()
-        clv_tag    = " (½ CLV penalty)" if clv_mults.get(e.get("mkt_type", ""), 1.0) == 0.5 else ""
+    ts = datetime.now().strftime("%I:%M %p")
 
-        # Embed color: green ≥10%, yellow ≥7%, blue otherwise
-        color = 0x00c853 if ep >= 10 else 0xffe57a if ep >= 7 else 0x2979ff
-        stars = "🔥" if ep >= 10 else "⚡" if ep >= 7 else "📈"
-        conf_label = "★★★ HIGH CONF" if e.get("confidence", 0) >= 0.80 else "★★ MED CONF" if e.get("confidence", 0) >= 0.50 else "★ LOW CONF"
+    for gk, group_edges in groups.items():
+        # Sort markets within group: highest edge first
+        group_edges.sort(key=lambda x: x.get("edge_pct", 0), reverse=True)
+        best = group_edges[0]   # lead with the strongest edge
 
-        # content = what shows on the phone lock screen without unlocking
-        # Keep it tight: the two numbers the user needs at a glance
-        content = f"{stars} **+{ep}% edge** | Kelly **${kelly_bet:.0f}** ({kelly_pct}%){clv_tag}"
+        best_ep    = round(best.get("edge_pct", 0), 1)
+        best_k     = best.get("kalshi", 0.5)
+        best_fair  = best.get("fair")
+        best_side  = best.get("side", "?")
+        best_kelly = _sms_kelly(best)
+        best_kelly_bet = round(best_kelly * PERF_BANKROLL, 2)
+        best_kelly_pct = round(best_kelly * 100, 2)
 
-        # Rich embed — full detail visible after opening Discord
-        ticker_str = e.get("ticker", "")
-        mkt_type_str = e.get("mkt_type", "").upper()
+        # Lock-screen preview — shows the top edge + total count
+        stars = "🔥" if best_ep >= 10 else "⚡" if best_ep >= 7 else "📈"
+        extra = f" (+{len(group_edges)-1} more)" if len(group_edges) > 1 else ""
+        clv_tag = " (½ CLV)" if clv_mults.get(best.get("mkt_type",""), 1.0) == 0.5 else ""
+        content = (f"{stars} **{best.get('matchup','')}**{extra}  "
+                   f"+{best_ep}% edge | Kelly **${best_kelly_bet:.0f}**{clv_tag}")
+
+        # Embed color driven by best edge in group
+        color = 0x00c853 if best_ep >= 10 else 0xffe57a if best_ep >= 7 else 0x2979ff
+        conf_label = ("★★★ HIGH CONF" if best.get("confidence", 0) >= 0.80
+                      else "★★ MED CONF" if best.get("confidence", 0) >= 0.50
+                      else "★ LOW CONF")
+
+        # Build one field block per market in the group
+        market_fields = []
+        for e in group_edges:
+            ep        = round(e.get("edge_pct", 0), 1)
+            k         = e.get("kalshi", 0.5)
+            fair_p    = e.get("fair")
+            side      = e.get("side", "?")
+            mtype     = e.get("mkt_type", "").upper()
+            kf        = _sms_kelly(e)
+            kb        = round(kf * PERF_BANKROLL, 2)
+            kp        = round(kf * 100, 2)
+            ka        = _prob_to_american_str(k)
+            fa        = _prob_to_american_str(fair_p)
+            ct        = " (½ CLV)" if clv_mults.get(e.get("mkt_type",""), 1.0) == 0.5 else ""
+            market_fields.append({
+                "name":   f"[{mtype}] {e.get('title','')}  —  {side}",
+                "value":  (f"`+{ep}%` adj EV  •  Kelly `${kb:.0f}` ({kp}%){ct}\n"
+                           f"Kalshi `{ka}` ({round(k*100)}¢)  •  Fair `{fa}`"),
+                "inline": False,
+            })
+
         embed = {
-            "color": color,
-            "author": {"name": f"Kalshi EV Scanner  •  {ts}"},
-            "title": f"{e.get('matchup', '')}",
-            "description": f"**{e.get('title', '')}**  —  Side: **{side}**",
-            "fields": [
-                {"name": "Adj. Edge",      "value": f"`+{ep}%`",                        "inline": True},
-                {"name": "Kelly Stake",    "value": f"`${kelly_bet:.0f}` ({kelly_pct}%){clv_tag}", "inline": True},
-                {"name": "Confidence",     "value": conf_label,                          "inline": True},
-                # ⚠ Kalshi price is captured at scan time — can be up to 2 min stale.
-                # Always use ✓ Check (or validate_bet) before placing.
-                {"name": "Kalshi Price",   "value": f"`{kalshi_amer}`  ({round(k*100)}¢)  *(scan price)*","inline": True},
-                {"name": "Fair Value",     "value": f"`{cons_amer}`",                    "inline": True},
-                {"name": "Books",          "value": conf_books,                          "inline": True},
-                {"name": "Market Ticker",  "value": f"`{ticker_str}`  [{mkt_type_str}]", "inline": False},
-            ],
-            "footer": {"text": f"⚠ Kalshi price shown is from scan time — verify live price before betting  •  Bankroll ${PERF_BANKROLL:.0f}  •  Pinnacle fair value"},
-            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "color":       color,
+            "author":      {"name": f"Kalshi EV Scanner  •  {ts}"},
+            "title":       best.get("matchup", ""),
+            "description": f"{conf_label}  •  {len(group_edges)} market{'s' if len(group_edges)>1 else ''} flagged",
+            "fields":      market_fields,
+            "footer":      {"text": "⚠ Prices from scan time — verify live before betting  •  Pinnacle fair value"},
+            "timestamp":   datetime.now(timezone.utc).isoformat(),
         }
 
         ok = send_discord(embed, content)
         if ok:
-            _alerted_keys.add(key)
+            for e in group_edges:
+                key = _edge_key(e)
+                _alerted_keys.add(key)
             _save_alerted_keys(_alerted_keys, _gone_alerted_keys)
 
     # ── Follow-up: alert when a previously flagged edge is gone ──────────────

@@ -1566,6 +1566,7 @@ def scan_sport(
     _diag_games_matched  = 0   # events where Pinnacle game was found
     _diag_line_matches   = 0   # events where an exact Pinnacle line matched
     _diag_edges_raw      = 0   # markets that exceeded EDGE_THRESHOLD before final filters
+    _diag_best_adj       = -999.0  # best adjusted edge seen across all markets this scan
 
     def resolve(raw: Optional[str]) -> Optional[str]:
         if not raw:
@@ -1846,8 +1847,20 @@ def scan_sport(
                 no_adj  = no_fee_adj  * (1 - EV_HAIRCUT)
 
                 best_adj = max(yes_adj, no_adj)
+                if best_adj > _diag_best_adj:
+                    _diag_best_adj = best_adj
                 if best_adj > 0:
                     _diag_edges_raw += 1   # count positive-EV markets before threshold filter
+                # Log near-misses: markets within 5pp of threshold in either direction
+                _near_miss_gap = best_adj - EDGE_THRESHOLD  # negative = below threshold
+                if -0.05 < _near_miss_gap < 0:
+                    _best_side = "YES" if yes_adj >= no_adj else "NO"
+                    _matchup_str = f"{game_info.get('away','?')} @ {game_info.get('home','?')}"
+                    print(
+                        f"  [near-miss] {mkt_type:<6} {_matchup_str:<30} {_best_side} "
+                        f"fair={fair:.3f} ask={yes_ask:.3f} bid={yes_bid:.3f} "
+                        f"adj={best_adj:+.1%} (need {EDGE_THRESHOLD:.0%})"
+                    )
                 if best_adj < EDGE_THRESHOLD:
                     continue
                 # Cap: edges above MAX_EDGE are almost certainly line mismatches
@@ -1994,10 +2007,12 @@ def scan_sport(
         print(f"  (skipped {no_price_count} markets with no price)")
 
     _pin_game_count = len(game_index) // max(1, 2)  # approximate unique matchups
+    _best_adj_str = f"{_diag_best_adj:+.1%}" if _diag_best_adj > -999 else "n/a"
     print(
         f"  [diag] pin_games={_pin_game_count}  kalshi_events={_diag_kalshi_events}  "
         f"games_matched={_diag_games_matched}  line_matches={_diag_line_matches}  "
-        f"edges_raw(+EV)={_diag_edges_raw}  edges_final={len(edges)}"
+        f"edges_raw(+EV)={_diag_edges_raw}  edges_final={len(edges)}  "
+        f"best_adj={_best_adj_str}"
     )
 
     # ── 3. Sort by confidence × adj_edge, correlation-control, top N ─────
@@ -2034,6 +2049,7 @@ def scan_sport(
         "line_matches":   _diag_line_matches,
         "edges_raw":      _diag_edges_raw,
         "edges_final":    len(edges),
+        "best_adj_pct":   round(_diag_best_adj * 100, 1) if _diag_best_adj > -999 else None,
     }
     return edges, scan_stats
 

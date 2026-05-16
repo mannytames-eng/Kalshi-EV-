@@ -58,8 +58,8 @@ ODDS_BASE   = "https://api.the-odds-api.com/v4"
 # For a typical 52% fair / 45¢ entry, this costs ~2pp of the apparent edge.
 # A raw gap of 3% becomes ~0.9% true EV — still positive but thin.
 KALSHI_FEE_RATE    = 0.07    # Kalshi profit fee (7% of winnings) — update if tier changes
-EDGE_THRESHOLD     = 0.02    # ≥2% fee+haircut-adjusted EV to flag (was 3% pre-fee-model)
-                             # Equivalent to ~3.5–4% raw gap before fees and haircut.
+EDGE_THRESHOLD     = 0.03    # ≥3% fee+haircut-adjusted EV to flag (matches ALERT_MIN_EDGE)
+                             # Equivalent to ~4.5–5% raw gap before fees and haircut.
 MAX_EDGE           = 0.20    # reject edges >20% — almost certainly a stale line
 EV_HAIRCUT         = 0.10    # model-uncertainty discount (separate from fee)
 TOP_BETS_PER_CYCLE = 25      # surface up to 25 qualifying bets per scan
@@ -162,6 +162,35 @@ def _norm_ppf(p: float) -> float:
     c0, c1, c2 = 2.515517, 0.802853, 0.010328
     d1, d2, d3 = 1.432788, 0.189269, 0.001308
     return -(t - (c0 + c1 * t + c2 * t * t) / (1 + d1 * t + d2 * t * t + d3 * t * t * t))
+
+
+def _push_correction(no_vig_prob: float, integer_line: float, std: float) -> float:
+    """
+    Correction factor for Pinnacle integer lines vs Kalshi binary markets.
+
+    When Pinnacle posts an integer line (e.g. total 8.0 or spread -2.0), their
+    no-vig probability includes push redistribution:
+        no_vig = P(win) / (P(win) + P(lose))     [push excluded from denominator]
+
+    Kalshi is a binary market — what would be a push on Pinnacle is a LOSS on Kalshi.
+    So the correct Kalshi fair value is:
+        fair_kalshi = P(win) = no_vig × (1 − P(push))
+
+    Uses a Gaussian to estimate P(push) ≈ P(line − 0.5 < score < line + 0.5).
+
+    Returns the multiplier (1 − push_prob) to apply to the Pinnacle no-vig probability.
+    Only call this when the matched Pinnacle line is a whole number.
+    """
+    # Derive implied mean: no_vig ≈ P(score > line), so mean ≈ line + std × Φ⁻¹(no_vig)
+    # First-order approximation — push_prob is small so iteration is unnecessary.
+    mean = integer_line + std * _norm_ppf(no_vig_prob)
+    # Integrate normal density across the ±0.5 band around the integer line
+    push_prob = (
+        _norm_cdf((integer_line + 0.5 - mean) / std) -
+        _norm_cdf((integer_line - 0.5 - mean) / std)
+    )
+    push_prob = max(0.0, min(push_prob, 0.15))   # safety cap at 15%
+    return 1.0 - push_prob
 
 
 def _gaussian_total_fair(
@@ -399,19 +428,14 @@ def kalshi_prices(mkt: dict) -> Optional[Tuple[float, float]]:
 # ── The Odds API — multi-book ─────────────────────────────────────────────────
 def fetch_book_odds(sport: str) -> Tuple[List[dict], str]:
     """
-    Fetch h2h / spreads / totals (+ alternate totals) from ALL books in one API call.
-    One credit regardless of how many markets are requested.
-
-    alternate_totals: returns all Pinnacle alternate lines (7.5, 8.5, 9.5, 10.5 …)
-    so we can match the Kalshi threshold directly instead of Gaussian-extrapolating.
-    Pinnacle's alternate prices already bake in every venue/weather/matchup effect —
-    no model inference needed.
+    Fetch h2h / spreads / totals from Pinnacle only (1 credit per call).
+    Only sharp-book data is used for fair-value — DK/FanDuel have 0 weight.
     """
-    books = ",".join(BOOK_WEIGHTS.keys())
+    sharp_books = ",".join(k for k, w in BOOK_WEIGHTS.items() if w > 0)
     r = requests.get(f"{ODDS_BASE}/sports/{sport}/odds", params={
         "apiKey":     ODDS_API_KEY,
-        "bookmakers": books,
-        "markets":    "h2h,spreads,totals",
+        "bookmakers": sharp_books,
+        "markets":    "spreads,totals",   # h2h removed — not used for fair-value, saves ~1 credit/call
         "oddsFormat": "american",
     }, timeout=15)
     r.raise_for_status()
@@ -450,13 +474,12 @@ def fetch_player_prop_odds_event(sport: str, event_id: str, markets: str = None)
     """
     if markets is None:
         markets = "pitcher_strikeouts,batter_hits,batter_home_runs,batter_total_bases,batter_rbis"
-    all_books = ",".join(BOOK_WEIGHTS.keys())
-    # Try all books together first (one credit, richest data)
+    sharp_books = ",".join(k for k, w in BOOK_WEIGHTS.items() if w > 0)
     r = requests.get(
         f"{ODDS_BASE}/sports/{sport}/events/{event_id}/odds",
         params={
             "apiKey":     ODDS_API_KEY,
-            "bookmakers": all_books,
+            "bookmakers": sharp_books,
             "markets":    markets,
             "oddsFormat": "american",
         },
@@ -601,15 +624,12 @@ def _validate_book_consensus(
             f"({', '.join(parts)}; Kalshi={k_side:.1%})",
         )
 
-    # ── 4. Require at least one retail book to confirm ────────────────────
-    if not confirm_books:
-        available = [(bname, bp) for _, bp, bname in retail if bp is not None]
-        if not available:
-            return (
-                False,
-                f"Neither DraftKings nor FanDuel data available to confirm {side}",
-            )
-        detail = ", ".join(f"{n}={p:.1%}" for n, p in available)
+    # ── 4. Retail confirmation (DK/FD) — optional when not fetched ──────────
+    # If retail books are available, at least one must confirm.
+    # If none are available (Pinnacle-only mode), Pinnacle alone is sufficient.
+    available_retail = [(bname, bp) for _, bp, bname in retail if bp is not None]
+    if available_retail and not confirm_books:
+        detail = ", ".join(f"{n}={p:.1%}" for n, p in available_retail)
         return (
             False,
             f"Neither DraftKings nor FanDuel confirms value on {side} "
@@ -1308,6 +1328,17 @@ def _find_game(
         except ValueError:
             pass
 
+    def _both_teams_match(entry: dict, ta: Optional[str], tb: Optional[str]) -> bool:
+        """Verify both teams appear in the entry to avoid same-city collisions
+        (e.g. SF plays both LAD and ATH on the same day — looking up SF alone
+        would match the wrong game without this cross-check)."""
+        if ta is None or tb is None:
+            return True   # can't verify, allow it through
+        entry_home = _norm(entry.get("home", ""))
+        entry_away = _norm(entry.get("away", ""))
+        return (_norm(ta) in (entry_home, entry_away)
+                and _norm(tb) in (entry_home, entry_away))
+
     for t in [team_a, team_b]:
         if t is None:
             continue
@@ -1316,7 +1347,9 @@ def _find_game(
         for cdate in candidate_dates:
             date_key = f"{key}_{cdate}"
             if date_key in game_index:
-                return game_index[date_key]
+                entry = game_index[date_key]
+                if _both_teams_match(entry, team_a, team_b):
+                    return entry
         # 2. Bare-team fallback — verify date is within ±1 day to avoid
         #    using a completely different series game's Pinnacle odds.
         if key in game_index:
@@ -1324,7 +1357,8 @@ def _find_game(
             stored_date = entry.get("_game_date", "")
             if game_date and stored_date and stored_date not in candidate_dates:
                 continue
-            return entry
+            if _both_teams_match(entry, team_a, team_b):
+                return entry
     return None
 
 
@@ -1688,7 +1722,21 @@ def scan_sport(
                                 break
                         if pin_match is None:
                             continue  # Pinnacle doesn't post this exact spread line
-                        _, fair = pin_match
+                        pin_match_pt, fair = pin_match
+
+                        # ── Push correction for integer spread lines ──────────
+                        # Same issue as totals: Pinnacle's -2.0 line has a push
+                        # (margin = exactly 2), but Kalshi >2.0 is binary — a
+                        # margin of 2 is a LOSS (2 is not strictly > 2.0).
+                        # Half-point lines (1.5, 2.5 …) have no push — skip them.
+                        if abs(pin_match_pt - round(pin_match_pt)) < 1e-9:
+                            corr     = _push_correction(fair, pin_match_pt, spread_std)
+                            push_pct = (1.0 - corr) * 100
+                            print(f"    [push-corr] integer spread {pin_match_pt:.1f}: "
+                                  f"push≈{push_pct:.1f}%  "
+                                  f"cover {fair:.3f}→{fair*corr:.3f}")
+                            fair *= corr
+
                         books_detail   = {"pinnacle": fair}
                         books_used     = ["pinnacle"]
                         consensus_prob = fair
@@ -1697,14 +1745,14 @@ def scan_sport(
                     total_info = game_info.get("total", {})
                     if total_info.get("over_point") is not None:
                         # ── Prefer exact Pinnacle line match over equivalence rule ──
-                        # Check all stored Pinnacle lines for an exact or near-exact match
-                        # to the Kalshi threshold. This ensures the fair value shown
-                        # matches what you'd see looking up that specific line on Pinnacle,
-                        # avoiding confusion when Pinnacle's main line differs from Kalshi's.
+                        # Check all stored Pinnacle lines for an exact or equivalent match.
+                        # Two thresholds are equivalent when they produce the same outcome
+                        # in integer-scored sports (e.g. 8.0 == 8.5 in baseball — both
+                        # require 9+ runs). Prefer exact/equivalent matches over Gaussian.
                         pin_lines    = total_info.get("pin_lines", {})
                         exact_match  = None
                         for pin_pt, pin_probs in pin_lines.items():
-                            if abs(pin_pt - threshold) <= 0.25:
+                            if abs(pin_pt - threshold) <= 0.25 or _lines_equivalent(pin_pt, threshold):
                                 exact_match = (pin_pt, pin_probs)
                                 break
 
@@ -1714,26 +1762,28 @@ def scan_sport(
                             po              = exact_match[1]["over_prob"]
                             pu              = exact_match[1]["under_prob"]
                             total_fair_src  = "exact"   # Pinnacle has this exact line
+
+                            # ── Push correction for integer Pinnacle lines ────────
+                            # Pinnacle posts integer totals (e.g. 8.0) as 3-outcome
+                            # markets: over / push / under.  Their no-vig probability
+                            # redistributes the push, inflating the over prob vs the
+                            # true P(total > line).  Kalshi is binary — a total landing
+                            # on the integer is a LOSS, not a push.  Correct before use.
+                            if abs(pin_total - round(pin_total)) < 1e-9:
+                                corr      = _push_correction(po, pin_total, total_std)
+                                push_pct  = (1.0 - corr) * 100
+                                print(f"    [push-corr] integer line {pin_total:.1f}: "
+                                      f"push≈{push_pct:.1f}%  "
+                                      f"over {po:.3f}→{po*corr:.3f}  "
+                                      f"under {pu:.3f}→{pu*corr:.3f}")
+                                po *= corr
+                                pu *= corr
                         else:
-                            # No exact match — Gaussian fallback for small gaps only.
-                            # The most common case: Pinnacle posts an integer line
-                            # (e.g. 8.0) while Kalshi markets are at half-points
-                            # (8.5). A 0.5-run step is safe to extrapolate.
-                            # Anything larger risks park/weather distortion (Coors
-                            # Field etc.) so we skip it entirely.
-                            pin_total  = total_info["over_point"]
-                            pin_over_p = total_info["over_prob"]
-                            total_gap  = abs(threshold - pin_total)
-                            if total_gap > 0.5:
-                                continue   # gap too large — skip, no inference
-                            po = _gaussian_total_fair(
-                                pin_over_prob=pin_over_p,
-                                pin_line=pin_total,
-                                kalshi_threshold=threshold,
-                                std=total_std,
-                            )
-                            pu             = 1.0 - po
-                            total_fair_src = "gaussian_halfstep"
+                            # No exact Pinnacle alternate line — skip entirely.
+                            # Gaussian extrapolation was removed: even a 0.5-run
+                            # step can systematically mis-estimate edge direction
+                            # and was the likely cause of YES/over bias.
+                            continue
 
                         books_used  = total_info.get("books_used", [])
                         books_detail = {
@@ -1904,6 +1954,7 @@ def scan_sport(
                 edges.append({
                     "ticker":               mkt.get("ticker", ""),
                     "title":                prop_label,
+                    "kalshi_line":          threshold,   # Kalshi floor_strike (e.g. 8.5) — the line to bet on Kalshi
                     "matchup":              matchup,
                     "side":                 side,
                     "kalshi":               round(k_side, 4),
@@ -2269,8 +2320,13 @@ def scan_player_props(
         if matched is None:
             continue
 
-        # Reject if Kalshi threshold differs from reference line by > 0.6
-        if abs(matched["line"] - kp["threshold"]) > 0.6:
+        # Reject if Kalshi threshold differs from reference line by > 0.5.
+        # Note: this tolerance controls a Poisson extrapolation — the lambda is
+        # derived from Pinnacle's line, then evaluated at the Kalshi threshold.
+        # A 0.5-unit gap (e.g. Pinnacle 6.5 → Kalshi 7.0) changes the outcome
+        # bucket by one integer step (P(X≥7) → P(X≥8)), which can meaningfully
+        # mis-state fair value.  Keep this tight; loosen only with evidence.
+        if abs(matched["line"] - kp["threshold"]) > 0.5:
             continue
 
         lam       = matched["lambda"]
@@ -2341,6 +2397,7 @@ def scan_player_props(
         edges.append({
             "ticker":               kp["ticker"],
             "title":                f"{search_title} (line {matched['line']})",
+            "kalshi_line":          kp.get("floor_strike"),
             "matchup":              matchup,
             "side":                 side,
             "kalshi":               round(k_side, 4),

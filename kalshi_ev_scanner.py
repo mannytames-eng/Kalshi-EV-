@@ -1561,6 +1561,12 @@ def scan_sport(
     city_lu = build_city_lookup(abbr_map)
     now_utc = datetime.now(timezone.utc)
 
+    # Diagnostic counters — surfaced in /api/scan so we can diagnose zero-edge runs
+    _diag_kalshi_events  = 0   # Kalshi events fetched across all series
+    _diag_games_matched  = 0   # events where Pinnacle game was found
+    _diag_line_matches   = 0   # events where an exact Pinnacle line matched
+    _diag_edges_raw      = 0   # markets that exceeded EDGE_THRESHOLD before final filters
+
     def resolve(raw: Optional[str]) -> Optional[str]:
         if not raw:
             return None
@@ -1583,6 +1589,7 @@ def scan_sport(
             continue
 
         print(f"  Kalshi [{series}]: {len(events)} event(s)")
+        _diag_kalshi_events += len(events)
 
         for evt in events:
             ev_ticker = evt.get("event_ticker", "")
@@ -1637,6 +1644,7 @@ def scan_sport(
             game_info = _find_game(away_name, home_name, game_index, game_date)
             if game_info is None:
                 continue
+            _diag_games_matched += 1
 
             try:
                 time.sleep(0.2)
@@ -1722,6 +1730,7 @@ def scan_sport(
                                 break
                         if pin_match is None:
                             continue  # Pinnacle doesn't post this exact spread line
+                        _diag_line_matches += 1
                         pin_match_pt, fair = pin_match
 
                         # ── Push correction for integer spread lines ──────────
@@ -1757,6 +1766,7 @@ def scan_sport(
                                 break
 
                         if exact_match:
+                            _diag_line_matches += 1
                             # Use the Pinnacle line that directly matches Kalshi threshold
                             pin_total       = exact_match[0]
                             po              = exact_match[1]["over_prob"]
@@ -1836,6 +1846,8 @@ def scan_sport(
                 no_adj  = no_fee_adj  * (1 - EV_HAIRCUT)
 
                 best_adj = max(yes_adj, no_adj)
+                if best_adj > 0:
+                    _diag_edges_raw += 1   # count positive-EV markets before threshold filter
                 if best_adj < EDGE_THRESHOLD:
                     continue
                 # Cap: edges above MAX_EDGE are almost certainly line mismatches
@@ -1981,6 +1993,13 @@ def scan_sport(
     if no_price_count:
         print(f"  (skipped {no_price_count} markets with no price)")
 
+    _pin_game_count = len(game_index) // max(1, 2)  # approximate unique matchups
+    print(
+        f"  [diag] pin_games={_pin_game_count}  kalshi_events={_diag_kalshi_events}  "
+        f"games_matched={_diag_games_matched}  line_matches={_diag_line_matches}  "
+        f"edges_raw(+EV)={_diag_edges_raw}  edges_final={len(edges)}"
+    )
+
     # ── 3. Sort by confidence × adj_edge, correlation-control, top N ─────
     # Confidence-weighted score: rewards bets where all books agree AND edge is large.
     # A 10% edge where DK/FD/Pinnacle all agree outranks a 12% edge where only one
@@ -2008,7 +2027,15 @@ def scan_sport(
                 f"{stars:>4}  {bks}"
             )
 
-    return edges
+    scan_stats = {
+        "pin_games":      _pin_game_count,
+        "kalshi_events":  _diag_kalshi_events,
+        "games_matched":  _diag_games_matched,
+        "line_matches":   _diag_line_matches,
+        "edges_raw":      _diag_edges_raw,
+        "edges_final":    len(edges),
+    }
+    return edges, scan_stats
 
 
 # ── Player-props helpers ──────────────────────────────────────────────────────
@@ -2456,7 +2483,7 @@ def scan_nba_player_props() -> List[dict]:
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 def run_once() -> int:
-    mlb_edges = scan_sport(
+    mlb_edges, _ = scan_sport(
         label         = "MLB — Run Line & Totals",
         spread_series = "KXMLBSPREAD",
         total_series  = "KXMLBTOTAL",
@@ -2465,7 +2492,7 @@ def run_once() -> int:
         spread_std    = MLB_SPREAD_STD,
         total_std     = MLB_TOTAL_STD,
     )
-    nba_edges = scan_sport(
+    nba_edges, _ = scan_sport(
         label         = "NBA — Spread & Totals",
         spread_series = "KXNBASPREAD",
         total_series  = "KXNBATOTAL",

@@ -144,10 +144,11 @@ def _is_shadow_bet(e: dict) -> tuple:
 # ── Shared state (updated by background thread) ───────────────────────────────
 _lock    = threading.Lock()
 _state   = {
-    "edges":       [],
-    "last_scan":   None,   # ISO string
-    "scanning":    False,
-    "error":       None,
+    "edges":           [],
+    "last_scan":       None,   # ISO string
+    "scanning":        False,
+    "error":           None,
+    "last_scan_stats": None,   # diagnostic counters from last scan_sport call
 }
 
 # Tracks first-seen and last-seen YES price for each edge key (for staleness + CLV)
@@ -183,7 +184,9 @@ print(f"  Loaded {len(_edge_price_history)} Pinnacle price entries from disk")
 _odds_cache_lock  = threading.Lock()
 _cached_mlb_index: Optional[dict] = None
 _cached_nba_index: Optional[dict] = None
-_last_odds_refresh: float = 0.0   # epoch seconds of last successful refresh
+_last_odds_refresh: float        = 0.0   # epoch seconds of last ATTEMPT (success or fail)
+_last_odds_cache_success: float  = 0.0   # epoch seconds of last SUCCESSFUL index population
+_odds_game_count: int            = 0     # number of Pinnacle matchups in the cached index
 
 # ── validate_bet result cache (saves 1 credit per click) ─────────────────────
 # validate_bet() calls fetch_book_odds() — 1 Odds API credit per call.
@@ -1918,7 +1921,8 @@ def _run_odds_refresh():
     Costs exactly 2 Odds API credits (1 per sport: MLB + NBA).
     Runs every ODDS_REFRESH_SECONDS in a dedicated background thread.
     """
-    global _cached_mlb_index, _cached_nba_index, _last_odds_refresh
+    global _cached_mlb_index, _cached_nba_index, _last_odds_refresh, \
+           _last_odds_cache_success, _odds_game_count
     print(f"\n  ── Odds index refresh  {datetime.now().strftime('%H:%M:%S')} ──")
 
     try:
@@ -1926,8 +1930,14 @@ def _run_odds_refresh():
             "baseball_mlb", total_range=(5.0, 14.0), spread_limit=3.0
         )
         if mlb_idx is not None:
+            n_games = len(mlb_idx) // max(1, 2)
             with _odds_cache_lock:
-                _cached_mlb_index = mlb_idx
+                _cached_mlb_index       = mlb_idx
+                _last_odds_cache_success = time.time()
+                _odds_game_count        = n_games
+            print(f"  MLB index cached: {n_games} matchups")
+        else:
+            print("  WARNING: fetch_odds_index returned None — Pinnacle cache not updated")
     except Exception as exc:
         print(f"  ERROR refreshing MLB odds index: {exc}")
         # On 401 (credits exhausted), wipe the cache — stale odds produce phantom
@@ -2000,7 +2010,7 @@ def _run_scan():
             return
 
         # MLB spreads + totals — ML removed (not used); NBA removed entirely for credit conservation
-        mlb = scan_sport(
+        mlb, mlb_stats = scan_sport(
             label="MLB — Spread & Totals",
             spread_series="KXMLBSPREAD",
             total_series="KXMLBTOTAL",
@@ -2014,6 +2024,7 @@ def _run_scan():
 
         # NBA scanning removed — props eliminated, totals-only mode, credit conservation
         nba = []
+        nba_stats = {}
 
         # Player props disabled — pitcher strikeout lines move too much between flag and gametime
         mlb_props = []
@@ -2152,9 +2163,10 @@ def _run_scan():
         _save_history(_history)
 
         with _lock:
-            _state["edges"]     = edges
-            _state["last_scan"] = now_iso
-            _state["scanning"]  = False
+            _state["edges"]          = edges
+            _state["last_scan"]      = now_iso
+            _state["scanning"]       = False
+            _state["last_scan_stats"] = mlb_stats   # diagnostic counters for /api/scan
 
         # Log new bets and capture what was just added for the alert
         newly_logged = _add_new_bets(edges)
@@ -4468,10 +4480,14 @@ class Handler(BaseHTTPRequestHandler):
                 state_copy = dict(_state)
             # Augment with watchdog / odds health info for observability
             with _odds_cache_lock:
-                odds_age_sec = int(time.time() - _last_odds_refresh) if _last_odds_refresh else None
-            state_copy["watchdog_last_tick"] = int(_watchdog_last_tick) if _watchdog_last_tick else None
-            state_copy["odds_age_sec"]       = odds_age_sec
-            state_copy["kalshi_auth_failed"] = _kalshi_auth_failed
+                odds_age_sec         = int(time.time() - _last_odds_refresh) if _last_odds_refresh else None
+                cache_success_age    = int(time.time() - _last_odds_cache_success) if _last_odds_cache_success else None
+                game_count           = _odds_game_count
+            state_copy["watchdog_last_tick"]     = int(_watchdog_last_tick) if _watchdog_last_tick else None
+            state_copy["odds_age_sec"]           = odds_age_sec
+            state_copy["odds_cache_success_age"] = cache_success_age   # age of last SUCCESSFUL index population
+            state_copy["odds_game_count"]        = game_count           # matchups in cached Pinnacle index
+            state_copy["kalshi_auth_failed"]     = _kalshi_auth_failed
             payload = json.dumps(state_copy).encode()
             self._send(200, "application/json", payload)
 

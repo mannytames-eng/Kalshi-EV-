@@ -82,16 +82,29 @@ def _odds_refresh_interval() -> int:
       MLB odds call: 1 credit  |  NBA odds call: 1 credit
       Props event call: 1 credit  |  Events list: 0 credits
 
-    Budget at 12/30-min intervals (Railway only — localhost killed):
-      Peak  (11h × 5/hr × 1 sport × 2 markets): 110 credits/day
-      Off   (13h × 2/hr × 1 sport × 2 markets):  52 credits/day
-      Grand total: 162/day × 31 = 5,022/month
-      Buffer: 14,978 credits (75% headroom under 20k)
+    Normal budget at 12/30-min intervals:
+      Peak  (11h × 5/hr): 55 credits/day
+      Off   (13h × 2/hr): 26 credits/day
+      Total: ~81/day → ~2,511/month
+
+    CREDIT_CONSERVATION_MODE (active until June 1):
+      Peak  (11h × 2/hr at 30 min): 22 credits/day
+      Off   (13h × 1/hr at 60 min): 13 credits/day
+      Total: ~35/day → ~525 for 15 days  (well under 2,480 remaining)
+    Reset CREDIT_CONSERVATION_MODE = False on June 1 to restore 12-min peak.
     """
+    # ── Temporary credit conservation — remove June 1 ────────────────────────
+    CREDIT_CONSERVATION_MODE = True
+    if CREDIT_CONSERVATION_MODE:
+        et_hour = _et_hour()
+        if 11 <= et_hour < 22:
+            return 30 * 60   # 30 min peak (was 12) — saves ~33 credits/day
+        return 60 * 60       # 60 min off-peak (was 30) — saves ~13 credits/day
+    # ── Normal schedule ───────────────────────────────────────────────────────
     et_hour = _et_hour()
     if 11 <= et_hour < 22:   # 11 AM – 10 PM ET: game window
-        return 12 * 60       # 12 min peak — adequate, saves ~3,600 credits/month vs 10-min
-    return 30 * 60           # overnight: minimal traffic, slow way down
+        return 12 * 60       # 12 min peak
+    return 30 * 60           # overnight
 REFRESH_SECONDS       = 2 * 60     # re-scan Kalshi every 2 min    (0 credits)
 # Monthly credit math (20k budget):
 #   Odds refresh : 2 × 144/day × 30 =  8,640

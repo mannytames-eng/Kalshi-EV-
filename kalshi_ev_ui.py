@@ -125,22 +125,6 @@ PAPER_START_DATE     = "2026-04-07"  # bets before this date excluded from portf
 PAPER_KELLY_FRACTION = 0.25     # quarter-Kelly sizing
 PAPER_KELLY_CAP      = 0.05     # max 5% of current balance per bet
 
-# ── Shadow filter — YES totals at >8.5 / >9.5 require higher edge ─────────────
-# Bets that fail this filter are logged with shadow=True for comparison tracking.
-# Main tracker excludes them; shadow tracker shows what would have happened.
-SHADOW_YES_TOTAL_THRESHOLDS = {8, 9}   # ticker suffix -8 = >8.5, -9 = >9.5
-SHADOW_YES_TOTAL_MIN_EDGE   = 5.0      # require 5% adj edge (vs normal 3%) to pass
-
-def _is_shadow_bet(e: dict) -> tuple:
-    """Return (is_shadow, reason) for a candidate edge."""
-    import re as _re
-    if e.get("side") == "YES" and e.get("mkt_type") == "total":
-        m = _re.search(r"-(\d+)\|", e.get("ticker", "") + "|")
-        if m and int(m.group(1)) in SHADOW_YES_TOTAL_THRESHOLDS:
-            if e.get("edge_pct", 0) < SHADOW_YES_TOTAL_MIN_EDGE:
-                return True, f"YES total >{m.group(1)}.5 edge {e.get('edge_pct',0):.1f}% < {SHADOW_YES_TOTAL_MIN_EDGE}% threshold"
-    return False, ""
-
 # ── Shared state (updated by background thread) ───────────────────────────────
 _lock    = threading.Lock()
 _state   = {
@@ -474,23 +458,9 @@ for _b in _bets:
         _b["correlated"] = False
         _data_fixed = True
 
-# Backfill shadow flag on existing bets — YES totals at >8.5/>9.5 with edge <5%
-import re as _re_shadow
-for _b in _bets:
-    if "shadow" not in _b:
-        _is_shad, _shad_reason = _is_shadow_bet({
-            "side":     _b.get("side", ""),
-            "mkt_type": _b.get("mkt_type", ""),
-            "ticker":   _b.get("ticker", "") + "|",
-            "edge_pct": _b.get("edge_pct", 0),
-        })
-        _b["shadow"]        = _is_shad
-        _b["shadow_reason"] = _shad_reason if _is_shad else ""
-        _data_fixed = True
-
 if _data_fixed:
     _save_bets(_bets)
-    print("  Applied one-time data corrections (CLV/pin_entry upgrades + shadow backfill)")
+    print("  Applied one-time data corrections (CLV/pin_entry upgrades)")
 
 
 def _bet_id(ticker: str, side: str) -> str:
@@ -643,18 +613,10 @@ def _add_new_bets(edges: list) -> list:
                 "correlated":         is_correlated,         # excluded from win-rate/Kelly stats
             }
 
-            # Shadow filter — flag bets that don't meet the higher YES-total bar
-            is_shadow, shadow_reason = _is_shadow_bet(e)
-            if is_shadow:
-                new_bet["shadow"]        = True
-                new_bet["shadow_reason"] = shadow_reason
-            else:
-                new_bet["shadow"]        = False
-
             _bets.append(new_bet)
             newly_added.append(new_bet)
             existing_ids.add(bid)
-            if not is_correlated and not is_shadow:
+            if not is_correlated:
                 open_slots.add(slot)   # only primary bet claims the slot
             added += 1
         if added:
@@ -1025,21 +987,11 @@ def _get_performance(since: Optional[str] = None) -> dict:
     def _is_correlated(b: dict) -> bool:
         return b.get("correlated", False)
 
-    def _is_shadow(b: dict) -> bool:
-        return b.get("shadow", False)
-
-    gl_bets    = [b for b in bets    if not _is_prop(b) and not _is_shadow(b)]
-    gl_won     = [b for b in won     if not _is_prop(b) and not _is_correlated(b) and not _is_shadow(b)]
-    gl_lost    = [b for b in lost    if not _is_prop(b) and not _is_correlated(b) and not _is_shadow(b)]
-    gl_open    = [b for b in open_   if not _is_prop(b) and not _is_shadow(b)]
+    gl_bets    = [b for b in bets  if not _is_prop(b)]
+    gl_won     = [b for b in won   if not _is_prop(b) and not _is_correlated(b)]
+    gl_lost    = [b for b in lost  if not _is_prop(b) and not _is_correlated(b)]
+    gl_open    = [b for b in open_ if not _is_prop(b)]
     gl_settled = gl_won + gl_lost
-
-    # Shadow tracker — bets filtered from main but still tracked for comparison
-    sh_bets    = [b for b in bets   if _is_shadow(b)]
-    sh_won     = [b for b in won    if _is_shadow(b)]
-    sh_lost    = [b for b in lost   if _is_shadow(b)]
-    sh_open    = [b for b in open_  if _is_shadow(b)]
-    sh_settled = sh_won + sh_lost
 
     # ── Kelly sizing helper ────────────────────────────────────────────────────
     # 0.25 Fractional Kelly for a binary prediction-market bet, with:
@@ -1246,16 +1198,6 @@ def _get_performance(since: Optional[str] = None) -> dict:
         "recent_bet_count":     recent_bet_count,  # settled bets in last 14d
         "recent_7d_count":      recent_7d_count,   # settled bets in last 7d
         "days_since_last_bet":  days_since_last_bet,
-        # Shadow tracker stats
-        "shadow": {
-            "total":    len(sh_bets),
-            "won":      len(sh_won),
-            "lost":     len(sh_lost),
-            "open":     len(sh_open),
-            "win_rate": round(len(sh_won) / len(sh_settled) * 100, 1) if sh_settled else None,
-            "avg_edge": round(sum(b.get("edge_pct",0) for b in sh_settled) / len(sh_settled), 1) if sh_settled else None,
-            "bets":     sorted(sh_bets, key=lambda b: b.get("flagged_at",""), reverse=True),
-        },
     }
 
 
@@ -2887,16 +2829,6 @@ HTML = """<!DOCTYPE html>
   </div>
 </div>
 
-<div id="shadow-card" class="card">
-  <div class="card-header" onclick="toggleCard('shadow-body-wrap')">🔮 Shadow Tracker — YES Totals &gt;8.5/9.5 (filtered) <span class="card-toggle" id="shadow-body-wrap-toggle">▾</span></div>
-  <div id="shadow-body-wrap" class="card-body" style="display:none;">
-    <div style="font-size:12px;color:var(--muted);padding:0 0 12px 0;line-height:1.6;">
-      Bets filtered from the main tracker (YES totals at &gt;8.5/&gt;9.5 with adj edge &lt;5%). Still resolved and tracked here for comparison. If this tracker wins at &lt;40%, the filter is justified. If it rebounds to 47%+, consider removing it.
-    </div>
-    <div id="shadow-stats"></div>
-    <div id="shadow-body"><div class="empty">No shadow bets yet.</div></div>
-  </div>
-</div>
 
 <div id="history-card" class="card">
   <div class="card-header" onclick="toggleCard('history-body')">Portfolio ROI <span class="card-toggle" id="history-body-toggle">▾</span></div>
@@ -4105,53 +4037,6 @@ function renderPerformance(d) {
   }
   document.getElementById('perf-body').innerHTML += perfTableHtml;
 
-  // ── Shadow tracker ───────────────────────────────────────────────────────────
-  const sh = d.shadow || {};
-  const shBets = sh.bets || [];
-  if (shBets.length === 0) {
-    document.getElementById('shadow-body').innerHTML = '<div class="empty">No shadow bets yet.</div>';
-    document.getElementById('shadow-stats').innerHTML = '';
-  } else {
-    const shSettled = shBets.filter(b => b.status === 'won' || b.status === 'lost');
-    const shWon  = shBets.filter(b => b.status === 'won').length;
-    const shLost = shBets.filter(b => b.status === 'lost').length;
-    const shWR   = sh.win_rate != null ? sh.win_rate.toFixed(1) + '%' : '—';
-    const wrColor = sh.win_rate != null ? (sh.win_rate >= 47 ? 'var(--green)' : sh.win_rate >= 43 ? '#e3a53a' : 'var(--red)') : 'var(--muted)';
-    document.getElementById('shadow-stats').innerHTML = `
-      <div style="display:flex;gap:16px;flex-wrap:wrap;padding:0 0 14px 0;font-size:13px;">
-        ${pill('Total', sh.total || 0)}
-        ${pill('Won', `<span style="color:var(--green)">${shWon}</span>`)}
-        ${pill('Lost', `<span style="color:var(--red)">${shLost}</span>`)}
-        ${pill('Open', sh.open || 0)}
-        ${pill('Win Rate', `<span style="color:${wrColor};font-weight:700;">${shWR}</span>`)}
-        ${pill('Avg Edge', sh.avg_edge != null ? '+' + sh.avg_edge + '%' : '—')}
-      </div>`;
-    const shRows = shBets.slice(0, 50).map(b => {
-      const ts = b.flagged_at ? new Date(b.flagged_at).toLocaleString('en-US',{month:'short',day:'numeric',hour:'numeric',minute:'2-digit'}) : '—';
-      const rClass = b.status === 'won' ? 'result-won' : b.status === 'lost' ? 'result-lost' : '';
-      const rLabel = b.status === 'won' ? '✓ WON' : b.status === 'lost' ? '✗ LOST' : '…';
-      const entryK = b.kalshi_price != null ? (b.kalshi_price * 100).toFixed(0) + '¢' : '—';
-      const pinE   = b.pin_prob_at_flag != null ? b.pin_prob_at_flag.toFixed(1) + '¢' : '—';
-      return `<tr>
-        <td>${ts}</td>
-        <td>${b.matchup || '—'}</td>
-        <td>${b.title || '—'}</td>
-        <td class="side-${(b.side||'').toLowerCase()}">${b.side || '—'}</td>
-        <td class="num">${b.edge_pct != null ? b.edge_pct + '%' : '—'}</td>
-        <td class="num">${entryK} <span style="font-size:10px;color:var(--muted);">Pin ${pinE}</span></td>
-        <td class="num ${rClass}">${rLabel}</td>
-        <td style="font-size:10px;color:var(--muted);">${b.shadow_reason || ''}</td>
-      </tr>`;
-    }).join('');
-    document.getElementById('shadow-body').innerHTML = `<table>
-      <thead><tr>
-        <th>Flagged</th><th>Matchup</th><th>Prop</th><th>Side</th>
-        <th class="num">Adj. EV</th><th class="num">Entry / Pin</th>
-        <th class="num">Result</th><th>Filter Reason</th>
-      </tr></thead>
-      <tbody>${shRows}</tbody>
-    </table>`;
-  }
 }
 
 
@@ -4554,13 +4439,6 @@ class Handler(BaseHTTPRequestHandler):
             # Show all bets newest-first so the running table is complete (not capped at 20)
             recent = sorted(paper_bets, key=lambda b: b.get("flagged_at",""), reverse=True)
 
-            # Shadow tracker — YES totals >8.5/>9.5 filtered from main
-            sh_bets   = [b for b in paper_bets if b.get("shadow") is True]
-            sh_won    = [b for b in sh_bets if b["status"] == "won"]
-            sh_lost   = [b for b in sh_bets if b["status"] == "lost"]
-            sh_open   = [b for b in sh_bets if b["status"] == "open"]
-            sh_settled = sh_won + sh_lost
-
             result = {
                 "balance":        balance,
                 "start_balance":  PAPER_START_BALANCE,
@@ -4576,15 +4454,6 @@ class Handler(BaseHTTPRequestHandler):
                 "win_rate":       win_rate,
                 "avg_stake":      avg_stake,
                 "bets":           recent,
-                "shadow": {
-                    "total":    len(sh_bets),
-                    "won":      len(sh_won),
-                    "lost":     len(sh_lost),
-                    "open":     len(sh_open),
-                    "win_rate": round(len(sh_won) / len(sh_settled) * 100, 1) if sh_settled else None,
-                    "avg_edge": round(sum(b.get("edge_pct",0) for b in sh_settled) / len(sh_settled), 1) if sh_settled else None,
-                    "bets":     sorted(sh_bets, key=lambda b: b.get("flagged_at",""), reverse=True),
-                },
             }
             self._send(200, "application/json", json.dumps(result).encode())
 

@@ -2765,6 +2765,73 @@ HTML = """<!DOCTYPE html>
   .badge-unvalidated { display:inline-block; font-size:9px; background:#2d200a; color:#e3a53a; padding:1px 5px; border-radius:3px; margin-left:5px; vertical-align:middle; letter-spacing:0.03em; }
   .badge-sharp { display:inline-block; font-size:9px; background:#0d2137; color:#58a6ff; border:1px solid #1f4e79; padding:1px 5px; border-radius:3px; margin-left:5px; vertical-align:middle; font-weight:700; letter-spacing:0.04em; }
   .exec-card-header { background:linear-gradient(90deg,#1a2637 0%,#161b22 100%); border-left:3px solid #58a6ff; }
+
+  /* ── Scanner status strip ───────────────────────────────────────────────── */
+  #status-strip {
+    display: flex;
+    align-items: center;
+    gap: 14px;
+    padding: 6px 14px;
+    background: #0d1117;
+    border: 1px solid var(--border);
+    border-radius: 7px;
+    margin-bottom: 8px;
+    flex-wrap: wrap;
+    font-size: 11px;
+    color: var(--muted);
+  }
+  .ss-item { display: flex; align-items: center; gap: 5px; white-space: nowrap; }
+  .ss-dot {
+    width: 7px; height: 7px;
+    border-radius: 50%;
+    flex-shrink: 0;
+    transition: background 0.4s;
+  }
+  .ss-green  { background: #3fb950; box-shadow: 0 0 5px #3fb95055; }
+  .ss-yellow { background: #e3a53a; box-shadow: 0 0 5px #e3a53a55; }
+  .ss-red    { background: #f85149; box-shadow: 0 0 5px #f8514955; }
+  .ss-muted  { background: #444; box-shadow: none; }
+
+  /* ── Market temperature gauge ───────────────────────────────────────────── */
+  #temp-wrap {
+    flex: 1;
+    min-width: 180px;
+    max-width: 320px;
+    display: flex;
+    align-items: center;
+    gap: 7px;
+  }
+  #temp-label { font-size: 10px; color: var(--muted); white-space: nowrap; }
+  #temp-track {
+    flex: 1;
+    height: 7px;
+    background: #21262d;
+    border: 1px solid #30363d;
+    border-radius: 4px;
+    position: relative;
+    overflow: hidden;
+  }
+  #temp-fill {
+    height: 100%;
+    border-radius: 4px;
+    transition: width 0.7s cubic-bezier(.4,0,.2,1), background 0.5s;
+  }
+  #temp-threshold {
+    position: absolute;
+    top: -1px; bottom: -1px;
+    width: 2px;
+    background: #3fb950cc;
+    border-radius: 1px;
+    pointer-events: none;
+  }
+  #temp-value {
+    font-size: 11px;
+    font-weight: 700;
+    white-space: nowrap;
+    min-width: 40px;
+    transition: color 0.4s;
+  }
+
   .clv-pos { color:#3fb950; font-weight:700; }
   .clv-neg { color:#f85149; font-weight:700; }
   .clv-neu { color:var(--muted); }
@@ -2790,6 +2857,29 @@ HTML = """<!DOCTYPE html>
     <button id="refresh" onclick="fetchData()">↻ Refresh</button>
   </div>
 </header>
+
+<div id="status-strip">
+  <div class="ss-item">
+    <span class="ss-dot ss-muted" id="ss-scan-dot"></span>
+    <span id="ss-scan-txt">Scan —</span>
+  </div>
+  <div class="ss-item">
+    <span class="ss-dot ss-muted" id="ss-pin-dot"></span>
+    <span id="ss-pin-txt">Pinnacle —</span>
+  </div>
+  <div class="ss-item">
+    <span class="ss-dot ss-muted" id="ss-games-dot"></span>
+    <span id="ss-games-txt">— games</span>
+  </div>
+  <div id="temp-wrap">
+    <span id="temp-label">Best market</span>
+    <div id="temp-track">
+      <div id="temp-fill"></div>
+      <div id="temp-threshold"></div>
+    </div>
+    <span id="temp-value" style="color:var(--muted);">—</span>
+  </div>
+</div>
 
 <div id="today-edges-card" class="card">
   <div class="card-header exec-card-header" onclick="toggleCard('today-edges-body')">📅 Today's Edges &nbsp;<span style="font-size:10px;color:var(--muted);font-weight:400;">all edges flagged today · live tracker updates every 2 min</span> <span class="card-toggle" id="today-edges-body-toggle">▾</span></div>
@@ -3263,6 +3353,95 @@ function renderAll() {
 
 let autoRefreshTimer = null;
 
+// ── Status strip + temperature gauge ─────────────────────────────────────────
+function updateStatusStrip(d) {
+  // ── Scan age ──────────────────────────────────────────────────────────────
+  const scanDot = document.getElementById('ss-scan-dot');
+  const scanTxt = document.getElementById('ss-scan-txt');
+  if (d.last_scan) {
+    const ageSec = Math.round((Date.now() - new Date(d.last_scan).getTime()) / 1000);
+    const ageMin = ageSec / 60;
+    scanTxt.textContent = ageSec < 60 ? `Scan ${ageSec}s ago` : `Scan ${ageMin.toFixed(1)}m ago`;
+    if      (ageMin <  3) { scanDot.className = 'ss-dot ss-green'; }
+    else if (ageMin <  6) { scanDot.className = 'ss-dot ss-yellow'; }
+    else                  { scanDot.className = 'ss-dot ss-red'; }
+  } else {
+    scanTxt.textContent = 'Scan —';
+    scanDot.className = 'ss-dot ss-muted';
+  }
+
+  // ── Pinnacle data age ─────────────────────────────────────────────────────
+  const pinDot = document.getElementById('ss-pin-dot');
+  const pinTxt = document.getElementById('ss-pin-txt');
+  const pinAge = d.odds_cache_success_age;   // seconds since last successful fetch
+  if (pinAge != null) {
+    const pinMin = Math.round(pinAge / 60);
+    pinTxt.textContent = pinMin < 1 ? 'Pinnacle <1m' : `Pinnacle ${pinMin}m old`;
+    if      (pinAge < 900)  { pinDot.className = 'ss-dot ss-green'; }   // < 15 min
+    else if (pinAge < 2100) { pinDot.className = 'ss-dot ss-yellow'; }  // < 35 min
+    else                    { pinDot.className = 'ss-dot ss-red'; }
+  } else {
+    pinTxt.textContent = 'Pinnacle —';
+    pinDot.className = 'ss-dot ss-muted';
+  }
+
+  // ── Game count ────────────────────────────────────────────────────────────
+  const gamesDot = document.getElementById('ss-games-dot');
+  const gamesTxt = document.getElementById('ss-games-txt');
+  const gc = d.odds_game_count;
+  if (gc != null) {
+    gamesTxt.textContent = `${gc} games`;
+    if      (gc >= 15) { gamesDot.className = 'ss-dot ss-green'; }
+    else if (gc >= 5)  { gamesDot.className = 'ss-dot ss-yellow'; }
+    else               { gamesDot.className = 'ss-dot ss-red'; }
+  } else {
+    gamesTxt.textContent = '— games';
+    gamesDot.className = 'ss-dot ss-muted';
+  }
+
+  // ── Temperature gauge ─────────────────────────────────────────────────────
+  // Range: -10% (cold) to +5% (well above threshold)
+  // Threshold marker sits at 3% = (3-(-10))/(5-(-10)) = 13/15 = 86.7% from left
+  const GAUGE_MIN  = -10;   // pp — leftmost (coldest)
+  const GAUGE_MAX  =   5;   // pp — rightmost (hottest)
+  const THRESHOLD  =   3;   // pp — where the green marker sits
+  const GAUGE_SPAN = GAUGE_MAX - GAUGE_MIN;
+
+  const fill  = document.getElementById('temp-fill');
+  const mark  = document.getElementById('temp-threshold');
+  const val   = document.getElementById('temp-value');
+
+  // Position the threshold marker (doesn't change, but set it once)
+  const threshPct = ((THRESHOLD - GAUGE_MIN) / GAUGE_SPAN) * 100;
+  mark.style.left = threshPct.toFixed(1) + '%';
+
+  const stats = d.last_scan_stats;
+  const best  = stats && stats.best_adj_pct != null ? stats.best_adj_pct : null;
+
+  if (best != null) {
+    const clamped  = Math.max(GAUGE_MIN, Math.min(GAUGE_MAX, best));
+    const fillPct  = ((clamped - GAUGE_MIN) / GAUGE_SPAN) * 100;
+    fill.style.width = fillPct.toFixed(1) + '%';
+
+    // Color the fill and value text
+    let fillColor, textColor;
+    if      (best >= THRESHOLD) { fillColor = '#3fb950'; textColor = '#3fb950'; }  // edge live — green
+    else if (best >= -1)        { fillColor = '#e3a53a'; textColor = '#e3a53a'; }  // warm — yellow
+    else if (best >= -4)        { fillColor = '#58a6ff'; textColor = '#58a6ff'; }  // cool — blue
+    else                        { fillColor = '#444';    textColor = 'var(--muted)'; }  // cold — grey
+
+    fill.style.background = fillColor;
+    val.style.color = textColor;
+    val.textContent = (best >= 0 ? '+' : '') + best.toFixed(1) + '%';
+    val.title = `Best market adj. edge this scan: ${best.toFixed(1)}% (threshold: ${THRESHOLD}%)`;
+  } else {
+    fill.style.width = '0%';
+    fill.style.background = '#444';
+    val.style.color = 'var(--muted)';
+    val.textContent = '—';
+  }
+}
+
 function scheduleRefresh(ms) {
   if (autoRefreshTimer) clearTimeout(autoRefreshTimer);
   nextRefresh = Date.now() + ms;
@@ -3293,6 +3472,9 @@ async function fetchData() {
     if (d.last_scan) {
       document.getElementById('last-scan').textContent = fmtDate(d.last_scan);
     }
+
+    // ── Status strip + temperature gauge ─────────────────────────────────────
+    updateStatusStrip(d);
 
     // While scanning: show spinner only if we have no data yet
     if (d.scanning) {

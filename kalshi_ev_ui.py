@@ -1123,7 +1123,7 @@ def _get_performance(since: Optional[str] = None) -> dict:
     for b in settled:
         label = _perf_label(b)
         if label not in by_type:
-            by_type[label] = {"won": 0, "lost": 0, "units": [], "kelly": []}
+            by_type[label] = {"won": 0, "lost": 0, "units": [], "kelly": [], "clv": []}
         kp = _kelly_pnl(b)
         if b["status"] == "won":
             by_type[label]["won"] += 1
@@ -1134,6 +1134,9 @@ def _get_performance(since: Optional[str] = None) -> dict:
             by_type[label]["units"].append(-1.0)
         if kp is not None:
             by_type[label]["kelly"].append(kp)
+        clv_val = b.get("clv")
+        if clv_val is not None:
+            by_type[label]["clv"].append(clv_val)
 
     MIN_SAMPLE = 20   # need at least 20 settled bets before win rate is meaningful
 
@@ -1145,6 +1148,8 @@ def _get_performance(since: Optional[str] = None) -> dict:
         kelly_pct_t = round(sum(d["kelly"]) * 100, 3) if d["kelly"] else None
         # Dollar amount for display alongside %, derived from pct × bankroll
         kelly_t    = round(sum(d["kelly"]) * PERF_BANKROLL, 2) if d["kelly"] else None
+        # Average CLV across all settled bets in this market type
+        avg_clv_t  = round(sum(d["clv"]) / len(d["clv"]), 2) if d["clv"] else None
         type_breakdown.append({
             "label":             label,
             "won":               d["won"],
@@ -1152,6 +1157,7 @@ def _get_performance(since: Optional[str] = None) -> dict:
             "win_rate":          wr_t,
             "kelly_pct":         kelly_pct_t,    # % of bankroll P&L
             "kelly_dollars":     kelly_t,
+            "avg_clv":           avg_clv_t,      # pp — positive = beating closing line
             "insufficient_data": total_t < MIN_SAMPLE,
             "sample_size":       total_t,
         })
@@ -4084,12 +4090,18 @@ function renderPerformance(d) {
       const kellyCell = kpct != null
         ? `<span class="${kcls}" title="$${t.kelly_dollars != null ? Math.abs(t.kelly_dollars).toFixed(0) : '?'} on $${bankroll} bank">${sign(kpct)}${kpct.toFixed(2)}%</span>`
         : '—';
+      const clv = t.avg_clv;
+      const clvCls = clv == null ? '' : clv > 0 ? 'pnl-pos' : clv < 0 ? 'pnl-neg' : '';
+      const clvCell = clv != null
+        ? `<span class="${clvCls}" title="Average closing-line value — positive means Kalshi moved in your favour after entry">${sign(clv)}${clv.toFixed(2)} pp</span>`
+        : '—';
       return `<tr>
         <td>${labelCell}</td>
         <td class="num pnl-pos">${t.won}</td>
         <td class="num pnl-neg">${t.lost}</td>
         <td class="num">${wrCell}</td>
         <td class="num">${kellyCell}</td>
+        <td class="num">${clvCell}</td>
       </tr>`;
     }).join('');
     _setHTML('perf-body', `
@@ -4098,6 +4110,7 @@ function renderPerformance(d) {
           <th>Market Type</th><th class="num">Won</th><th class="num">Lost</th>
           <th class="num">Win Rate</th>
           <th class="num" title="Kelly P&amp;L as % of bankroll (hover for dollar amount)">Kelly P&amp;L (% bank)</th>
+          <th class="num" title="Avg CLV — how much the market moved in your favour after entry (pp = percentage points). Positive = beating the closing line.">Avg CLV</th>
         </tr></thead>
         <tbody>${typeRows}</tbody>
       </table>`);

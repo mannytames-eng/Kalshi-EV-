@@ -78,33 +78,19 @@ def _et_hour() -> int:
 def _odds_refresh_interval() -> int:
     """Return seconds until next odds refresh based on current ET hour.
 
-    Measured credit costs (May 2026 — Pinnacle-only after DK/FD removal):
-      MLB odds call: 1 credit  |  NBA odds call: 1 credit
-      Props event call: 1 credit  |  Events list: 0 credits
+    Credit costs (MLB only — NBA removed 2026-05-16):
+      MLB odds call: 1 credit/refresh  |  Props: 1 credit/event
 
-    Normal budget at 12/30-min intervals:
-      Peak  (11h × 5/hr): 55 credits/day
-      Off   (13h × 2/hr): 26 credits/day
-      Total: ~81/day → ~2,511/month
-
-    CREDIT_CONSERVATION_MODE (active until June 1):
-      Peak  (11h × 2/hr at 30 min): 22 credits/day
-      Off   (13h × 1/hr at 60 min): 13 credits/day
-      Total: ~35/day → ~525 for 15 days  (well under 2,480 remaining)
-    Reset CREDIT_CONSERVATION_MODE = False on June 1 to restore 12-min peak.
+    Max-speed budget (2-min peak / 4-min off-peak):
+      Peak  (11h × 30/hr × 1): 330 credits/day  →  9,900/month
+      Off   (13h × 15/hr × 1): 195 credits/day  →  5,850/month
+      Props (4h interval, 10 events × 6/day):    →  1,800/month
+      Total: ~17,550/month  (12% under 20k; 18,075 in 31-day month)
     """
-    # ── Full-speed mode (10k credits granted 2026-05-16) ─────────────────────
-    CREDIT_CONSERVATION_MODE = False
-    if CREDIT_CONSERVATION_MODE:
-        et_hour = _et_hour()
-        if 11 <= et_hour < 22:
-            return 30 * 60   # 30 min peak (was 12) — saves ~33 credits/day
-        return 60 * 60       # 60 min off-peak (was 30) — saves ~13 credits/day
-    # ── Normal schedule ───────────────────────────────────────────────────────
     et_hour = _et_hour()
     if 11 <= et_hour < 22:   # 11 AM – 10 PM ET: game window
-        return 12 * 60       # 12 min peak
-    return 30 * 60           # overnight
+        return 2 * 60        # 2 min peak — maximum edge detection speed
+    return 4 * 60            # overnight — still fast, minimal credit cost
 REFRESH_SECONDS       = 2 * 60     # re-scan Kalshi every 2 min    (0 credits)
 # Monthly credit math (20k budget):
 #   Odds refresh : 2 × 144/day × 30 =  8,640
@@ -1448,7 +1434,7 @@ print(f"  Loaded {len(_alerted_keys)} previously alerted edge key(s) from disk")
 # period during game hours — indicates a silent data pipeline failure.
 _zero_edge_streak      = 0          # consecutive scans with no qualifying edges
 _last_props_scan: float = 0.0       # epoch seconds of last props scan
-PROPS_REFRESH_SECONDS  = 8 * 60 * 60   # MLB props: scan every 8h (credits restored May 1)
+PROPS_REFRESH_SECONDS  = 4 * 60 * 60   # MLB props: scan every 4h (max-speed mode 2026-05-16)
 _zero_edge_alerted     = False      # suppresses duplicate alerts per drought
 _ZERO_EDGE_ALERT_SCANS = 60         # 60 × 2-min scan = 2 hours of silence
 
@@ -1859,9 +1845,9 @@ def _send_odds_stale_alert(minutes: float) -> None:
 
 def _run_odds_refresh():
     """
-    Fetch fresh book odds (Pinnacle + DK + FanDuel) and update the cached indices.
-    Costs exactly 2 Odds API credits (1 per sport: MLB + NBA).
-    Runs every ODDS_REFRESH_SECONDS in a dedicated background thread.
+    Fetch fresh Pinnacle odds (MLB only — NBA removed) and update the cached index.
+    Costs exactly 1 Odds API credit per call.
+    Runs every _odds_refresh_interval() seconds: 2-min peak / 4-min off-peak.
     """
     global _cached_mlb_index, _cached_nba_index, _last_odds_refresh, \
            _last_odds_cache_success, _odds_game_count
@@ -1968,9 +1954,18 @@ def _run_scan():
         nba = []
         nba_stats = {}
 
-        # Player props disabled — pitcher strikeout lines move too much between flag and gametime
-        mlb_props = []
+        # Player props — MLB only, throttled to PROPS_REFRESH_SECONDS (4h)
+        global _last_props_scan
         now_ts = time.time()
+        if now_ts - _last_props_scan >= PROPS_REFRESH_SECONDS:
+            try:
+                mlb_props = scan_player_props(odds_sport="baseball_mlb", abbr_map=MLB_ABBR)
+            except Exception as _prop_exc:
+                print(f"  Props scan error: {_prop_exc}")
+                mlb_props = []
+            _last_props_scan = now_ts
+        else:
+            mlb_props = []
 
         all_edges = sorted(mlb + nba + mlb_props, key=lambda x: x["edge"], reverse=True)
 

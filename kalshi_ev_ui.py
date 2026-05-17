@@ -93,8 +93,8 @@ def _odds_refresh_interval() -> int:
       Total: ~35/day → ~525 for 15 days  (well under 2,480 remaining)
     Reset CREDIT_CONSERVATION_MODE = False on June 1 to restore 12-min peak.
     """
-    # ── Temporary credit conservation — remove June 1 ────────────────────────
-    CREDIT_CONSERVATION_MODE = True
+    # ── Full-speed mode (10k credits granted 2026-05-16) ─────────────────────
+    CREDIT_CONSERVATION_MODE = False
     if CREDIT_CONSERVATION_MODE:
         et_hour = _et_hour()
         if 11 <= et_hour < 22:

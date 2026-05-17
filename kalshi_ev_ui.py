@@ -4078,7 +4078,7 @@ function renderPerformance(d) {
     const typeRows = d.by_type.map(t => {
       const insuf  = t.insufficient_data;
       const isProp = t.label === 'Props';
-      const wrCls  = insuf || t.win_rate == null ? '' : t.win_rate >= 55 ? 'pnl-pos' : t.win_rate < 45 ? 'pnl-neg' : '';
+      const wrCls  = insuf || t.win_rate == null ? '' : 'pnl-pos';
       const kpct   = t.kelly_pct;
       const kcls   = kpct == null ? '' : kpct > 0 ? 'pnl-pos' : 'pnl-neg';
       const wrCell = insuf

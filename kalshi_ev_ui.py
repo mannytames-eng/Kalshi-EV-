@@ -190,6 +190,20 @@ def _load_bets() -> list:
         with open(BETS_FILE, "r") as f:
             return json.load(f)
     except (FileNotFoundError, json.JSONDecodeError):
+        # ── Volume migration: seed from repo copy on first boot ───────────────
+        # If DATA_DIR ≠ _SCRIPT_DIR (i.e. /data volume just mounted and empty),
+        # copy the repo's ev_bets.json into the volume so history is preserved.
+        _seed_path = os.path.join(_SCRIPT_DIR, "ev_bets.json")
+        if DATA_DIR != _SCRIPT_DIR and os.path.exists(_seed_path):
+            try:
+                with open(_seed_path, "r") as _sf:
+                    bets = json.load(_sf)
+                _save_bets(bets)
+                print(f"  Volume seed: copied {len(bets)} bets from repo → {BETS_FILE}")
+                return bets
+            except Exception as _seed_exc:
+                print(f"  Volume seed failed: {_seed_exc}")
+        # ── EV_BETS_SEED env var fallback (base64-encoded JSON) ───────────────
         seed = os.environ.get("EV_BETS_SEED")
         if seed:
             try:

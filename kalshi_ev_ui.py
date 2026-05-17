@@ -2887,15 +2887,6 @@ HTML = """<!DOCTYPE html>
   <div id="today-edges-body" class="card-body"><div class="empty">No edges found today yet.</div></div>
 </div>
 
-<div id="mlb-card" class="card">
-  <div class="card-header mlb" onclick="toggleCard('mlb-body')">⚾ MLB &nbsp;<span style="font-size:10px;color:var(--muted);font-weight:400;">spreads · totals · moneylines · sorted by edge strength</span> <span class="card-toggle" id="mlb-body-toggle">▾</span></div>
-  <div id="mlb-body" class="card-body"><div class="empty">No MLB edges ≥3% right now.</div></div>
-</div>
-
-<div id="nba-card" class="card">
-  <div class="card-header" style="border-left:3px solid #58a6ff;" onclick="toggleCard('nba-body')">🏀 NBA &nbsp;<span style="font-size:10px;color:var(--muted);font-weight:400;">spreads · totals · moneylines · sorted by edge strength</span> <span class="card-toggle" id="nba-body-toggle">▾</span></div>
-  <div id="nba-body" class="card-body"><div class="empty">No NBA edges ≥3% right now.</div></div>
-</div>
 
 
 <div id="paper-card" class="card">
@@ -2928,15 +2919,6 @@ HTML = """<!DOCTYPE html>
   </div>
 </div>
 
-<div id="mlb-spread-card" class="card">
-  <div class="card-header mlb" onclick="toggleCard('mlb-spread-body')">⚾ MLB — Run Line <span class="card-toggle" id="mlb-spread-body-toggle">▾</span></div>
-  <div id="mlb-spread-body" class="card-body card-mlb-spread"><div class="empty">No run line edges found. Scanning every 2 min.</div></div>
-</div>
-
-<div id="mlb-total-card" class="card">
-  <div class="card-header mlb" onclick="toggleCard('mlb-total-body')">⚾ MLB — Totals <span class="card-toggle" id="mlb-total-body-toggle">▾</span></div>
-  <div id="mlb-total-body" class="card-body card-mlb-total"><div class="empty">No totals edges found. Scanning every 2 min.</div></div>
-</div>
 
 
 
@@ -3342,12 +3324,7 @@ function sportOf(e) {
 }
 
 function renderAll() {
-  const mlbEdges = lastEdges.filter(e => sportOf(e) === 'mlb');
-  const nbaEdges = lastEdges.filter(e => sportOf(e) === 'nba');
-  _setHTML('mlb-body', renderTable(mlbEdges));
-  _setHTML('nba-body', renderTable(nbaEdges));
-
-  // Update tab title
+  // Update tab title with live edge count
   const count = lastEdges.length;
   document.title = count > 0 ? `(${count}) Kalshi EV Scanner` : 'Kalshi EV Scanner';
 }
@@ -3479,11 +3456,7 @@ async function fetchData() {
 
     // While scanning: show spinner only if we have no data yet
     if (d.scanning) {
-      if (!lastEdges.length) {
-        const scanning = '<div class="empty">Scanning...</div>';
-        ['mlb-body','nba-body']
-          .forEach(id => _setHTML(id, scanning));
-      }
+      // nothing to show while cold-start scanning — today-edges handles display
     } else {
       // Always update data and re-render
       prevEdgeKeys = new Set(lastEdges.map(edgeKey));

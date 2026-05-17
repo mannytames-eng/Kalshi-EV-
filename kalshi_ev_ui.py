@@ -4307,7 +4307,7 @@ async function fetchPaper() {
         <div style="font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:0.06em;margin-top:3px;">ROI on $${d.start_balance.toFixed(0)}</div>
       </div>
       <div style="background:var(--surface);padding:14px 16px;text-align:center;">
-        <div style="font-size:22px;font-weight:700;color:${d.win_rate != null ? (d.win_rate >= 55 ? 'var(--green)' : d.win_rate < 45 ? 'var(--red)' : 'var(--text)') : 'var(--muted)'};">${d.win_rate != null ? d.win_rate + '%' : '—'}</div>
+        <div style="font-size:22px;font-weight:700;color:${d.win_rate != null ? 'var(--green)' : 'var(--muted)'};">${d.win_rate != null ? d.win_rate + '%' : '—'}</div>
         <div style="font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:0.06em;margin-top:3px;">Win Rate (${settled} settled)</div>
       </div>
       <div style="background:var(--surface);padding:14px 16px;text-align:center;">

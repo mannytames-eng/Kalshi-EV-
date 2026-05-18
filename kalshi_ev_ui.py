@@ -229,6 +229,14 @@ def _save_bets(bets: list):
         _os.replace(tmp, BETS_FILE)
     except Exception as exc:
         print(f"  WARNING: could not save bets: {exc}")
+        # Fire a Discord alert once per session — silent disk failure = data loss on next restart
+        global _save_bets_alerted
+        if not _save_bets_alerted:
+            _save_bets_alerted = True
+            try:
+                send_discord(None, f"🚨 **Bet save failure** — `{exc}`\nBets are in memory but NOT persisting to disk. Data will be lost on next restart. Check Railway volume / disk space.")
+            except Exception:
+                pass
 
 _bets: list = _load_bets()
 _bets_lock = threading.RLock()   # reentrant — _add_new_bets holds this while calling _paper_kelly_stake → _compute_paper_balance
@@ -1466,6 +1474,9 @@ _ZERO_EDGE_ALERT_SCANS = 60         # 60 × 2-min scan = 2 hours of silence
 _scan_stale_alerted    = False      # suppresses duplicate stale alerts
 _SCAN_STALE_MINUTES    = 20         # minutes without a scan = hung thread (20 min allows for cold-start on Railway)
 _watchdog_last_tick: float = 0.0    # epoch seconds of last watchdog loop tick — exposed in /api/scan
+_BOOT_TIME: float      = time.time()  # process start time — used by watchdog cold-start check
+_cold_start_alerted    = False      # fires once if last_scan stays None >10 min during game hours
+_save_bets_alerted     = False      # fires once per session if _save_bets fails (disk/permission error)
 
 # ── Kalshi auth failure detector ──────────────────────────────────────────────
 _kalshi_auth_failed    = False      # set True on first 401; cleared on successful scan
@@ -4923,6 +4934,20 @@ if __name__ == "__main__":
                         stale_min = (now_utc - last_dt).total_seconds() / 60
                     except Exception:
                         pass
+
+                # ── Mode 3: cold-start failure — last_scan still None after 10 min ─
+                # Happens when the odds thread fails its very first fetch on boot.
+                # Scan thread keeps skipping ("cache cold") forever with no alert.
+                global _cold_start_alerted
+                uptime_min = (time.time() - _BOOT_TIME) / 60
+                if last_scan_iso is None and in_game_hours and uptime_min > 10:
+                    if not _cold_start_alerted:
+                        _cold_start_alerted = True
+                        print(f"  🚨 Cold-start failure — scanner has never completed a scan "
+                              f"({uptime_min:.0f} min uptime). Odds cache likely failed on boot.")
+                        _send_scan_stale_alert(uptime_min)
+                elif last_scan_iso is not None:
+                    _cold_start_alerted = False   # clear once first scan succeeds
 
                 if stale_min is not None and in_game_hours:
                     if stale_min >= _SCAN_STALE_MINUTES:

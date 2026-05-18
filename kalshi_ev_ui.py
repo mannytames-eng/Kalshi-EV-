@@ -81,16 +81,16 @@ def _odds_refresh_interval() -> int:
     Credit costs (MLB only — NBA removed 2026-05-16):
       MLB odds call: 1 credit/refresh  |  Props: 1 credit/event
 
-    Max-speed budget (2-min peak / 4-min off-peak):
-      Peak  (11h × 30/hr × 1): 330 credits/day  →  9,900/month
-      Off   (13h × 15/hr × 1): 195 credits/day  →  5,850/month
-      Props (4h interval, 10 events × 6/day):    →  1,800/month
-      Total: ~17,550/month  (12% under 20k; 18,075 in 31-day month)
+    Budget (2-min peak / 8-min off-peak — calibrated for 29k period ending June 1):
+      Peak  (11h × 30/hr × 1): 330 credits/day
+      Off   (13h × 7/hr  × 1):  91 credits/day
+      Props (4h interval, 10 events × 6/day):  48 credits/day
+      Total: ~469/day → 6,566 to June 1  (1,247 buffer on 7,813 remaining)
     """
     et_hour = _et_hour()
     if 11 <= et_hour < 22:   # 11 AM – 10 PM ET: game window
         return 2 * 60        # 2 min peak — maximum edge detection speed
-    return 4 * 60            # overnight — still fast, minimal credit cost
+    return 8 * 60            # overnight — no edges, conserve for June 1
 REFRESH_SECONDS       = 2 * 60     # re-scan Kalshi every 2 min    (0 credits)
 # Monthly credit math (20k budget):
 #   Odds refresh : 2 × 144/day × 30 =  8,640

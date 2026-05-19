@@ -3581,16 +3581,20 @@ function renderTodayEdges() {
     const inSnapshot = snap != null || live != null;
 
     // ── Cutoff price: max Kalshi price that preserves ≥3% edge ───────────
+    // curFair is already expressed from the perspective of the bet side:
+    //   YES bet → curFair = fair_yes     → max YES price = fair_yes - 0.03
+    //   NO  bet → curFair = 1-fair_yes   → max NO  price = (1-fair_yes) - 0.03
+    // Using the same formula (curFair - MIN_EDGE) is correct for both sides.
+    // Bug: the old code used (1 - curFair - MIN_EDGE) for NO, which substituted
+    // fair_yes back in — causing aboveCutoff to fire even on strong NO edges.
     const MIN_EDGE = 0.03;
     let cutoffLabel = null;
     let cutoffCents = null;
     if (curFair != null) {
-      if (b.side === 'YES') {
-        const maxYes = curFair - MIN_EDGE;
-        if (maxYes > 0 && maxYes < 1) { cutoffCents = maxYes; cutoffLabel = `YES ≤ ${kalshiToAmerican(maxYes)}`; }
-      } else {
-        const maxNo = 1 - curFair - MIN_EDGE;
-        if (maxNo > 0 && maxNo < 1)   { cutoffCents = maxNo;  cutoffLabel = `NO ≤ ${kalshiToAmerican(maxNo)}`; }
+      const maxPrice = curFair - MIN_EDGE;
+      if (maxPrice > 0 && maxPrice < 1) {
+        cutoffCents = maxPrice;
+        cutoffLabel = `${b.side} ≤ ${kalshiToAmerican(maxPrice)}`;
       }
     }
     const liveKalshiSide = curKalshi != null

@@ -1555,9 +1555,10 @@ def scan_sport(
             return []
 
     # ── 2. Kalshi markets ─────────────────────────────────────────────────
-    edges:      List[dict] = []
-    seen_edges: set        = set()
-    no_price_count         = 0
+    edges:           List[dict] = []
+    seen_edges:      set        = set()
+    market_snapshot: dict       = {}   # {ticker|side: {adj_edge, kalshi, fair}} — ALL markets, not just ≥3%
+    no_price_count              = 0
     city_lu = build_city_lookup(abbr_map)
     now_utc = datetime.now(timezone.utc)
 
@@ -1851,6 +1852,26 @@ def scan_sport(
                     _diag_best_adj = best_adj
                 if best_adj > 0:
                     _diag_edges_raw += 1   # count positive-EV markets before threshold filter
+
+                # ── Market snapshot: record current edge for BOTH sides ───────
+                # Used by Open Positions to show live value on existing bets even
+                # when below the 3% flag threshold.  Zero extra credits — we've
+                # already computed this data, we're just capturing it.
+                _snap_ticker = mkt.get("ticker", "")
+                if _snap_ticker:
+                    market_snapshot[f"{_snap_ticker}|YES"] = {
+                        "adj_edge": round(yes_adj, 4),
+                        "kalshi":   round(yes_ask, 4),
+                        "fair":     round(fair, 4),
+                        "edge_pct": round(yes_adj * 100, 1),
+                    }
+                    market_snapshot[f"{_snap_ticker}|NO"] = {
+                        "adj_edge": round(no_adj, 4),
+                        "kalshi":   round(1 - yes_bid, 4),
+                        "fair":     round(1 - fair, 4),
+                        "edge_pct": round(no_adj * 100, 1),
+                    }
+
                 # Log near-misses: markets within 5pp of threshold in either direction
                 _near_miss_gap = best_adj - EDGE_THRESHOLD  # negative = below threshold
                 if -0.05 < _near_miss_gap < 0:
@@ -2051,7 +2072,7 @@ def scan_sport(
         "edges_final":    len(edges),
         "best_adj_pct":   round(_diag_best_adj * 100, 1) if _diag_best_adj > -999 else None,
     }
-    return edges, scan_stats
+    return edges, scan_stats, market_snapshot
 
 
 # ── Player-props helpers ──────────────────────────────────────────────────────

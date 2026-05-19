@@ -119,6 +119,7 @@ _state   = {
     "scanning":        False,
     "error":           None,
     "last_scan_stats": None,   # diagnostic counters from last scan_sport call
+    "market_snapshot": {},     # {ticker|side: {adj_edge, kalshi, fair, edge_pct}} — all scanned markets
 }
 
 # Tracks first-seen and last-seen YES price for each edge key (for staleness + CLV)
@@ -1970,7 +1971,7 @@ def _run_scan():
             return
 
         # MLB spreads + totals — ML removed (not used); NBA removed entirely for credit conservation
-        mlb, mlb_stats = scan_sport(
+        mlb, mlb_stats, mlb_snapshot = scan_sport(
             label="MLB — Spread & Totals",
             spread_series="KXMLBSPREAD",
             total_series="KXMLBTOTAL",
@@ -2132,10 +2133,11 @@ def _run_scan():
         _save_history(_history)
 
         with _lock:
-            _state["edges"]          = edges
-            _state["last_scan"]      = now_iso
-            _state["scanning"]       = False
+            _state["edges"]           = edges
+            _state["last_scan"]       = now_iso
+            _state["scanning"]        = False
             _state["last_scan_stats"] = mlb_stats   # diagnostic counters for /api/scan
+            _state["market_snapshot"] = mlb_snapshot  # all processed markets, not just ≥3%
 
         # Log new bets and capture what was just added for the alert
         newly_logged = _add_new_bets(edges)
@@ -2983,10 +2985,11 @@ HTML = """<!DOCTYPE html>
 <script>
 const REFRESH_MS = """ + str(REFRESH_SECONDS * 1000) + """;
 let nextRefresh = Date.now() + REFRESH_MS;
-let lastEdges      = [];   // MLB spreads/totals
-let prevEdgeKeys = new Set();
-let _roiPoints = null;
-let clvMultipliers = {};   // {"prop": 0.5, "spread": 1.0, …} — set by fetchPerformance()
+let lastEdges        = [];   // MLB spreads/totals
+let marketSnapshot   = {};   // {ticker|side: {adj_edge, kalshi, fair, edge_pct}} — all scanned markets
+let prevEdgeKeys     = new Set();
+let _roiPoints       = null;
+let clvMultipliers   = {};   // {"prop": 0.5, "spread": 1.0, …} — set by fetchPerformance()
 
 let _slowRefreshCounter = 0;  // perf+history refresh every 3 scan cycles
 
@@ -3486,7 +3489,8 @@ async function fetchData() {
     } else {
       // Always update data and re-render
       prevEdgeKeys = new Set(lastEdges.map(edgeKey));
-      lastEdges = d.edges || [];
+      lastEdges      = d.edges || [];
+      marketSnapshot = d.market_snapshot || {};
       renderAll();
       try { renderTodayEdges(); } catch(e) { console.error('renderTodayEdges (poll) threw', e); }
 
@@ -3551,7 +3555,7 @@ function renderTodayEdges() {
     return;
   }
 
-  // Build live lookup: ticker|side -> live edge object
+  // Build live lookup: ticker|side -> live edge object (≥3% only)
   const liveMap = {};
   for (const e of lastEdges) {
     liveMap[e.ticker + '|' + e.side] = e;
@@ -3559,81 +3563,72 @@ function renderTodayEdges() {
 
   const rows = [...todayEdgesList].reverse().map(b => {
     const key  = b.ticker + '|' + b.side;
-    const live = liveMap[key];
-    const isActive = !!live;
+    const live = liveMap[key];           // present only if ≥3% in last scan
+    const snap = marketSnapshot[key];    // present for ANY market scanned this cycle
 
-    // ── Bet recommendation ─────────────────────────────────────────────────
-    // The key insight: live.edge_pct is from the last scan (up to 12 min old).
-    // Kalshi can move significantly in that window. Instead of trusting the
-    // stale edge number alone, we compute a CUTOFF PRICE from the Pinnacle
-    // fair value — the max Kalshi price at which this bet still has ≥3% edge.
-    // The user checks the live Kalshi price against the cutoff and decides.
-    //
-    // Cutoff math (fair = Pinnacle no-vig prob, 0-1 scale):
-    //   YES bet: edge = fair - kalshi_yes  ≥ 0.03  →  max YES = fair - 0.03
-    //   NO  bet: edge = kalshi_yes - fair  ≥ 0.03  →  max NO  = 1 - (fair + 0.03)
+    // ── Resolve current edge from best available source ───────────────────
+    // Priority: live (full edge obj) > snapshot (all scanned) > nothing (PASS)
+    const curEdgePct = live != null
+      ? (live.edge_pct != null ? live.edge_pct : 0)
+      : (snap != null ? snap.edge_pct : null);
+    const curFair    = live != null ? live.fair
+                     : snap != null ? snap.fair : null;
+    const curKalshi  = live != null ? live.kalshi
+                     : snap != null ? snap.kalshi : null;
+    const inSnapshot = snap != null || live != null;
+
+    // ── Cutoff price: max Kalshi price that preserves ≥3% edge ───────────
     const MIN_EDGE = 0.03;
-    let cutoffLabel = null;   // "YES ≤ -109" or "NO ≤ +115"
-    let cutoffCents = null;   // raw 0-1 cutoff price for the side being bet
-    if (isActive && live.fair != null) {
-      const fair = live.fair;  // 0-1
+    let cutoffLabel = null;
+    let cutoffCents = null;
+    if (curFair != null) {
       if (b.side === 'YES') {
-        const maxYes = fair - MIN_EDGE;
-        if (maxYes > 0 && maxYes < 1) {
-          cutoffCents = maxYes;
-          cutoffLabel = `YES ≤ ${kalshiToAmerican(maxYes)}`;
-        }
+        const maxYes = curFair - MIN_EDGE;
+        if (maxYes > 0 && maxYes < 1) { cutoffCents = maxYes; cutoffLabel = `YES ≤ ${kalshiToAmerican(maxYes)}`; }
       } else {
-        const maxNo = 1 - fair - MIN_EDGE;
-        if (maxNo > 0 && maxNo < 1) {
-          cutoffCents = maxNo;
-          cutoffLabel = `NO ≤ ${kalshiToAmerican(maxNo)}`;
-        }
+        const maxNo = 1 - curFair - MIN_EDGE;
+        if (maxNo > 0 && maxNo < 1)   { cutoffCents = maxNo;  cutoffLabel = `NO ≤ ${kalshiToAmerican(maxNo)}`; }
       }
     }
-    // Current Kalshi price for the side being bet (to compare against cutoff)
-    const liveKalshiSide = isActive && live.kalshi != null
-      ? (b.side === 'YES' ? live.kalshi : 1 - live.kalshi)
+    const liveKalshiSide = curKalshi != null
+      ? (b.side === 'YES' ? curKalshi : curKalshi)   // snapshot already stores the bet-side price
       : null;
-    // Is the last-scan price already above the cutoff? If so the edge is gone
-    // even in the scan data — forces PASS regardless of reported edge_pct.
     const aboveCutoff = cutoffCents != null && liveKalshiSide != null
-      && liveKalshiSide > cutoffCents + 0.005;  // 0.5¢ tolerance for rounding
+      && liveKalshiSide > cutoffCents + 0.005;
 
     let recLabel, recColor, recTip;
-    if (!isActive) {
+    const drift    = live != null && live.drift_pct != null ? live.drift_pct : 0;
+    const driftBad = drift <= -3;
+
+    if (!inSnapshot) {
+      // Not in scan at all — Pinnacle offline or market closed
       recLabel = 'PASS';
       recColor = 'var(--muted)';
-      recTip   = 'Edge no longer detected in latest scan — line corrected or market closed';
+      recTip   = 'Market not found in latest scan — Pinnacle data unavailable or Kalshi market closed';
+    } else if (curEdgePct === null || curEdgePct <= 0 || aboveCutoff) {
+      recLabel = 'PASS';
+      recColor = '#f85149';
+      recTip   = aboveCutoff && cutoffLabel
+        ? `Kalshi price above cutoff for 3% edge (${cutoffLabel}). Current edge: ${curEdgePct != null ? curEdgePct.toFixed(1) : '—'}%. Line has moved — do not bet.`
+        : `Edge gone — current edge ${curEdgePct != null ? curEdgePct.toFixed(1) : '—'}% (was +${b.edge_pct}% at flag). Kalshi corrected.`;
+    } else if (curEdgePct < 3.0) {
+      recLabel = `WEAK +${curEdgePct.toFixed(1)}%`;
+      recColor = '#e3a53a';
+      recTip   = `Edge compressed to +${curEdgePct.toFixed(1)}% — below the 3% threshold. Was +${b.edge_pct}% at flag. Not worth the fee risk.`;
+    } else if (driftBad) {
+      recLabel = cutoffLabel ? `BET if ${cutoffLabel}` : `BET +${curEdgePct.toFixed(1)}%`;
+      recColor = '#e3a53a';
+      recTip   = `Kalshi drifted ${Math.abs(drift).toFixed(1)}pp since flagged. Edge still +${curEdgePct.toFixed(1)}% but verify live price first.`;
     } else {
-      const curEdge  = live.edge_pct != null ? live.edge_pct : 0;
-      const drift    = live.drift_pct != null ? live.drift_pct : 0;
-      const driftBad = drift <= -3;
-      if (curEdge <= 0 || aboveCutoff) {
-        recLabel = 'PASS';
-        recColor = '#f85149';
-        recTip   = aboveCutoff && cutoffLabel
-          ? `Kalshi price is above the cutoff for 3% edge (${cutoffLabel}). Last-scan edge: +${curEdge.toFixed(1)}%. Line has moved — do not bet.`
-          : `Edge gone — current edge ${curEdge.toFixed(1)}% (was +${b.edge_pct}% at flag). Kalshi corrected.`;
-      } else if (curEdge < 3.0) {
-        recLabel = 'WEAK';
-        recColor = '#e3a53a';
-        recTip   = `Edge compressed to +${curEdge.toFixed(1)}% — below the 3% threshold. Was +${b.edge_pct}% at flag.`;
-      } else if (driftBad) {
-        recLabel = 'VERIFY';
-        recColor = '#e3a53a';
-        recTip   = `Kalshi drifted ${Math.abs(drift).toFixed(1)}pp since flagged. Last-scan edge still +${curEdge.toFixed(1)}% but verify live price first.`;
-      } else {
-        recLabel = cutoffLabel ? `BET if ${cutoffLabel}` : 'BET';
-        recColor = '#3fb950';
-        recTip   = cutoffLabel
-          ? `Last-scan edge +${curEdge.toFixed(1)}%. Scan prices can be up to 12 min old — check Kalshi live before placing. Edge only exists while ${cutoffLabel}.`
-          : `Edge +${curEdge.toFixed(1)}% in latest scan. Always verify live price on Kalshi before placing.`;
-      }
+      recLabel = cutoffLabel ? `BET if ${cutoffLabel}` : `BET +${curEdgePct.toFixed(1)}%`;
+      recColor = '#3fb950';
+      recTip   = cutoffLabel
+        ? `Current edge +${curEdgePct.toFixed(1)}%. Scan prices up to 2 min old — edge holds while ${cutoffLabel}.`
+        : `Current edge +${curEdgePct.toFixed(1)}%. Always verify live price on Kalshi before placing.`;
     }
     const recBadge = `<span style="font-weight:700;font-size:12px;color:${recColor};" title="${recTip}">${recLabel}</span>`;
 
-    const driftTxt = isActive && live.drift_pct != null && live.drift_pct !== 0
+    const driftTxt = live != null && live.drift_pct != null && live.drift_pct !== 0
       ? `<span class="badge-drift">(${live.drift_pct > 0 ? '+' : ''}${live.drift_pct}%)</span>` : '';
 
     // ── American odds at flag time ──────────────────────────────────────────
@@ -3645,10 +3640,11 @@ function renderTodayEdges() {
     </span>`;
 
     // ── Current American odds (from last scan — up to 2 min old) ─────────────
-    const curKalshiAmer = isActive && live.kalshi != null ? kalshiToAmerican(live.kalshi) : null;
-    const curFairAmer   = isActive && live.fair   != null ? probToAmerican(live.fair)      : null;
-    const lastScanEdge = isActive
-      ? `<span style="color:${edgeColor(live.edge_pct)};font-weight:700;">${live.edge_pct > 0 ? '+' : ''}${pct(live.edge_pct)}</span>
+    // Use live (full edge obj) if available, else fall back to snapshot
+    const curKalshiAmer = curKalshi != null ? kalshiToAmerican(curKalshi) : null;
+    const curFairAmer   = curFair   != null ? probToAmerican(curFair)     : null;
+    const lastScanEdge = inSnapshot && curEdgePct != null
+      ? `<span style="color:${edgeColor(curEdgePct)};font-weight:700;">${curEdgePct > 0 ? '+' : ''}${pct(curEdgePct)}</span>
          <span style="font-size:10px;color:var(--muted);display:block;margin-top:2px;">
            Kalshi <span style="color:var(--text);">${curKalshiAmer || '—'}</span>
            &nbsp;·&nbsp; Fair <span style="color:var(--text);">${curFairAmer || '—'}</span>

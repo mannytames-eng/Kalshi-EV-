@@ -239,6 +239,7 @@ def _save_bets(bets: list):
                 pass
 
 _bets: list = _load_bets()
+print(f"  Bet store loaded: {len(_bets)} bets from {BETS_FILE}")
 _bets_lock = threading.RLock()   # reentrant — _add_new_bets holds this while calling _paper_kelly_stake → _compute_paper_balance
 
 # --- One-time backfill: ensure every bet has closing_yes_pct, closing_pin_pct, clv, clv_source ---
@@ -3487,7 +3488,7 @@ async function fetchData() {
       prevEdgeKeys = new Set(lastEdges.map(edgeKey));
       lastEdges = d.edges || [];
       renderAll();
-      renderTodayEdges();
+      try { renderTodayEdges(); } catch(e) { console.error('renderTodayEdges (poll) threw', e); }
 
       // History + perf + today edges: first load always, then every 3 cycles
       _slowRefreshCounter++;
@@ -3534,9 +3535,12 @@ let todayEdgesList = [];
 async function fetchTodayEdges() {
   try {
     const r = await fetch('/api/today_edges');
+    if (!r.ok) throw new Error(`today_edges HTTP ${r.status}`);
     todayEdgesList = await r.json();
   } catch(e) { console.error('today_edges fetch failed', e); }
-  renderTodayEdges();
+  try {
+    renderTodayEdges();
+  } catch(e) { console.error('renderTodayEdges threw', e); }
 }
 
 function renderTodayEdges() {
@@ -4599,8 +4603,14 @@ class Handler(BaseHTTPRequestHandler):
         elif path == "/api/today_edges":
             today = datetime.now(timezone.utc).date().isoformat()
             with _bets_lock:
+                total_bets = len(_bets)
                 today_bets = [b for b in _bets if b.get("flagged_at", "")[:10] == today]
-            payload = json.dumps(today_bets).encode()
+            print(f"  /api/today_edges: today={today}, total_bets={total_bets}, found={len(today_bets)}")
+            try:
+                payload = json.dumps(today_bets).encode()
+            except Exception as _je:
+                print(f"  /api/today_edges JSON error: {_je}")
+                payload = b"[]"
             self._send(200, "application/json", payload)
 
         elif path == "/api/performance":

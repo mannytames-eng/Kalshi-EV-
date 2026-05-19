@@ -567,6 +567,8 @@ def _add_new_bets(edges: list) -> list:
             bid = _bet_id(e["ticker"], e["side"])
             if bid in existing_ids:
                 continue   # exact same market already logged
+            if bid in _bad_match_ids:
+                continue   # permanently suppressed ghost/bad-match edge — never re-flag
             existing_ids.add(bid)   # prevent same ticker appearing twice in one cycle
 
             game_date = _parse_ticker_date(e.get("ticker", ""))

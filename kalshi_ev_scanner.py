@@ -389,6 +389,7 @@ MIN_PRICE      = 0.12   # mid below 12% → likely in-game (pre-game markets rar
 MAX_PRICE      = 0.88   # mid above 88% → likely in-game
 PROP_MIN_PRICE = 0.08
 PROP_MAX_PRICE = 0.92
+PROP_MAX_EDGE  = 0.15   # props above 15% adj edge are almost certainly a line mismatch — cap separately from game-line MAX_EDGE
 
 
 def kalshi_prices(mkt: dict) -> Optional[Tuple[float, float]]:
@@ -2384,15 +2385,38 @@ def scan_player_props(
         if matched is None:
             continue
 
-        # Require Pinnacle's line to match the Kalshi threshold within 0.1 units.
-        # Stricter than the old 0.5 tolerance — strikeout props showed fake edges
-        # when Pinnacle "over 4.5" was matched to Kalshi "6+" (floor_strike=5).
-        # The Poisson extrapolation over 1 full integer is too noisy to trust:
-        # P(X≥5)=55% extrapolated to P(X≥6)=35% looked like a 17% edge against
-        # a Kalshi "6+" price of 18¢.  Require a near-exact line match instead.
-        # Valid pairs: Pinnacle "over 5.5" (line=5.5) → Kalshi floor_strike=5 (= X>5 = X≥6).
-        if abs(matched["line"] - kp["threshold"]) > 0.1:
+        # ── Ghost-edge safeguard: integer boundary check ─────────────────────
+        # Pinnacle uses half-integer lines (4.5, 5.5, 6.5 …).
+        # Kalshi stores integer floor_strikes (5, 6, 7 …) where floor_strike=k
+        # means the market resolves YES if the stat is ≥ k+1 (i.e. > k, i.e. ≥ k+1).
+        # A Pinnacle "over 5.5" line has int(5.5)=5, which matches Kalshi floor_strike=5.
+        # A Pinnacle "over 4.5" line has int(4.5)=4, which does NOT match floor_strike=5.
+        # The old 0.5 raw-diff tolerance allowed int(4.5)=4 → floor_strike=5 through
+        # because abs(4.5-5.0)=0.5 ≤ 0.5. That caused the Canning ghost edge:
+        # Pinnacle "over 4.5 Ks" (P(X≥5)) matched to Kalshi "6+" (P(X≥6)), giving a
+        # fake 8.9% edge. The integer boundary check is the correct gate: int(line)
+        # must equal int(threshold). abs(5.5-5.0)=0.5 would have passed the old check
+        # too, but int(5.5)=5 == int(5.0)=5 is the right semantic test.
+        pin_line      = matched["line"]
+        kalshi_thresh = kp["threshold"]
+        if int(pin_line) != int(kalshi_thresh):
+            print(
+                f"  ✗ prop  {matched.get('player','?'):<25} REJECTED — line mismatch  "
+                f"pin={pin_line} (int={int(pin_line)})  kalshi_thresh={kalshi_thresh} (int={int(kalshi_thresh)})"
+            )
             continue
+        # Also catch any remaining large absolute differences (>0.6) as an extra
+        # belt-and-suspenders guard in case a book uses full-integer lines.
+        if abs(pin_line - kalshi_thresh) > 0.6:
+            print(
+                f"  ✗ prop  {matched.get('player','?'):<25} REJECTED — abs line diff too large  "
+                f"pin={pin_line}  kalshi_thresh={kalshi_thresh}  diff={abs(pin_line - kalshi_thresh):.2f}"
+            )
+            continue
+        print(
+            f"  → prop line match  {matched.get('player','?'):<25} "
+            f"pin={pin_line}  kalshi_thresh={kalshi_thresh}  (int boundary: {int(pin_line)}=={int(kalshi_thresh)})"
+        )
 
         lam       = matched["lambda"]
         threshold = kp["threshold"]
@@ -2413,7 +2437,10 @@ def scan_player_props(
         best_adj = max(yes_adj, no_adj)
         if best_adj < EDGE_THRESHOLD:
             continue
-        if best_adj > MAX_EDGE:
+        if best_adj > PROP_MAX_EDGE:   # 15% cap — tighter than game-line MAX_EDGE (20%); very large prop edges are almost always a mismatch
+            print(
+                f"  ✗ prop  {matched.get('player','?'):<25} REJECTED — adj edge {best_adj:.1%} > PROP_MAX_EDGE {PROP_MAX_EDGE:.0%}"
+            )
             continue
 
         if yes_adj >= no_adj:

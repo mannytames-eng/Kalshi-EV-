@@ -2384,13 +2384,14 @@ def scan_player_props(
         if matched is None:
             continue
 
-        # Reject if Kalshi threshold differs from reference line by > 0.5.
-        # Note: this tolerance controls a Poisson extrapolation — the lambda is
-        # derived from Pinnacle's line, then evaluated at the Kalshi threshold.
-        # A 0.5-unit gap (e.g. Pinnacle 6.5 → Kalshi 7.0) changes the outcome
-        # bucket by one integer step (P(X≥7) → P(X≥8)), which can meaningfully
-        # mis-state fair value.  Keep this tight; loosen only with evidence.
-        if abs(matched["line"] - kp["threshold"]) > 0.5:
+        # Require Pinnacle's line to match the Kalshi threshold within 0.1 units.
+        # Stricter than the old 0.5 tolerance — strikeout props showed fake edges
+        # when Pinnacle "over 4.5" was matched to Kalshi "6+" (floor_strike=5).
+        # The Poisson extrapolation over 1 full integer is too noisy to trust:
+        # P(X≥5)=55% extrapolated to P(X≥6)=35% looked like a 17% edge against
+        # a Kalshi "6+" price of 18¢.  Require a near-exact line match instead.
+        # Valid pairs: Pinnacle "over 5.5" (line=5.5) → Kalshi floor_strike=5 (= X>5 = X≥6).
+        if abs(matched["line"] - kp["threshold"]) > 0.1:
             continue
 
         lam       = matched["lambda"]

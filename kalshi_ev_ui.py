@@ -2909,8 +2909,8 @@ HTML = """<!DOCTYPE html>
 </div>
 
 <div id="today-edges-card" class="card">
-  <div class="card-header exec-card-header" onclick="toggleCard('today-edges-body')">📅 Today's Edges &nbsp;<span style="font-size:10px;color:var(--muted);font-weight:400;">all edges flagged today · live tracker updates every 2 min</span> <span class="card-toggle" id="today-edges-body-toggle">▾</span></div>
-  <div id="today-edges-body" class="card-body"><div class="empty">No edges found today yet.</div></div>
+  <div class="card-header exec-card-header" onclick="toggleCard('today-edges-body')">📋 Open Positions &nbsp;<span style="font-size:10px;color:var(--muted);font-weight:400;">all open bets · updates every 2 min</span> <span class="card-toggle" id="today-edges-body-toggle">▾</span></div>
+  <div id="today-edges-body" class="card-body"><div class="empty">No open positions.</div></div>
 </div>
 
 
@@ -3547,7 +3547,7 @@ function renderTodayEdges() {
   const el = document.getElementById('today-edges-body');
   if (!el) return;
   if (!todayEdgesList.length) {
-    el.innerHTML = '<div class="empty">No edges found today yet. Scanning every 2 min.</div>';
+    el.innerHTML = '<div class="empty">No open positions. Edges will appear here when flagged.</div>';
     return;
   }
 
@@ -4601,13 +4601,19 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, "application/json", json.dumps(points).encode())
 
         elif path == "/api/today_edges":
-            today = datetime.now(timezone.utc).date().isoformat()
+            # Return all open bets (game not yet started), sorted newest-first.
+            # Renamed from "today_edges" — shows active positions regardless of when flagged.
+            now_iso = datetime.now(timezone.utc).isoformat()
             with _bets_lock:
-                total_bets = len(_bets)
-                today_bets = [b for b in _bets if b.get("flagged_at", "")[:10] == today]
-            print(f"  /api/today_edges: today={today}, total_bets={total_bets}, found={len(today_bets)}")
+                open_bets = [
+                    b for b in _bets
+                    if b.get("status") == "open"
+                    and b.get("paper_stake") is not None
+                ]
+            open_bets.sort(key=lambda b: b.get("flagged_at", ""), reverse=True)
+            print(f"  /api/today_edges: found {len(open_bets)} open positions")
             try:
-                payload = json.dumps(today_bets).encode()
+                payload = json.dumps(open_bets).encode()
             except Exception as _je:
                 print(f"  /api/today_edges JSON error: {_je}")
                 payload = b"[]"

@@ -860,17 +860,23 @@ def build_consensus_game_index(
 
         # Skip games that have already commenced
         ct_str = game.get("commence_time", "")
+        game_date = ""
         if ct_str:
             try:
                 ct = datetime.fromisoformat(ct_str.replace("Z", "+00:00"))
                 if ct < datetime.now(timezone.utc):
                     continue
+                # Index by ET date, not UTC date.  Kalshi tickers encode dates in ET,
+                # so the index key must also use ET to prevent consecutive-day collisions.
+                # Example: LAD@SD 9:40pm ET May 19 = 1:40am UTC May 20 → without this
+                # fix, it's indexed as 2026-05-20 and matches Kalshi's May 20 ticker.
+                et_offset = timedelta(hours=(4 if 4 <= ct.month <= 10 else 5))
+                game_date = (ct - et_offset).strftime("%Y-%m-%d")
             except ValueError:
                 pass
 
         # Key by team+date to handle doubleheaders / same-day games.
         # Also store a bare-team fallback for any code that doesn't have the date.
-        game_date = ct_str[:10] if ct_str else ""  # YYYY-MM-DD or ""
         info["_game_date"] = game_date   # embed date so _find_game can cross-check
         for team in [home, away]:
             nteam = _norm(team)

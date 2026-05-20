@@ -4451,11 +4451,12 @@ async function fetchPaper() {
     // ── Bet table ──────────────────────────────────────────────────────────
     if (d.bets && d.bets.length) {
       const PAPER_PREVIEW = 15;
-      const allBets = d.bets;
+      const allBets     = d.bets.filter(b => b.clv_source !== 'corrupted_utc');
+      const corruptBets = d.bets.filter(b => b.clv_source === 'corrupted_utc');
       const showAll = window._paperShowAll || false;
       const visibleBets = showAll ? allBets : allBets.slice(0, PAPER_PREVIEW);
-      let rows = '';
-      for (const b of visibleBets) {
+
+      const renderPaperRow = (b) => {
         const stake = b.paper_stake != null ? '$' + b.paper_stake.toFixed(2) : '—';
         let pnlCell = '—';
         if (b.paper_pnl != null) {
@@ -4478,7 +4479,7 @@ async function fetchPaper() {
           valCell = `<span style="color:#3fb950;font-weight:700;" title="Value locked at entry: Pinnacle priced this side at ${b.pin_prob_at_flag.toFixed(1)}%, you paid ${(b.kalshi_price*100).toFixed(1)}¢ on Kalshi → +${val.toFixed(1)}pp value">+${val.toFixed(1)}pp</span>`;
         }
 
-        rows += `<tr>
+        return `<tr style="${b.clv_source === 'corrupted_utc' ? 'opacity:0.55;' : ''}">
           <td style="color:var(--muted);font-size:11px;">${flagDate}</td>
           <td class="matchup-inline">${matchupHtml(b.matchup)}</td>
           <td style="font-size:12px;max-width:200px;">${b.title}</td>
@@ -4489,16 +4490,18 @@ async function fetchPaper() {
           <td class="num">${pnlCell}</td>
           <td style="color:${statusColor};font-weight:700;text-align:center;">${statusLabel}</td>
         </tr>`;
-      }
-      html += `<table style="font-size:12px;">
+      };
+
+      const tableHead = `<table style="font-size:12px;">
         <thead><tr>
           <th>Date</th><th>Matchup</th><th>Bet</th><th>Side</th>
           <th class="num">Adj. EV</th>
           <th class="num" title="Value locked at entry = Pinnacle probability at flag − Kalshi price. Always positive when the edge was real. This is the value you captured when you placed the bet.">Value @ Entry</th>
           <th class="num">Kelly Stake</th><th class="num">P&amp;L</th><th>Result</th>
-        </tr></thead>
-        <tbody>${rows}</tbody>
-      </table>`;
+        </tr></thead>`;
+
+      html += tableHead + `<tbody>${visibleBets.map(renderPaperRow).join('')}</tbody></table>`;
+
       if (!showAll && allBets.length > PAPER_PREVIEW) {
         html += `<div style="text-align:center;padding:10px;">
           <button onclick="window._paperShowAll=true;fetchPaper();" style="background:var(--bg2);color:var(--accent);border:1px solid var(--border);border-radius:6px;padding:6px 20px;cursor:pointer;font-size:12px;font-weight:600;">
@@ -4511,6 +4514,13 @@ async function fetchPaper() {
             Show recent only
           </button>
         </div>`;
+      }
+
+      if (corruptBets.length) {
+        html += `<div style="margin-top:18px;border-top:1px solid var(--border);padding-top:10px;">
+          <div style="font-size:11px;color:#8b949e;margin-bottom:6px;">
+            ⚠ ${corruptBets.length} corrupted bets — wrong Pinnacle reference (UTC/ET date collision, fixed May 2026). Excluded from all stats and P&amp;L above.
+          </div>` + tableHead + `<tbody>${corruptBets.map(renderPaperRow).join('')}</tbody></table></div>`;
       }
     } else {
       html += '<div class="empty" style="padding:16px;">No paper trades yet. Every edge ≥3% flagged from ' + d.start_date + ' is automatically sized and tracked here.</div>';
@@ -4760,8 +4770,12 @@ class Handler(BaseHTTPRequestHandler):
             roi_pct     = round(total_pnl / PAPER_START_BALANCE * 100, 2)
             win_rate    = round(len(won_bets) / len(settled) * 100, 1) if settled else None
             avg_stake   = round(sum(b["paper_stake"] for b in paper_bets) / len(paper_bets), 2) if paper_bets else None
-            # Show all bets newest-first so the running table is complete (not capped at 20)
-            recent = sorted(paper_bets, key=lambda b: b.get("flagged_at",""), reverse=True)
+            # Clean bets newest-first, corrupted bets appended at end
+            _clean_p  = sorted([b for b in paper_bets if b.get("clv_source") != "corrupted_utc"],
+                                key=lambda b: b.get("flagged_at",""), reverse=True)
+            _corrupt_p = sorted([b for b in paper_bets if b.get("clv_source") == "corrupted_utc"],
+                                 key=lambda b: b.get("flagged_at",""), reverse=True)
+            recent = _clean_p + _corrupt_p
 
             result = {
                 "balance":        balance,

@@ -4330,11 +4330,12 @@ function renderPerformance(d) {
   if (corruptBets.length) {
     const corruptRows = corruptBets.map(renderPerfRow).join('');
     perfTableHtml += `
-      <div style="margin-top:18px;border-top:1px solid var(--border);padding-top:10px;">
-        <div style="font-size:11px;color:#8b949e;margin-bottom:6px;">
-          ⚠ ${corruptBets.length} excluded bets — wrong Pinnacle reference (UTC/ET date collision, fixed May 2026). Not counted in any stats above.
-        </div>
-        <table style="opacity:0.55;">
+      <details style="margin-top:14px;border-top:1px solid var(--border);padding-top:10px;">
+        <summary style="cursor:pointer;font-size:11px;color:#8b949e;user-select:none;list-style:none;display:flex;align-items:center;gap:6px;">
+          <span style="font-size:10px;">▶</span>
+          ⚠ ${corruptBets.length} excluded bets (wrong Pinnacle reference — UTC/ET date collision, fixed May 2026) — click to expand
+        </summary>
+        <table style="opacity:0.55;margin-top:8px;">
           <thead><tr>
             <th>Flagged</th><th>Game Time</th><th>Matchup</th><th>Prop</th><th>Side</th>
             <th class="num">Adj. EV</th><th class="num">Line Move</th>
@@ -4342,7 +4343,7 @@ function renderPerformance(d) {
           </tr></thead>
           <tbody>${corruptRows}</tbody>
         </table>
-      </div>`;
+      </details>`;
   }
 
   document.getElementById('perf-body').innerHTML += perfTableHtml;
@@ -4517,10 +4518,11 @@ async function fetchPaper() {
       }
 
       if (corruptBets.length) {
-        html += `<div style="margin-top:18px;border-top:1px solid var(--border);padding-top:10px;">
-          <div style="font-size:11px;color:#8b949e;margin-bottom:6px;">
-            ⚠ ${corruptBets.length} corrupted bets — wrong Pinnacle reference (UTC/ET date collision, fixed May 2026). Excluded from all stats and P&amp;L above.
-          </div>` + tableHead + `<tbody>${corruptBets.map(renderPaperRow).join('')}</tbody></table></div>`;
+        html += `<details style="margin-top:14px;border-top:1px solid var(--border);padding-top:10px;">
+          <summary style="cursor:pointer;font-size:11px;color:#8b949e;user-select:none;list-style:none;display:flex;align-items:center;gap:6px;">
+            <span style="font-size:10px;">▶</span>
+            ⚠ ${corruptBets.length} excluded bets (wrong Pinnacle reference — UTC/ET date collision, fixed May 2026) — click to expand
+          </summary>` + tableHead + `<tbody>${corruptBets.map(renderPaperRow).join('')}</tbody></table></details>`;
       }
     } else {
       html += '<div class="empty" style="padding:16px;">No paper trades yet. Every edge ≥3% flagged from ' + d.start_date + ' is automatically sized and tracked here.</div>';

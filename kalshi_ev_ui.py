@@ -4722,7 +4722,8 @@ class Handler(BaseHTTPRequestHandler):
                               and b.get("paper_stake") is not None]
             balance     = _compute_paper_balance()
             open_exp    = round(sum(b["paper_stake"] for b in paper_bets if b["status"] == "open"), 2)
-            settled     = [b for b in paper_bets if b["status"] in ("won", "lost")]
+            settled     = [b for b in paper_bets if b["status"] in ("won", "lost")
+                           and b.get("clv_source") != "corrupted_utc"]
             won_bets    = [b for b in settled if b["status"] == "won"]
             total_pnl   = round(balance - PAPER_START_BALANCE, 2)
             roi_pct     = round(total_pnl / PAPER_START_BALANCE * 100, 2)
@@ -4739,10 +4740,10 @@ class Handler(BaseHTTPRequestHandler):
                 "roi_pct":        roi_pct,
                 "open_exposure":  open_exp,
                 "available":      round(balance - open_exp, 2),
-                "total_bets":     len(paper_bets),
+                "total_bets":     len(settled) + (len(paper_bets) - len([b for b in paper_bets if b["status"] in ("won","lost")])),
                 "won":            len(won_bets),
                 "lost":           len(settled) - len(won_bets),
-                "open":           len(paper_bets) - len(settled),
+                "open":           len([b for b in paper_bets if b["status"] == "open"]),
                 "win_rate":       win_rate,
                 "avg_stake":      avg_stake,
                 "bets":           recent,

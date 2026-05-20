@@ -1767,6 +1767,16 @@ def scan_sport(
                             if abs(pin_pt - threshold) <= 0.25 or _lines_equivalent(pin_pt, threshold):
                                 exact_match = (pin_pt, pin_probs)
                                 break
+                        # ── Diagnostic: log floor_strike → threshold → matched pin line ──
+                        _raw_fs     = mkt.get("floor_strike")
+                        _matched_pt = exact_match[0] if exact_match else None
+                        _matched_po = round(exact_match[1].get("over_prob", 0), 3) if exact_match else None
+                        _diag_sfx   = (f"matched_pin={_matched_pt}  pin_over={_matched_po}"
+                                       if exact_match else "NO MATCH")
+                        print(
+                            f"  [total-diag] {mkt.get('title','?')[:40]:<40}  "
+                            f"floor_strike={_raw_fs}  threshold={threshold}  {_diag_sfx}"
+                        )
 
                         if exact_match:
                             _diag_line_matches += 1

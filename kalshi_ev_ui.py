@@ -456,7 +456,8 @@ _bad_match_ids = {
     "KXMLBTOTAL-26MAY152140SFATH-8|NO",            # SF@ATH matched to SF@LAD Pinnacle data → 12.1% fake edge
     "KXMLBTOTAL-26MAY152138LADLAA-8|NO",            # LAD@LAA matched to SF@LAD Pinnacle data
     "KXMLBSPREAD-26MAY152138LADLAA-LAD2|NO",        # LAD@LAA spread matched to SF@LAD
-    "KXMLBKS-26MAY192140LADSD-SDGCANNING17-6|YES", # Canning ghost edge: Pinnacle "over 4.5 Ks" (P(X≥5)) matched to Kalshi "6+" (P(X≥6)) — line mismatch int(4.5)=4 ≠ kalshi_thresh=5
+    "KXMLBKS-26MAY192140LADSD-SDGCANNING17-6|YES",  # Canning ghost edge: Pinnacle "over 4.5 Ks" (P(X≥5)) matched to Kalshi "6+" (P(X≥6)) — line mismatch int(4.5)=4 ≠ kalshi_thresh=5
+    "KXMLBTOTAL-26MAY202040LADSD-9|YES",             # Suspected floor_strike mismatch: scanner fair=46% but Pinnacle over 8.5 = +151 (~40%) — quarantined pending total-diag log verification
 }
 _bets = [_b for _b in _bets if _b.get("id") not in _bad_match_ids]
 _data_fixed = True

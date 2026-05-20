@@ -525,7 +525,8 @@ def _compute_paper_balance() -> float:
     with _bets_lock:
         paper_bets = [b for b in _bets if b.get("flagged_at", "") >= PAPER_START_DATE
                       and b.get("paper_stake") is not None
-                      and not b.get("correlated", False)]
+                      and not b.get("correlated", False)
+                      and b.get("clv_source") != "corrupted_utc"]
     bal = PAPER_START_BALANCE
     for b in paper_bets:
         if b["status"] in ("won", "lost") and b.get("paper_pnl") is not None:
@@ -967,6 +968,8 @@ def _get_clv_multipliers() -> dict:
 
     by_type: dict = {}
     for b in settled:
+        if b.get("clv_source") == "corrupted_utc":
+            continue
         mtype = _infer_mkt_type(b)
         if not mtype:
             continue
@@ -998,6 +1001,9 @@ def _get_performance(since: Optional[str] = None) -> dict:
     lost  = [b for b in bets if b["status"] == "lost"]
     open_ = [b for b in bets if b["status"] == "open"]
     settled = won + lost
+    # clean_settled excludes corrupted-CLV bets from all performance calculations.
+    # settled (full list) is still used for the bets display table only.
+    clean_settled = [b for b in settled if b.get("clv_source") != "corrupted_utc"]
 
     # Game lines only — exclude all props (MLB + NBA) from top-level pills.
     def _is_prop(b: dict) -> bool:
@@ -1009,11 +1015,15 @@ def _get_performance(since: Optional[str] = None) -> dict:
     def _is_correlated(b: dict) -> bool:
         return b.get("correlated", False)
 
-    gl_bets    = [b for b in bets  if not _is_prop(b)]
-    gl_won     = [b for b in won   if not _is_prop(b) and not _is_correlated(b)]
-    gl_lost    = [b for b in lost  if not _is_prop(b) and not _is_correlated(b)]
-    gl_open    = [b for b in open_ if not _is_prop(b)]
+    def _is_corrupted(b: dict) -> bool:
+        return b.get("clv_source") == "corrupted_utc"
+
+    gl_bets    = [b for b in bets  if not _is_prop(b) and not _is_corrupted(b)]
+    gl_won     = [b for b in won   if not _is_prop(b) and not _is_correlated(b) and not _is_corrupted(b)]
+    gl_lost    = [b for b in lost  if not _is_prop(b) and not _is_correlated(b) and not _is_corrupted(b)]
+    gl_open    = [b for b in open_ if not _is_prop(b) and not _is_corrupted(b)]
     gl_settled = gl_won + gl_lost
+    corrupted_count = sum(1 for b in bets if _is_corrupted(b))
 
     # ── Kelly sizing helper ────────────────────────────────────────────────────
     # 0.25 Fractional Kelly for a binary prediction-market bet, with:
@@ -1156,7 +1166,7 @@ def _get_performance(since: Optional[str] = None) -> dict:
         return f"{sport} {mtype.capitalize()}" if mtype else sport
 
     by_type = {}
-    for b in settled:
+    for b in clean_settled:
         label = _perf_label(b)
         if label not in by_type:
             by_type[label] = {"won": 0, "lost": 0, "units": [], "kelly": [], "clv": []}
@@ -1208,7 +1218,7 @@ def _get_performance(since: Optional[str] = None) -> dict:
     AUDIT_WARN_THRESHOLD = 38
     AUDIT_MIN_SAMPLE     = 10
     audit_buckets: dict = {}
-    for b in settled:
+    for b in clean_settled:
         mtype  = _infer_mkt_type(b)
         src    = b.get("clv_source", "none")
         key    = f"{mtype or 'other'}/{src}"
@@ -1254,6 +1264,7 @@ def _get_performance(since: Optional[str] = None) -> dict:
         "recent_7d_count":      recent_7d_count,   # settled bets in last 7d
         "days_since_last_bet":  days_since_last_bet,
         "source_audit":         source_audit,      # win-rate by (mkt_type, clv_source) — warns if <38%
+        "corrupted_excluded":   corrupted_count,   # bets excluded from stats (data-quality)
     }
 
 
@@ -4113,6 +4124,7 @@ function renderPerformance(d) {
       P&amp;L sized by <strong>0.25 Fractional Kelly</strong>, capped at 5% per bet.
       CLV-penalised types run at 0.5× until their closing-line value stabilises.
       Reported as <strong>% of bankroll</strong> — a 5¢ longshot loss shows −0.15%, not −1 unit.
+      ${d.corrupted_excluded ? `<br><span style="color:#8b949e;">⚠ ${d.corrupted_excluded} bets excluded from all stats (wrong Pinnacle reference — UTC/ET date collision, fixed May 2026). Shown as <strong>BAD REF</strong> in the history table.</span>` : ''}
     </p>`;
 
   // By-type breakdown table
@@ -4261,10 +4273,13 @@ function renderPerformance(d) {
     const corrBadge = b.correlated
       ? `<span title="Correlated — same game/type/side already open. Logged for record; excluded from win rate &amp; Kelly stats." style="font-size:9px;font-weight:700;color:#e3a53a;background:rgba(227,165,58,0.12);border:1px solid rgba(227,165,58,0.3);border-radius:3px;padding:1px 4px;margin-left:5px;vertical-align:middle;">CORR</span>`
       : '';
-    return `<tr style="${b.correlated ? 'opacity:0.7;' : ''}">
+    const corruptBadge = b.clv_source === 'corrupted_utc'
+      ? `<span title="Excluded from all stats — Pinnacle reference was from the wrong game (UTC/ET date collision, now fixed)." style="font-size:9px;font-weight:700;color:#8b949e;background:rgba(139,148,158,0.12);border:1px solid rgba(139,148,158,0.3);border-radius:3px;padding:1px 4px;margin-left:5px;vertical-align:middle;">BAD REF</span>`
+      : '';
+    return `<tr style="${b.correlated || b.clv_source === 'corrupted_utc' ? 'opacity:0.55;' : ''}">
       <td>${ts}</td>
       <td>${gameTimeCell}</td>
-      <td>${b.matchup}${corrBadge}</td>
+      <td>${b.matchup}${corrBadge}${corruptBadge}</td>
       <td class="prop-col">${b.title}</td>
       <td class="side-${b.side.toLowerCase()}">${b.side}</td>
       <td class="num">${edgeCell}</td>
@@ -4651,6 +4666,7 @@ class Handler(BaseHTTPRequestHandler):
                     if b["status"] in ("won", "lost")
                     and b.get("paper_pnl") is not None
                     and not b.get("correlated", False)
+                    and b.get("clv_source") != "corrupted_utc"
                     and b.get("flagged_at", "") >= PAPER_START_DATE
                 ]
             settled.sort(key=lambda b: b.get("resolved_at") or b.get("flagged_at", ""))

@@ -451,6 +451,14 @@ for _b in _bets:
             _b["closing_pin_pct"] = _b["pin_prob_at_flag"]
             _data_fixed = True
 
+# Fix: Mark total bets whose CLV used wrong Pinnacle game (UTC/ET date collision pre-fix).
+#      clv_source="pin" totals had 27% win rate — Pinnacle reference was a different game.
+#      Excluded from avg-CLV pool; P&L/win-rate tracking unchanged.
+for _b in _bets:
+    if ("TOTAL" in _b.get("ticker", "") and _b.get("clv_source") == "pin"):
+        _b["clv_source"] = "corrupted_utc"
+        _data_fixed = True
+
 # Fix: Remove bets with wrong Pinnacle game match (ticker mismatch → fake edge)
 _bad_match_ids = {
     "KXMLBTOTAL-26MAY152140SFATH-8|NO",            # SF@ATH matched to SF@LAD Pinnacle data → 12.1% fake edge
@@ -1194,6 +1202,33 @@ def _get_performance(since: Optional[str] = None) -> dict:
     # Total Kelly P&L as % of bankroll
     total_kelly_pct = round(sum(kelly_pnls) * 100, 3) if kelly_pnls else None
 
+    # ── Win-rate audit by (market type, CLV source) ───────────────────────────
+    # Detects data-quality bugs: a CLV source with <38% win rate (N≥10) signals
+    # the reference price was wrong (wrong game, wrong line, stale data).
+    AUDIT_WARN_THRESHOLD = 38
+    AUDIT_MIN_SAMPLE     = 10
+    audit_buckets: dict = {}
+    for b in settled:
+        mtype  = _infer_mkt_type(b)
+        src    = b.get("clv_source", "none")
+        key    = f"{mtype or 'other'}/{src}"
+        audit_buckets.setdefault(key, [0, 0])
+        audit_buckets[key][1] += 1
+        if b["status"] == "won":
+            audit_buckets[key][0] += 1
+    source_audit = []
+    for key, (w, n) in sorted(audit_buckets.items()):
+        if n < AUDIT_MIN_SAMPLE:
+            continue
+        wr = round(100 * w / n, 1)
+        source_audit.append({
+            "key":     key,
+            "wins":    w,
+            "total":   n,
+            "win_pct": wr,
+            "warn":    wr < AUDIT_WARN_THRESHOLD,
+        })
+
     return {
         "total_bets":           len(gl_bets),
         "won":                  len(gl_won),
@@ -1218,6 +1253,7 @@ def _get_performance(since: Optional[str] = None) -> dict:
         "recent_bet_count":     recent_bet_count,  # settled bets in last 14d
         "recent_7d_count":      recent_7d_count,   # settled bets in last 7d
         "days_since_last_bet":  days_since_last_bet,
+        "source_audit":         source_audit,      # win-rate by (mkt_type, clv_source) — warns if <38%
     }
 
 
@@ -4120,6 +4156,38 @@ function renderPerformance(d) {
         </tr></thead>
         <tbody>${typeRows}</tbody>
       </table>`);
+  }
+
+  // ── Data-quality audit table ─────────────────────────────────────────────
+  if (d.source_audit && d.source_audit.length) {
+    const hasWarn = d.source_audit.some(r => r.warn);
+    const auditRows = d.source_audit.map(r => {
+      const cls  = r.warn ? 'pnl-neg' : 'pnl-pos';
+      const flag = r.warn ? ' ⚠' : '';
+      return `<tr>
+        <td style="font-family:monospace;font-size:11px;">${r.key}${flag}</td>
+        <td class="num">${r.wins}/${r.total}</td>
+        <td class="num"><span class="${cls}">${r.win_pct}%</span></td>
+      </tr>`;
+    }).join('');
+    const headerCls = hasWarn ? 'pnl-neg' : '';
+    document.getElementById('perf-body').innerHTML += `
+      <details style="margin-bottom:12px;">
+        <summary style="cursor:pointer;font-size:12px;color:var(--muted);user-select:none;">
+          <span class="${headerCls}">Data-quality audit${hasWarn ? ' ⚠ — one or more buckets below 38% win rate' : ''}</span>
+        </summary>
+        <table style="margin-top:6px;font-size:11px;">
+          <thead><tr>
+            <th>Bucket (type/clv_source)</th>
+            <th class="num">W/L</th>
+            <th class="num">Win Rate</th>
+          </tr></thead>
+          <tbody>${auditRows}</tbody>
+        </table>
+        <p style="font-size:10px;color:var(--muted);margin:4px 0 0;">
+          &lt;38% win rate with N≥10 suggests the reference price for that bucket was wrong (wrong game, stale odds, or line mismatch). Investigate before trusting CLV for that bucket.
+        </p>
+      </details>`;
   }
 
   if (!d.bets.length) {

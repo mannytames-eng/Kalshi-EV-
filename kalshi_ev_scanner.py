@@ -1773,17 +1773,6 @@ def scan_sport(
                             if abs(pin_pt - threshold) <= 0.25 or _lines_equivalent(pin_pt, threshold):
                                 exact_match = (pin_pt, pin_probs)
                                 break
-                        # ── Diagnostic: log floor_strike → threshold → matched pin line ──
-                        _raw_fs     = mkt.get("floor_strike")
-                        _matched_pt = exact_match[0] if exact_match else None
-                        _matched_po = round(exact_match[1].get("over_prob", 0), 3) if exact_match else None
-                        _diag_sfx   = (f"matched_pin={_matched_pt}  pin_over={_matched_po}"
-                                       if exact_match else "NO MATCH")
-                        print(
-                            f"  [total-diag] {mkt.get('title','?')[:40]:<40}  "
-                            f"floor_strike={_raw_fs}  threshold={threshold}  {_diag_sfx}"
-                        )
-
                         if exact_match:
                             _diag_line_matches += 1
                             # Use the Pinnacle line that directly matches Kalshi threshold
@@ -1990,6 +1979,17 @@ def scan_sport(
 
                 # ── Confidence score ──────────────────────────────────────
                 confidence = _book_confidence(books_detail)
+
+                # ── Match audit log (totals only) ─────────────────────────
+                # Searchable record of which Pinnacle game/line was matched.
+                # Lets you spot wrong-game matches by checking pin_line vs kalshi_thresh.
+                if mkt_type == "total":
+                    _pin_t = locals().get("pin_total", "?")
+                    _pin_o = round(locals().get("po", 0) * 100, 1) if locals().get("po") is not None else "?"
+                    print(
+                        f"  [match] {matchup:<35}  "
+                        f"kalshi_thresh={threshold}  pin_line={_pin_t}  pin_over={_pin_o}%  adj={adj_edge:+.1%}"
+                    )
 
                 # ── Diagnostic log ────────────────────────────────────────
                 book_str = "  ".join(f"{b}={p:.1%}" for b, p in sorted(books_detail.items()))

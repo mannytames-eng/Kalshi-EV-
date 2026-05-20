@@ -1134,7 +1134,16 @@ def _get_performance(since: Optional[str] = None) -> dict:
     # Add per-bet P&L fields for display
     # kelly_pnl_pct = P&L as % of bankroll (e.g. +0.42 = +0.42%)
     # kelly_bet_pct = Kelly-recommended stake as % of bankroll
-    table_bets = sorted(settled + open_, key=lambda b: b["flagged_at"], reverse=True)[:30]
+    # Clean bets (no cap) sorted newest-first, corrupted appended at end
+    _clean_table = sorted(
+        [b for b in settled + open_ if b.get("clv_source") != "corrupted_utc"],
+        key=lambda b: b["flagged_at"], reverse=True
+    )
+    _corrupt_table = sorted(
+        [b for b in settled if b.get("clv_source") == "corrupted_utc"],
+        key=lambda b: b["flagged_at"], reverse=True
+    )
+    table_bets = _clean_table + _corrupt_table
     for b in table_bets:
         kf = _kelly_frac(b)
         kp = _kelly_pnl(b)
@@ -4209,11 +4218,12 @@ function renderPerformance(d) {
   }
 
   const PERF_PREVIEW = 15;
-  const allPerfBets = d.bets;
-  const showAllPerf = window._perfShowAll || false;
-  const visiblePerf = showAllPerf ? allPerfBets : allPerfBets.slice(0, PERF_PREVIEW);
+  const allPerfBets  = d.bets.filter(b => b.clv_source !== 'corrupted_utc');
+  const corruptBets  = d.bets.filter(b => b.clv_source === 'corrupted_utc');
+  const showAllPerf  = window._perfShowAll || false;
+  const visiblePerf  = showAllPerf ? allPerfBets : allPerfBets.slice(0, PERF_PREVIEW);
 
-  let rows = visiblePerf.map(b => {
+  const renderPerfRow = (b) => {
     const now = Date.now();
     const gameStartMs = b.game_time ? new Date(b.game_time).getTime() : null;
     const isLive = b.status === 'open' && gameStartMs != null && now >= gameStartMs;
@@ -4288,7 +4298,8 @@ function renderPerformance(d) {
       <td class="num">${kBet}</td>
       <td class="num">${kPnl}</td>
     </tr>`;
-  }).join('');
+  };
+  let rows = visiblePerf.map(renderPerfRow).join('');
 
   let perfTableHtml = `<table>
     <thead><tr>
@@ -4314,6 +4325,26 @@ function renderPerformance(d) {
       </button>
     </div>`;
   }
+
+  // Corrupted bets section — always shown at bottom, excluded from all stats
+  if (corruptBets.length) {
+    const corruptRows = corruptBets.map(renderPerfRow).join('');
+    perfTableHtml += `
+      <div style="margin-top:18px;border-top:1px solid var(--border);padding-top:10px;">
+        <div style="font-size:11px;color:#8b949e;margin-bottom:6px;">
+          ⚠ ${corruptBets.length} excluded bets — wrong Pinnacle reference (UTC/ET date collision, fixed May 2026). Not counted in any stats above.
+        </div>
+        <table style="opacity:0.55;">
+          <thead><tr>
+            <th>Flagged</th><th>Game Time</th><th>Matchup</th><th>Prop</th><th>Side</th>
+            <th class="num">Adj. EV</th><th class="num">Line Move</th>
+            <th class="num">Result</th><th class="num">Kelly Bet %</th><th class="num">Kelly P&L %</th>
+          </tr></thead>
+          <tbody>${corruptRows}</tbody>
+        </table>
+      </div>`;
+  }
+
   document.getElementById('perf-body').innerHTML += perfTableHtml;
 
 }

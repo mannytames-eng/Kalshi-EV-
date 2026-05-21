@@ -2093,9 +2093,7 @@ def scan_sport(
 
 
 # ── Player-props helpers ──────────────────────────────────────────────────────
-PLAYER_PROP_MARKETS = (
-    "pitcher_strikeouts,batter_hits,batter_home_runs,batter_total_bases,batter_rbis"
-)
+PLAYER_PROP_MARKETS = "pitcher_strikeouts,batter_hits"
 NBA_PLAYER_PROP_MARKETS = "player_points,player_assists,player_threes"
 
 MLB_PROP_SERIES: Dict[str, str] = {
@@ -2142,7 +2140,7 @@ def build_all_player_props(
     Returns: { player_norm: { prop_type: {player, line, over_prob, lambda} } }
     """
     if markets is None:
-        markets = "pitcher_strikeouts,batter_hits,batter_home_runs,batter_total_bases,batter_rbis"
+        markets = "pitcher_strikeouts,batter_hits"
     now = datetime.now(timezone.utc)
     target_events = []
     for ev in odds_events:

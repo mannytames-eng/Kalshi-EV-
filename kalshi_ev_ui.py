@@ -79,18 +79,20 @@ def _odds_refresh_interval() -> int:
     """Return seconds until next odds refresh based on current ET hour.
 
     Credit costs (MLB only — NBA removed 2026-05-16):
-      MLB odds call: 1 credit/refresh  |  Props: 1 credit/event
+      MLB odds call: 2 credits/refresh (spreads+totals = 2 markets)
+      Props call:    2 credits/event   (pitcher_strikeouts+batter_hits = 2 markets)
 
-    Budget (2-min peak / 8-min off-peak — calibrated for 29k period ending June 1):
-      Peak  (11h × 30/hr × 1): 330 credits/day
-      Off   (13h × 7/hr  × 1):  91 credits/day
-      Props (4h interval, 10 events × 6/day):  48 credits/day
-      Total: ~469/day → 6,566 to June 1  (1,247 buffer on 7,813 remaining)
+    Budget (4-min peak / 8-min off-peak — June 20k budget):
+      Peak  (11h × 15/hr × 2): 330 credits/day
+      Off   (13h × 7.5/hr × 2): 195 credits/day
+      Props (8h interval, 10 events × 3/day × 3 credits): 90 credits/day
+      Pre-close: ~4 credits/day
+      Total: ~619/day → ~18,570/month  (1,430 buffer on 20k)
     """
     et_hour = _et_hour()
     if 11 <= et_hour < 22:   # 11 AM – 10 PM ET: game window
-        return 2 * 60        # 2 min peak — maximum edge detection speed
-    return 8 * 60            # overnight — no edges, conserve for June 1
+        return 4 * 60        # 4 min peak — balanced speed vs June credit budget
+    return 8 * 60            # overnight — no edges, conserve credits
 REFRESH_SECONDS       = 2 * 60     # re-scan Kalshi every 2 min    (0 credits)
 # Monthly credit math (20k budget):
 #   Odds refresh : 2 × 144/day × 30 =  8,640
@@ -1524,7 +1526,7 @@ print(f"  Loaded {len(_alerted_keys)} previously alerted edge key(s) from disk")
 # period during game hours — indicates a silent data pipeline failure.
 _zero_edge_streak      = 0          # consecutive scans with no qualifying edges
 _last_props_scan: float = 0.0       # epoch seconds of last props scan
-PROPS_REFRESH_SECONDS  = 4 * 60 * 60   # MLB props: scan every 4h (max-speed mode 2026-05-16)
+PROPS_REFRESH_SECONDS  = 8 * 60 * 60   # MLB props: scan every 8h (credit budget 2026-05-20)
 _zero_edge_alerted     = False      # suppresses duplicate alerts per drought
 _ZERO_EDGE_ALERT_SCANS = 60         # 60 × 2-min scan = 2 hours of silence
 
@@ -1975,7 +1977,7 @@ def _run_odds_refresh():
 
 
 def _background_odds_loop():
-    """Refresh book-odds cache on an adaptive schedule (costs 3 credits/refresh)."""
+    """Refresh book-odds cache on an adaptive schedule (costs 2 credits/refresh — spreads+totals)."""
     # On Railway, give the HTTP server 10 s to start accepting connections before
     # making any outbound network calls — keeps cold-start inside the healthcheck window.
     if os.environ.get("RAILWAY_ENVIRONMENT"):
@@ -5146,9 +5148,10 @@ if __name__ == "__main__":
     url = f"http://localhost:{PORT}"
     print(f"  Kalshi EV Scanner UI running at {url}")
     print(f"  Kalshi scan : every {REFRESH_SECONDS}s  (0 credits — cached odds)")
-    print(f"  Odds refresh: 4min game-hours / 20min overnight  (2 credits — Pinnacle+DK+FD)")
+    print(f"  Odds refresh: 4min peak / 8min overnight  (2 credits/call — spreads+totals)")
+    print(f"  Props scan  : every 8h, 2 markets  (~3 credits/event)")
     print(f"  CLV capture : every {CLV_CAPTURE_SECONDS}s  (0 credits — Kalshi-only)")
-    print(f"  Est. monthly: ~6,000 credits  (budget: 20,000)  |  Ctrl-C to stop\n")
+    print(f"  Est. monthly: ~18,570 credits  (budget: 20,000)  |  Ctrl-C to stop\n")
     # Only open browser if running on a local desktop (not a headless VPS)
     if os.environ.get("DISPLAY") or sys.platform == "darwin":
         try:

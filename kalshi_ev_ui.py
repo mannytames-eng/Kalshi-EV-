@@ -95,7 +95,7 @@ def _odds_refresh_interval() -> int:
     if 11 <= et_hour < 22:   # 11 AM – 10 PM ET: game window
         return 4 * 60        # 4 min peak — balanced speed vs June credit budget
     return 8 * 60            # overnight — no edges, conserve credits
-REFRESH_SECONDS       = 2 * 60     # re-scan Kalshi every 2 min    (0 credits)
+REFRESH_SECONDS       = 30         # re-scan Kalshi every 30 sec   (0 credits)
 # Monthly credit math (20k budget):
 #   Odds refresh : 2 × 144/day × 30 =  8,640
 #   Props scan   : 10 × 8/day × 30  =  2,400

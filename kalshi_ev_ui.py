@@ -87,7 +87,7 @@ def _odds_refresh_interval() -> int:
     Budget (4-min peak / 8-min off-peak — June 20k budget):
       Peak  (11h × 15/hr × 2): 330 credits/day
       Off   (13h × 7.5/hr × 2): 195 credits/day
-      Props (8h interval, 10 events × 3/day × 3 credits): 90 credits/day
+      Props (4h interval, 10 events × 6/day × 2 credits): 120 credits/day
       Pre-close: ~4 credits/day
       Total: ~619/day → ~18,570/month  (1,430 buffer on 20k)
     """
@@ -1550,7 +1550,7 @@ print(f"  Loaded {len(_alerted_keys)} previously alerted edge key(s) from disk")
 # period during game hours — indicates a silent data pipeline failure.
 _zero_edge_streak      = 0          # consecutive scans with no qualifying edges
 _last_props_scan: float = 0.0       # epoch seconds of last props scan
-PROPS_REFRESH_SECONDS  = 8 * 60 * 60   # MLB props: scan every 8h (credit budget 2026-05-20)
+PROPS_REFRESH_SECONDS  = 4 * 60 * 60   # MLB props: scan every 4h (doubled from 8h — local scanner killed, budget headroom)
 _zero_edge_alerted     = False      # suppresses duplicate alerts per drought
 _ZERO_EDGE_ALERT_SCANS = 60         # 60 × 2-min scan = 2 hours of silence
 
@@ -5187,7 +5187,7 @@ if __name__ == "__main__":
     print(f"  Kalshi EV Scanner UI running at {url}")
     print(f"  Kalshi scan : every {REFRESH_SECONDS}s  (0 credits — cached odds)")
     print(f"  Odds refresh: 4min peak / 8min overnight  (2 credits/call — spreads+totals)")
-    print(f"  Props scan  : every 8h, 2 markets  (~3 credits/event)")
+    print(f"  Props scan  : every 4h, 2 markets  (~2 credits/event)")
     print(f"  CLV capture : every {CLV_CAPTURE_SECONDS}s  (0 credits — Kalshi-only)")
     print(f"  Est. monthly: ~18,570 credits  (budget: 20,000)  |  Ctrl-C to stop\n")
     # Only open browser if running on a local desktop (not a headless VPS)

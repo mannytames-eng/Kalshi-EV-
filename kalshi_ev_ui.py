@@ -4852,6 +4852,20 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(500, "application/json",
                            json.dumps({"error": f"Server error: {exc}"}).encode())
 
+        elif path == "/api/debug/storage":
+            import os as _os
+            result = {
+                "DATA_DIR":           DATA_DIR,
+                "BETS_FILE":          BETS_FILE,
+                "data_dir_exists":    _os.path.isdir(DATA_DIR),
+                "bets_file_exists":   _os.path.exists(BETS_FILE),
+                "railway_env":        _os.environ.get("RAILWAY_ENVIRONMENT", "not set"),
+                "slash_data_exists":  _os.path.isdir("/data"),
+                "bets_in_memory":     len(_bets),
+                "bets_file_size_kb":  round(_os.path.getsize(BETS_FILE) / 1024, 1) if _os.path.exists(BETS_FILE) else 0,
+            }
+            self._send(200, "application/json", json.dumps(result).encode())
+
         elif path == "/api/test-discord":
             ok = send_test_discord()
             result = {"ok": ok, "webhook_set": bool(_DISCORD_WEBHOOK)}

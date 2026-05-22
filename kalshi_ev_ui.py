@@ -459,11 +459,19 @@ for _b in _bets:
             _data_fixed = True
 
 # Fix: Mark total bets whose CLV used wrong Pinnacle game (UTC/ET date collision pre-fix).
-#      clv_source="pin" totals had 27% win rate — Pinnacle reference was a different game.
-#      Excluded from avg-CLV pool; P&L/win-rate tracking unchanged.
+#      clv_source="pin" totals flagged before 2026-05-20 had 27% win rate — wrong Pinnacle
+#      game matched due to date collision bug (fixed 2026-05-20). Only applies to pre-fix bets.
 for _b in _bets:
-    if ("TOTAL" in _b.get("ticker", "") and _b.get("clv_source") == "pin"):
+    if ("TOTAL" in _b.get("ticker", "") and _b.get("clv_source") == "pin"
+            and _b.get("flagged_at", "9999") < "2026-05-20"):
         _b["clv_source"] = "corrupted_utc"
+        _data_fixed = True
+# Restore post-fix total bets wrongly marked corrupted_utc (missing date guard before this fix)
+for _b in _bets:
+    if (_b.get("clv_source") == "corrupted_utc"
+            and "TOTAL" in _b.get("ticker", "")
+            and _b.get("flagged_at", "") >= "2026-05-20"):
+        _b["clv_source"] = "pin"
         _data_fixed = True
 
 # Fix: Remove bets with wrong Pinnacle game match (ticker mismatch → fake edge)

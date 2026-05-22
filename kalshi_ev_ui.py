@@ -84,17 +84,17 @@ def _odds_refresh_interval() -> int:
       MLB odds call: 2 credits/refresh (spreads+totals = 2 markets)
       Props call:    2 credits/event   (pitcher_strikeouts+batter_hits = 2 markets)
 
-    Budget (4-min peak / 8-min off-peak — June 20k budget):
-      Peak  (11h × 15/hr × 2): 330 credits/day
-      Off   (13h × 7.5/hr × 2): 195 credits/day
+    Budget (3-min peak / 20-min off-peak — redistributed from overnight to peak):
+      Peak  (11h × 20/hr × 2): 440 credits/day
+      Off   (13h × 3/hr  × 2):  78 credits/day
       Props (4h interval, 10 events × 6/day × 2 credits): 120 credits/day
       Pre-close: ~4 credits/day
-      Total: ~619/day → ~18,570/month  (1,430 buffer on 20k)
+      Total: ~642/day → ~19,260/month  (740 buffer on 20k)
     """
     et_hour = _et_hour()
     if 11 <= et_hour < 22:   # 11 AM – 10 PM ET: game window
-        return 4 * 60        # 4 min peak — balanced speed vs June credit budget
-    return 8 * 60            # overnight — no edges, conserve credits
+        return 3 * 60        # 3 min peak — freed by slowing overnight
+    return 20 * 60           # overnight — near-zero edge probability, conserve credits
 REFRESH_SECONDS       = 30         # re-scan Kalshi every 30 sec   (0 credits)
 # Monthly credit math (20k budget):
 #   Odds refresh : 2 × 144/day × 30 =  8,640

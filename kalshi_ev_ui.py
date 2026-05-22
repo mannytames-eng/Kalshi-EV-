@@ -24,6 +24,8 @@ _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 _RAILWAY_DATA = "/data"
 BASE_DIR  = _RAILWAY_DATA if os.path.isdir(_RAILWAY_DATA) and os.environ.get("RAILWAY_ENVIRONMENT") else _SCRIPT_DIR
 DATA_DIR  = BASE_DIR   # data files (bets, history, keys) — persistent on Railway
+print(f"  [startup] DATA_DIR={DATA_DIR}  RAILWAY_ENVIRONMENT={os.environ.get('RAILWAY_ENVIRONMENT','not set')}")
+print(f"  [startup] /data exists={os.path.isdir(_RAILWAY_DATA)}")
 load_dotenv(os.path.join(_SCRIPT_DIR, ".env"))   # .env lives next to the script always
 
 # ── Import scanner logic ──────────────────────────────────────────────────────
@@ -223,23 +225,26 @@ def _load_bets() -> list:
                 pass
         return []
 
-def _save_bets(bets: list):
+def _save_bets(bets: list) -> bool:
+    """Save bets to disk. Returns True on success, False on failure."""
     try:
         import tempfile, os as _os
         fd, tmp = tempfile.mkstemp(dir=DATA_DIR, suffix=".tmp")
         with _os.fdopen(fd, "w") as f:
             json.dump(bets, f, indent=2)
         _os.replace(tmp, BETS_FILE)
+        return True
     except Exception as exc:
-        print(f"  WARNING: could not save bets: {exc}")
+        print(f"  WARNING: could not save bets to {BETS_FILE}: {exc}")
         # Fire a Discord alert once per session — silent disk failure = data loss on next restart
         global _save_bets_alerted
         if not _save_bets_alerted:
             _save_bets_alerted = True
             try:
-                send_discord(None, f"🚨 **Bet save failure** — `{exc}`\nBets are in memory but NOT persisting to disk. Data will be lost on next restart. Check Railway volume / disk space.")
+                send_discord(None, f"🚨 **Bet save failure** — `{exc}`\nPath: `{BETS_FILE}` | DATA_DIR: `{DATA_DIR}`\nBets are in memory but NOT persisting. Check Railway volume mount.")
             except Exception:
                 pass
+        return False
 
 _bets: list = _load_bets()
 print(f"  Bet store loaded: {len(_bets)} bets from {BETS_FILE}")
@@ -645,8 +650,19 @@ def _add_new_bets(edges: list) -> list:
                 open_slots.add(slot)   # only primary bet claims the slot
             added += 1
         if added:
-            _save_bets(_bets)
-            print(f"  Bet tracker: logged {added} new bet(s)")
+            save_ok = _save_bets(_bets)
+            if save_ok:
+                print(f"  Bet tracker: logged {added} new bet(s) → saved to {BETS_FILE}")
+            else:
+                # Save failed — roll back in-memory appends so Discord doesn't fire
+                # for bets that won't survive a restart
+                for b in newly_added:
+                    try:
+                        _bets.remove(b)
+                    except ValueError:
+                        pass
+                newly_added.clear()
+                print(f"  Bet tracker: save FAILED — rolled back {added} bet(s), Discord suppressed")
     return newly_added
 
 

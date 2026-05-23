@@ -90,11 +90,24 @@ def _odds_refresh_interval() -> int:
       Props (4h interval, 10 events × 6/day × 2 credits): 120 credits/day
       Pre-close: ~4 credits/day
       Total: ~642/day → ~19,260/month  (740 buffer on 20k)
+
+    Conservation mode (May 24–31): local scanner double-billed, 1,838 credits remain.
+      Peak  (11h × 6/hr  × 2): 132 credits/day
+      Off   (13h × 1/hr  × 2):  26 credits/day
+      Props: disabled            0 credits/day
+      Total: ~158/day → 1,264 for 8 days (254 buffer before June 1 reset)
     """
     et_hour = _et_hour()
-    if 11 <= et_hour < 22:   # 11 AM – 10 PM ET: game window
-        return 3 * 60        # 3 min peak — freed by slowing overnight
-    return 20 * 60           # overnight — near-zero edge probability, conserve credits
+    today   = datetime.now(timezone.utc).date()
+    from datetime import date as _date
+    conservation = _date(2026, 5, 24) <= today < _date(2026, 6, 1)
+    if conservation:
+        if 11 <= et_hour < 22:
+            return 10 * 60   # conservation: 10 min peak
+        return 60 * 60       # conservation: 60 min overnight
+    if 11 <= et_hour < 22:
+        return 3 * 60        # normal: 3 min peak
+    return 20 * 60           # normal: 20 min overnight
 REFRESH_SECONDS       = 30         # re-scan Kalshi every 30 sec   (0 credits)
 # Monthly credit math (20k budget):
 #   Odds refresh : 2 × 144/day × 30 =  8,640
@@ -2074,9 +2087,12 @@ def _run_scan():
         nba_stats = {}
 
         # Player props — MLB only, throttled to PROPS_REFRESH_SECONDS (4h)
+        # Disabled in conservation mode (May 24–31) to preserve remaining credits.
         global _last_props_scan
         now_ts = time.time()
-        if now_ts - _last_props_scan >= PROPS_REFRESH_SECONDS:
+        from datetime import date as _date
+        _conservation = _date(2026, 5, 24) <= datetime.now(timezone.utc).date() < _date(2026, 6, 1)
+        if not _conservation and now_ts - _last_props_scan >= PROPS_REFRESH_SECONDS:
             try:
                 mlb_props = scan_player_props(odds_sport="baseball_mlb", abbr_map=MLB_ABBR)
             except Exception as _prop_exc:

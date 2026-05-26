@@ -17,6 +17,18 @@ from typing import List, Optional
 
 from dotenv import load_dotenv
 
+# ── Railway-only guard ────────────────────────────────────────────────────────
+# All scanning resources must go to Railway. Running locally double-bills
+# Odds API credits from the same key and pollutes the paper portfolio.
+# Set ALLOW_LOCAL_RUN=1 only for one-off debugging sessions.
+if not os.environ.get("RAILWAY_ENVIRONMENT") and not os.environ.get("ALLOW_LOCAL_RUN"):
+    print("=" * 60)
+    print("  BLOCKED: This scanner is Railway-only.")
+    print("  Running locally wastes Odds API credits.")
+    print("  To override for debugging: ALLOW_LOCAL_RUN=1 python3 kalshi_ev_ui.py")
+    print("=" * 60)
+    sys.exit(1)
+
 # ── Portable base directory — works on Mac and any Linux VPS ─────────────────
 # On Railway a persistent volume is mounted at /data — use it for all data files
 # so they survive service restarts/redeploys.  Falls back to script directory locally.

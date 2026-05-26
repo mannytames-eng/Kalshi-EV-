@@ -91,20 +91,18 @@ def _odds_refresh_interval() -> int:
       Pre-close: ~4 credits/day
       Total: ~642/day → ~19,260/month  (740 buffer on 20k)
 
-    Conservation mode (May 24–31): local scanner double-billed, 1,838 credits remain.
-      Peak  (11h × 6/hr  × 2): 132 credits/day
-      Off   (13h × 1/hr  × 2):  26 credits/day
-      Props: disabled            0 credits/day
-      Total: ~158/day → 1,264 for 8 days (254 buffer before June 1 reset)
+    Conservation mode (May 24–31): 975 credits remain as of May 24 → EMERGENCY flat 30-min.
+      Main loop (24h × 2/hr × 2): ~96 credits/day
+      Pre-close + validate_bet:     ~3 credits/day
+      Props: disabled                0 credits/day
+      Total: ~99/day → ~713 for 7.2 days (262 buffer before June 1 reset)
     """
     et_hour = _et_hour()
     today   = datetime.now(timezone.utc).date()
     from datetime import date as _date
     conservation = _date(2026, 5, 24) <= today < _date(2026, 6, 1)
     if conservation:
-        if 11 <= et_hour < 22:
-            return 10 * 60   # conservation: 10 min peak
-        return 60 * 60       # conservation: 60 min overnight
+        return 30 * 60       # emergency: flat 30 min all day (975 credits left → ~99/day × 7.2 days = ~713 used, 262 buffer)
     if 11 <= et_hour < 22:
         return 3 * 60        # normal: 3 min peak
     return 20 * 60           # normal: 20 min overnight

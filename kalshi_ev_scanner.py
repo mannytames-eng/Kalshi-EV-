@@ -749,11 +749,12 @@ def build_consensus_game_index(
                     # posted as the "favorite" to cover by that margin.
                     if bkey == "pinnacle":
                         for tname, cov_prob, pt in probs:
-                            if pt < 0:
-                                abs_pt = abs(pt)
-                                if tname not in pin_spread_lines:
-                                    pin_spread_lines[tname] = {}
-                                pin_spread_lines[tname][abs_pt] = cov_prob
+                            # Store both favorite (pt<0) and underdog (pt>0) so
+                            # Kalshi markets referencing either team can be matched.
+                            abs_pt = abs(pt)
+                            if tname not in pin_spread_lines:
+                                pin_spread_lines[tname] = {}
+                            pin_spread_lines[tname][abs_pt] = cov_prob
 
                 # ── totals + alternate_totals ──────────────────────────────
                 # alternate_totals returns every Pinnacle line (7.5, 8.5, 9.5,
@@ -1803,11 +1804,10 @@ def scan_sport(
                             # and was the likely cause of YES/over bias.
                             continue
 
-                        books_used  = total_info.get("books_used", [])
-                        books_detail = {
-                            bk: td["over_prob"]
-                            for bk, td in total_info.get("per_book", {}).items()
-                        }
+                        books_used   = ["pinnacle"]     # alternate lines are Pinnacle-only by construction
+                        books_detail = {"pinnacle": po} # matched alternate-line prob, not main-line
+                        # (mirrors the spreads path at line 1758 — keeps validation
+                        #  oracle consistent with the fair value actually used for EV)
                         consensus_prob = po
                         # Direct no-vig probability from Pinnacle's matching line
                         fair = po if direction == "total_over" else pu

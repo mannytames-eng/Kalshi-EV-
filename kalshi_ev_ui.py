@@ -103,16 +103,16 @@ def _odds_refresh_interval() -> int:
       Pre-close: ~4 credits/day
       Total: ~642/day → ~19,260/month  (740 buffer on 20k)
 
-    Conservation mode (May 24–31): credits may run out before June 1 — accepted.
-      Peak  (11h × 6/hr  × 2): 132 credits/day
-      Off   (13h × 1/hr  × 2):  26 credits/day
-      Props: disabled              0 credits/day
-      Total: ~158/day
+    Full mode (100k plan, 2026-05-26+):
+      MLB+NBA peak  (11h × 20/hr × 8): 1,760 credits/day
+      MLB+NBA off   (13h × 3/hr  × 8):   312 credits/day
+      Props (4h interval, 10 events × 6/day × 2):  120 credits/day
+      Total: ~2,192/day  (budget: ~3,333/day on 100k plan)
     """
     et_hour = _et_hour()
     today   = datetime.now(timezone.utc).date()
     from datetime import date as _date
-    conservation = _date(2026, 5, 24) <= today < _date(2026, 6, 1)
+    conservation = False  # conservation mode ended — 100k credits, full speed ahead
     if conservation:
         if 11 <= et_hour < 22:
             return 10 * 60   # conservation: 10 min peak
@@ -1989,9 +1989,11 @@ def _send_odds_stale_alert(minutes: float) -> None:
 
 def _run_odds_refresh():
     """
-    Fetch fresh Pinnacle odds (MLB only — NBA removed) and update the cached index.
-    Costs exactly 1 Odds API credit per call.
-    Runs every _odds_refresh_interval() seconds: 2-min peak / 4-min off-peak.
+    Fetch fresh Pinnacle odds (MLB + NBA) and update the cached indices.
+    MLB: spreads + totals + alternate_spreads + alternate_totals (4 credits/call)
+    NBA: spreads + totals + alternate_spreads + alternate_totals (4 credits/call)
+    Total: ~8 credits/refresh.  3-min peak / 20-min off-peak.
+    Budget: ~2,200 credits/day (well under 3,333 on 100k plan).
     """
     global _cached_mlb_index, _cached_nba_index, _last_odds_refresh, \
            _last_odds_cache_success, _odds_game_count
@@ -2019,7 +2021,22 @@ def _run_odds_refresh():
                 _cached_mlb_index = None
             print("  MLB odds cache cleared — will not scan until credits restore")
 
-    # NBA odds fetch removed — NBA props eliminated, totals-only mode saves credits
+    try:
+        nba_idx, _ = fetch_odds_index(
+            "basketball_nba", total_range=(160.0, 260.0), spread_limit=20.0
+        )
+        if nba_idx is not None:
+            with _odds_cache_lock:
+                _cached_nba_index = nba_idx
+            print(f"  NBA index cached")
+        else:
+            print("  WARNING: fetch_odds_index returned None — NBA cache not updated")
+    except Exception as exc:
+        print(f"  ERROR refreshing NBA odds index: {exc}")
+        if "401" in str(exc):
+            with _odds_cache_lock:
+                _cached_nba_index = None
+            print("  NBA odds cache cleared — will not scan until credits restore")
 
     with _odds_cache_lock:
         _last_odds_refresh = time.time()
@@ -2081,7 +2098,7 @@ def _run_scan():
                 _state["scanning"] = False
             return
 
-        # MLB spreads + totals — ML removed (not used); NBA removed entirely for credit conservation
+        # MLB spreads + totals — ML removed (not used for fair-value)
         mlb, mlb_stats, mlb_snapshot = scan_sport(
             label="MLB — Spread & Totals",
             spread_series="KXMLBSPREAD",
@@ -2094,17 +2111,27 @@ def _run_scan():
             game_index=mlb_idx,
         )
 
-        # NBA scanning removed — props eliminated, totals-only mode, credit conservation
-        nba = []
-        nba_stats = {}
+        # NBA spreads + totals — re-enabled 2026-05-26 after upgrading to 100k credits
+        if nba_idx is not None:
+            nba, nba_stats, _nba_snapshot = scan_sport(
+                label="NBA — Spread & Totals",
+                spread_series="KXNBASPREAD",
+                total_series="KXNBATOTAL",
+                ml_series=None,
+                odds_sport="basketball_nba",
+                abbr_map=NBA_ABBR,
+                spread_std=NBA_SPREAD_STD,
+                total_std=NBA_TOTAL_STD,
+                game_index=nba_idx,
+            )
+        else:
+            nba = []
+            nba_stats = {}
 
         # Player props — MLB only, throttled to PROPS_REFRESH_SECONDS (4h)
-        # Disabled in conservation mode (May 24–31) to preserve remaining credits.
         global _last_props_scan
         now_ts = time.time()
-        from datetime import date as _date
-        _conservation = _date(2026, 5, 24) <= datetime.now(timezone.utc).date() < _date(2026, 6, 1)
-        if not _conservation and now_ts - _last_props_scan >= PROPS_REFRESH_SECONDS:
+        if now_ts - _last_props_scan >= PROPS_REFRESH_SECONDS:
             try:
                 mlb_props = scan_player_props(odds_sport="baseball_mlb", abbr_map=MLB_ABBR)
             except Exception as _prop_exc:

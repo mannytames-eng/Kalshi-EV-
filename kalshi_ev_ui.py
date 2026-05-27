@@ -97,52 +97,71 @@ def _pdt_hour() -> int:
     from datetime import timedelta as _td
     return (datetime.now(timezone.utc) - _td(hours=7)).hour
 
+def _all_games_commenced() -> bool:
+    """Return True when all MLB games for the current slate have commenced.
+
+    Uses Pinnacle's game count as a proxy: once all games go live Pinnacle
+    drops them from the upcoming-odds feed, pushing _odds_game_count to 0.
+    Guards against false-triggering on cold boot by requiring at least one
+    successful odds fetch before the short-circuit can activate.
+    """
+    with _odds_cache_lock:
+        return _last_odds_refresh > 0 and _odds_game_count == 0
+
 def _odds_refresh_interval() -> int:
-    """Return seconds until next Pinnacle odds refresh (PDT-based windows).
+    """Return seconds until next Pinnacle odds refresh (PDT context-aware schedule).
 
     Credit costs (MLB only — 4 markets per call):
       MLB odds call: 4 credits (spreads+totals+alternate_spreads+alternate_totals)
 
     Operating windows (PDT = UTC-7):
-      Peak     09:00–22:00 PDT (13h):  90s  — live game hours, capture line moves fast
-      Off-Peak 22:00–00:00 PDT  (2h): 10min — games winding down
-      Sleep    00:00–09:00 PDT  (9h): 15min — overnight, minimal market movement
+      Discovery    09:00–13:00 PDT (4h):  3min — morning line-setting, lower cadence
+      Peak Trading 13:00–22:00 PDT (9h): 75s  — live game hours, fast line capture
+      Sleep        22:00–09:00 PDT (11h): 15min — overnight, minimal market movement
+
+    Game-slate short-circuit (Task 2): if all MLB games have commenced during
+    Peak Trading, automatically drops to Sleep rates to conserve credits.
 
     Odds credit budget:
-      Peak     (40/hr × 13h × 4): 2,080/day
-      Off-Peak  (6/hr ×  2h × 4):    48/day
-      Sleep     (4/hr ×  9h × 4):   144/day
-      Total odds: ~2,272/day
+      Discovery    (20/hr ×  4h × 4):   320/day
+      Peak Trading (48/hr ×  9h × 4): 1,728/day
+      Sleep         (4/hr × 11h × 4):   176/day
+      Total odds: ~2,224/day
     """
     h = _pdt_hour()
-    if 9 <= h < 22:
-        return 90            # Peak: 90s
-    if h >= 22:
-        return 10 * 60       # Off-Peak: 10min
+    if 13 <= h < 22 and _all_games_commenced():
+        return 15 * 60       # Slate over — drop to Sleep rates early
+    if 9  <= h < 13:
+        return  3 * 60       # Discovery: 3min
+    if 13 <= h < 22:
+        return 75            # Peak Trading: 75s
     return 15 * 60           # Sleep: 15min
 
 def _props_refresh_interval() -> int:
-    """Return seconds between MLB props scans (PDT-based windows).
+    """Return seconds between MLB props scans (PDT context-aware schedule).
 
-    Peak     09:00–22:00 PDT: 15min — frequent checks during pre-game sharpening window
-    Off-Peak 22:00–00:00 PDT:  1h   — infrequent, lines mostly set for the night
-    Sleep    00:00–09:00 PDT:  OFF  — no upcoming games, save credits
+    Discovery    09:00–13:00 PDT: 15min — pre-game lines forming
+    Peak Trading 13:00–22:00 PDT: 30min — active window, balanced frequency
+    Sleep        22:00–09:00 PDT:  OFF  — no upcoming games, save credits
+
+    Game-slate short-circuit: mirrors odds logic — props off when slate over.
 
     Props credit budget (~21 credits/scan: 1 event list + 10 games × 2 markets):
-      Peak     (4/hr × 13h × 21): 1,092/day
-      Off-Peak (1/hr ×  2h × 21):    42/day
-      Sleep:                           0/day
-      Total props: ~1,134/day
+      Discovery    (4/hr ×  4h × 21):  336/day
+      Peak Trading (2/hr ×  9h × 21):  378/day
+      Sleep:                             0/day
+      Total props: ~714/day
 
-    Combined daily budget: ~3,406/day vs 3,333 limit — borderline, but
-    MAX_PROP_EVENTS=10 caps spend and most days have fewer qualifying events.
+    Combined daily budget: ~2,938/day (395/day buffer on 3,333 limit).
     """
     h = _pdt_hour()
-    if 9 <= h < 22:
-        return 15 * 60       # Peak: 15min
-    if h >= 22:
-        return 60 * 60       # Off-Peak: 1h
-    return 10 ** 9           # Sleep: effectively OFF
+    if 13 <= h < 22 and _all_games_commenced():
+        return 10 ** 9       # Slate over — props off
+    if 9  <= h < 13:
+        return 15 * 60       # Discovery: 15min
+    if 13 <= h < 22:
+        return 30 * 60       # Peak Trading: 30min
+    return 10 ** 9           # Sleep: OFF
 REFRESH_SECONDS       = 30         # re-scan Kalshi every 30 sec   (0 credits)
 # Monthly credit math (20k budget):
 #   Odds refresh : 2 × 144/day × 30 =  8,640

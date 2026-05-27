@@ -436,7 +436,7 @@ def fetch_book_odds(sport: str) -> Tuple[List[dict], str]:
     r = requests.get(f"{ODDS_BASE}/sports/{sport}/odds", params={
         "apiKey":     ODDS_API_KEY,
         "bookmakers": sharp_books,
-        "markets":    "spreads,totals",   # alternate_* markets only available on per-event endpoint, not sport endpoint
+        "markets":    "spreads,totals,h2h", # alternate_* markets only available on per-event endpoint, not sport endpoint
         "oddsFormat": "american",
     }, timeout=15)
     r.raise_for_status()
@@ -1759,12 +1759,35 @@ def scan_sport(
                         if mkt_team_is_fav:
                             fair = pin_match_cov
                         else:
-                            # P(underdog wins by > threshold) via Gaussian model,
-                            # anchored to the favorite's cover probability.
-                            fair = _gaussian_spread_fair(
-                                fav_cover_prob, fav_spread_pt, threshold,
-                                spread_std, team_is_fav=False,
-                            )
+                            # P(underdog wins by > threshold) — algebraic formula:
+                            #   P(dog wins by 2+) = 2 × P(dog wins outright) + P(fav covers) − 1
+                            #
+                            # Derivation (pure algebra, no distribution assumptions):
+                            #   P(fav wins by 1) = P(fav wins) − P(fav covers)
+                            #   P(dog wins by 1) = P(dog covers +1.5) − P(dog wins)
+                            #                    = (1 − fav_cover_prob) − ml_prob
+                            #   P(dog wins by 2+) = P(dog wins) − P(dog wins by 1)
+                            #                     = ml_prob − [(1 − fav_cover_prob) − ml_prob]
+                            #                     = 2·ml_prob + fav_cover_prob − 1
+                            #
+                            # Both inputs are live Pinnacle prices — no fixed std parameter,
+                            # no distributional assumptions about baseball margin shape.
+                            # Falls back to Gaussian only if moneyline data is unavailable.
+                            h2h_dog = game_info.get("h2h", {}).get(team_name)
+                            if h2h_dog is None:
+                                for k, v in game_info.get("h2h", {}).items():
+                                    if _norm(k) == _norm(team_name):
+                                        h2h_dog = v
+                                        break
+                            if h2h_dog is not None:
+                                ml_prob, _ = h2h_dog
+                                fair = max(0.0, 2 * ml_prob + fav_cover_prob - 1)
+                            else:
+                                # Moneyline unavailable — fall back to Gaussian
+                                fair = _gaussian_spread_fair(
+                                    fav_cover_prob, fav_spread_pt, threshold,
+                                    spread_std, team_is_fav=False,
+                                )
 
                         # ── Push correction for integer spread lines ──────────
                         # Same issue as totals: Pinnacle's -2.0 line has a push

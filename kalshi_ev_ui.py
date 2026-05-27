@@ -102,11 +102,14 @@ def _all_games_commenced() -> bool:
 
     Uses Pinnacle's game count as a proxy: once all games go live Pinnacle
     drops them from the upcoming-odds feed, pushing _odds_game_count to 0.
-    Guards against false-triggering on cold boot by requiring at least one
-    successful odds fetch before the short-circuit can activate.
+
+    IMPORTANT: uses _last_odds_cache_success (not _last_odds_refresh) so
+    this only activates after at least one confirmed successful Pinnacle fetch.
+    Using _last_odds_refresh would false-trigger on boot if the first fetch
+    fails or returns 0 games, locking the scanner into 15-min Sleep intervals.
     """
     with _odds_cache_lock:
-        return _last_odds_refresh > 0 and _odds_game_count == 0
+        return _last_odds_cache_success > 0 and _odds_game_count == 0
 
 def _odds_refresh_interval() -> int:
     """Return seconds until next Pinnacle odds refresh (PDT context-aware schedule).

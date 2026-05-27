@@ -96,15 +96,19 @@ def _odds_refresh_interval() -> int:
       MLB odds call: 4 credits/refresh (spreads+totals+alternate_spreads+alternate_totals)
       Props call:    2 credits/event   (pitcher_strikeouts+batter_hits = 2 markets)
 
-    Budget (1-min peak / 10-min off-peak — NBA credits reallocated here):
-      Peak  (11h × 60/hr × 4): 2,640 credits/day
+    Budget (90s peak / 10-min off-peak — props at 1h for pre-game coverage):
+      Peak  (11h × 40/hr × 4): 1,760 credits/day
       Off   (13h × 6/hr  × 4):   312 credits/day
-      Props (4h interval, ~15 events × 6/day × 2 credits): ~180 credits/day
-      Total: ~3,132/day  (budget: ~3,333/day on 100k plan — 201 buffer)
+      Props (1h interval, ~10 events × 10/day × 2 credits): ~210 credits/day
+      Total: ~2,282/day  (budget: ~3,333/day on 100k plan — 1,051 buffer)
+
+    Why 90s not 60s: Pinnacle line moves don't resolve in 30 seconds. No real edges
+    are missed by the extra 30s. The freed credits go to 1h props which catches
+    Pinnacle's pre-game sharpening window (2h before first pitch) on every game.
     """
     et_hour = _et_hour()
     if 11 <= et_hour < 22:
-        return 1 * 60        # 1 min peak (3× faster than before — NBA credits freed)
+        return 90            # 90s peak — props at 1h uses freed credits better
     return 10 * 60           # 10 min off-peak
 REFRESH_SECONDS       = 30         # re-scan Kalshi every 30 sec   (0 credits)
 # Monthly credit math (20k budget):
@@ -1561,7 +1565,7 @@ print(f"  Loaded {len(_alerted_keys)} previously alerted edge key(s) from disk")
 # period during game hours — indicates a silent data pipeline failure.
 _zero_edge_streak      = 0          # consecutive scans with no qualifying edges
 _last_props_scan: float = 0.0       # epoch seconds of last props scan
-PROPS_REFRESH_SECONDS  = 4 * 60 * 60   # MLB props: scan every 4h (doubled from 8h — local scanner killed, budget headroom)
+PROPS_REFRESH_SECONDS  = 1 * 60 * 60   # MLB props: scan every 1h — catches pre-game Pinnacle sharpening window
 _zero_edge_alerted     = False      # suppresses duplicate alerts per drought
 _ZERO_EDGE_ALERT_SCANS = 60         # 60 × 2-min scan = 2 hours of silence
 

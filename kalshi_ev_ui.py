@@ -143,27 +143,29 @@ def _odds_refresh_interval() -> int:
 def _props_refresh_interval() -> int:
     """Return seconds between MLB props scans (PDT context-aware schedule).
 
-    Discovery    09:00–13:00 PDT: 15min — pre-game lines forming
-    Peak Trading 13:00–22:00 PDT: 30min — active window, balanced frequency
+    Discovery    09:00–13:00 PDT:  8min — pre-game lines forming, catch early moves
+    Peak Trading 13:00–22:00 PDT: 10min — active window, tripled vs old 30min
     Sleep        22:00–09:00 PDT:  OFF  — no upcoming games, save credits
 
     Game-slate short-circuit: mirrors odds logic — props off when slate over.
 
-    Props credit budget (~21 credits/scan: 1 event list + 10 games × 2 markets):
-      Discovery    (4/hr ×  4h × 21):  336/day
-      Peak Trading (2/hr ×  9h × 21):  378/day
-      Sleep:                             0/day
-      Total props: ~714/day
+    Rationale: props markets (pitcher strikeouts, batter hits) are less liquid
+    than totals — Kalshi can lag Pinnacle by 15-30min after a lineup change or
+    pitcher scratch.  Scanning 3× more often catches those windows.
 
-    Combined daily budget: ~2,938/day (395/day buffer on 3,333 limit).
+    Props credit budget (~21 credits/scan: 1 event list + 10 games × 2 markets):
+      Discovery    (7.5/hr ×  4h × 21):  630/day
+      Peak Trading (  6/hr ×  9h × 21): 1,134/day
+      Sleep:                                0/day
+      Total props: ~1,764/day  (well within 100k credit budget)
     """
     h = _pdt_hour()
     if 13 <= h < 22 and _all_games_commenced():
         return 10 ** 9       # Slate over — props off
     if 9  <= h < 13:
-        return 15 * 60       # Discovery: 15min
+        return  8 * 60       # Discovery: 8min
     if 13 <= h < 22:
-        return 30 * 60       # Peak Trading: 30min
+        return 10 * 60       # Peak Trading: 10min
     return 10 ** 9           # Sleep: OFF
 REFRESH_SECONDS       = 30         # re-scan Kalshi every 30 sec   (0 credits)
 # Monthly credit math (20k budget):

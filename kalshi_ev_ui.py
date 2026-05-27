@@ -89,27 +89,60 @@ def _et_hour() -> int:
     from datetime import timedelta as _td
     return (datetime.now(timezone.utc) - _td(hours=_et_offset_hours())).hour
 
-def _odds_refresh_interval() -> int:
-    """Return seconds until next odds refresh based on current ET hour.
-
-    Credit costs (MLB only — NBA faded 2026-05-26, credits reallocated to faster MLB scans):
-      MLB odds call: 4 credits/refresh (spreads+totals+alternate_spreads+alternate_totals)
-      Props call:    2 credits/event   (pitcher_strikeouts+batter_hits = 2 markets)
-
-    Budget (90s peak / 10-min off-peak — props at 1h for pre-game coverage):
-      Peak  (11h × 40/hr × 4): 1,760 credits/day
-      Off   (13h × 6/hr  × 4):   312 credits/day
-      Props (1h interval, ~10 events × 10/day × 2 credits): ~210 credits/day
-      Total: ~2,282/day  (budget: ~3,333/day on 100k plan — 1,051 buffer)
-
-    Why 90s not 60s: Pinnacle line moves don't resolve in 30 seconds. No real edges
-    are missed by the extra 30s. The freed credits go to 1h props which catches
-    Pinnacle's pre-game sharpening window (2h before first pitch) on every game.
+def _pdt_hour() -> int:
+    """Return the current hour in US Pacific Daylight Time (PDT = UTC-7).
+    PDT is active April–October, covering the full MLB season.
+    Used for all scheduling windows — keeps scanner aligned with West Coast game times.
     """
-    et_hour = _et_hour()
-    if 11 <= et_hour < 22:
-        return 90            # 90s peak — props at 1h uses freed credits better
-    return 10 * 60           # 10 min off-peak
+    from datetime import timedelta as _td
+    return (datetime.now(timezone.utc) - _td(hours=7)).hour
+
+def _odds_refresh_interval() -> int:
+    """Return seconds until next Pinnacle odds refresh (PDT-based windows).
+
+    Credit costs (MLB only — 4 markets per call):
+      MLB odds call: 4 credits (spreads+totals+alternate_spreads+alternate_totals)
+
+    Operating windows (PDT = UTC-7):
+      Peak     09:00–22:00 PDT (13h):  90s  — live game hours, capture line moves fast
+      Off-Peak 22:00–00:00 PDT  (2h): 10min — games winding down
+      Sleep    00:00–09:00 PDT  (9h): 15min — overnight, minimal market movement
+
+    Odds credit budget:
+      Peak     (40/hr × 13h × 4): 2,080/day
+      Off-Peak  (6/hr ×  2h × 4):    48/day
+      Sleep     (4/hr ×  9h × 4):   144/day
+      Total odds: ~2,272/day
+    """
+    h = _pdt_hour()
+    if 9 <= h < 22:
+        return 90            # Peak: 90s
+    if h >= 22:
+        return 10 * 60       # Off-Peak: 10min
+    return 15 * 60           # Sleep: 15min
+
+def _props_refresh_interval() -> int:
+    """Return seconds between MLB props scans (PDT-based windows).
+
+    Peak     09:00–22:00 PDT: 15min — frequent checks during pre-game sharpening window
+    Off-Peak 22:00–00:00 PDT:  1h   — infrequent, lines mostly set for the night
+    Sleep    00:00–09:00 PDT:  OFF  — no upcoming games, save credits
+
+    Props credit budget (~21 credits/scan: 1 event list + 10 games × 2 markets):
+      Peak     (4/hr × 13h × 21): 1,092/day
+      Off-Peak (1/hr ×  2h × 21):    42/day
+      Sleep:                           0/day
+      Total props: ~1,134/day
+
+    Combined daily budget: ~3,406/day vs 3,333 limit — borderline, but
+    MAX_PROP_EVENTS=10 caps spend and most days have fewer qualifying events.
+    """
+    h = _pdt_hour()
+    if 9 <= h < 22:
+        return 15 * 60       # Peak: 15min
+    if h >= 22:
+        return 60 * 60       # Off-Peak: 1h
+    return 10 ** 9           # Sleep: effectively OFF
 REFRESH_SECONDS       = 30         # re-scan Kalshi every 30 sec   (0 credits)
 # Monthly credit math (20k budget):
 #   Odds refresh : 2 × 144/day × 30 =  8,640
@@ -134,6 +167,7 @@ PAPER_KELLY_CAP      = 0.05     # max 5% of current balance per bet
 _lock    = threading.Lock()
 _state   = {
     "edges":           [],
+    "edges_cache":     [],     # last non-empty scan result — served during off-peak/sleep windows
     "last_scan":       None,   # ISO string
     "scanning":        False,
     "error":           None,
@@ -1565,7 +1599,7 @@ print(f"  Loaded {len(_alerted_keys)} previously alerted edge key(s) from disk")
 # period during game hours — indicates a silent data pipeline failure.
 _zero_edge_streak      = 0          # consecutive scans with no qualifying edges
 _last_props_scan: float = 0.0       # epoch seconds of last props scan
-PROPS_REFRESH_SECONDS  = 1 * 60 * 60   # MLB props: scan every 1h — catches pre-game Pinnacle sharpening window
+# Props refresh interval is now dynamic — see _props_refresh_interval() above.
 _zero_edge_alerted     = False      # suppresses duplicate alerts per drought
 _ZERO_EDGE_ALERT_SCANS = 60         # 60 × 2-min scan = 2 hours of silence
 
@@ -2088,10 +2122,10 @@ def _run_scan():
         nba = []
         nba_stats = {}
 
-        # Player props — MLB only, throttled to PROPS_REFRESH_SECONDS (4h)
+        # Player props — MLB only, interval set by _props_refresh_interval() per PDT window
         global _last_props_scan
         now_ts = time.time()
-        if now_ts - _last_props_scan >= PROPS_REFRESH_SECONDS:
+        if now_ts - _last_props_scan >= _props_refresh_interval():
             try:
                 mlb_props = scan_player_props(odds_sport="baseball_mlb", abbr_map=MLB_ABBR)
             except Exception as _prop_exc:
@@ -2235,6 +2269,8 @@ def _run_scan():
 
         with _lock:
             _state["edges"]           = edges
+            if edges:
+                _state["edges_cache"] = edges   # persist last non-empty result for quiet windows
             _state["last_scan"]       = now_iso
             _state["scanning"]        = False
             _state["last_scan_stats"] = mlb_stats   # diagnostic counters for /api/scan
@@ -4726,6 +4762,13 @@ class Handler(BaseHTTPRequestHandler):
         elif path == "/api/scan":
             with _lock:
                 state_copy = dict(_state)
+            # Serve cached edges if the current scan produced none — prevents
+            # status indicators from reading zero during off-peak/sleep windows.
+            if not state_copy.get("edges") and state_copy.get("edges_cache"):
+                state_copy["edges"]           = state_copy["edges_cache"]
+                state_copy["edges_from_cache"] = True
+            else:
+                state_copy["edges_from_cache"] = False
             # Augment with watchdog / odds health info for observability
             with _odds_cache_lock:
                 odds_age_sec         = int(time.time() - _last_odds_refresh) if _last_odds_refresh else None

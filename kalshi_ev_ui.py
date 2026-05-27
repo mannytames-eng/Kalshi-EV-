@@ -143,8 +143,8 @@ def _odds_refresh_interval() -> int:
 def _props_refresh_interval() -> int:
     """Return seconds between MLB props scans (PDT context-aware schedule).
 
-    Discovery    09:00–13:00 PDT:  8min — pre-game lines forming, catch early moves
-    Peak Trading 13:00–22:00 PDT: 10min — active window, tripled vs old 30min
+    Discovery    09:00–13:00 PDT: 10min — pre-game lines forming
+    Peak Trading 13:00–22:00 PDT:  8min — lineups locked, scratches happen here
     Sleep        22:00–09:00 PDT:  OFF  — no upcoming games, save credits
 
     Game-slate short-circuit: mirrors odds logic — props off when slate over.
@@ -163,9 +163,9 @@ def _props_refresh_interval() -> int:
     if 13 <= h < 22 and _all_games_commenced():
         return 10 ** 9       # Slate over — props off
     if 9  <= h < 13:
-        return  8 * 60       # Discovery: 8min
+        return 10 * 60       # Discovery: 10min
     if 13 <= h < 22:
-        return 10 * 60       # Peak Trading: 10min
+        return  8 * 60       # Peak Trading: 8min
     return 10 ** 9           # Sleep: OFF
 REFRESH_SECONDS       = 30         # re-scan Kalshi every 30 sec   (0 credits)
 # Monthly credit math (20k budget):

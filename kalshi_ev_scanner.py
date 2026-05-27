@@ -1741,7 +1741,30 @@ def scan_sport(
                         if pin_match is None:
                             continue  # Pinnacle doesn't post this exact spread line
                         _diag_line_matches += 1
-                        pin_match_pt, fair = pin_match
+                        pin_match_pt, pin_match_cov = pin_match
+
+                        # ── Direction-correct fair value ──────────────────────
+                        # Kalshi YES = P(team wins by > threshold) for BOTH sides.
+                        #
+                        # Favorite  : pin_match_cov = P(fav covers -threshold)
+                        #             = P(fav wins by threshold+)  → use directly
+                        #
+                        # Underdog  : pin_match_cov = P(dog covers +threshold)
+                        #             = P(dog doesn't lose by threshold+)
+                        #             ≠ P(dog wins by threshold+)  → Gaussian fix
+                        #
+                        # Without this fix, underdog markets produce phantom ~25%
+                        # adj_edges because cover-prob (≈58%) >> Kalshi YES (≈27%),
+                        # even though both numbers are internally consistent.
+                        if mkt_team_is_fav:
+                            fair = pin_match_cov
+                        else:
+                            # P(underdog wins by > threshold) via Gaussian model,
+                            # anchored to the favorite's cover probability.
+                            fair = _gaussian_spread_fair(
+                                fav_cover_prob, fav_spread_pt, threshold,
+                                spread_std, team_is_fav=False,
+                            )
 
                         # ── Push correction for integer spread lines ──────────
                         # Same issue as totals: Pinnacle's -2.0 line has a push
@@ -1924,22 +1947,21 @@ def scan_sport(
                 seen_edges.add(dedup_key)
 
                 # ── Book-consensus validation ─────────────────────────────
-                # books_detail always stores the CANONICAL direction probability:
-                #   • total markets  → over_prob  (YES on OVER market)
-                #   • spread markets → fav_cover_prob (YES on FAV-covers market)
+                # books_detail stores P(Kalshi YES resolves) from each book:
+                #   • total_over     → over_prob   (YES = over)
+                #   • total_under    → under_prob? No — stored as over_prob
+                #   • spread (fav)   → P(fav wins by > threshold) = fav_cover_prob
+                #   • spread (dog)   → P(dog wins by > threshold) via Gaussian
                 #
-                # For markets where Kalshi YES = the OPPOSITE canonical direction
-                # (total_under or underdog-spread), we must flip the per-book
-                # probabilities before passing to the validator so it compares
-                # the right side against k_side.
+                # "canonical_yes_flip" = True when books_detail stores the
+                # CANONICAL (over/fav-cover) probability but Kalshi YES is the
+                # OPPOSITE direction, so we must flip before validation.
                 #
-                # "canonical_yes_flip" = True when books_detail represents the
-                # OPPOSITE of what Kalshi's YES side means.
+                # Underdog spreads no longer need flipping: after the Gaussian
+                # direction fix, books_detail["pinnacle"] = P(Kalshi YES) directly
+                # for both favorite and underdog sides.
                 canonical_yes_flip = (
                     direction == "total_under"
-                    or (direction == "spread_team"
-                        and fav_spread_info is not None
-                        and not mkt_team_is_fav)
                 )
                 if canonical_yes_flip:
                     # Re-express books_detail as P(Kalshi YES wins) per book

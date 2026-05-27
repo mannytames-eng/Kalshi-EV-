@@ -436,7 +436,7 @@ def fetch_book_odds(sport: str) -> Tuple[List[dict], str]:
     r = requests.get(f"{ODDS_BASE}/sports/{sport}/odds", params={
         "apiKey":     ODDS_API_KEY,
         "bookmakers": sharp_books,
-        "markets":    "spreads,totals,alternate_spreads,alternate_totals",   # alternates capture every Pinnacle line
+        "markets":    "spreads,totals",   # alternate_* markets only available on per-event endpoint, not sport endpoint
         "oddsFormat": "american",
     }, timeout=15)
     r.raise_for_status()

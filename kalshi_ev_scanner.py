@@ -1679,6 +1679,21 @@ def scan_sport(
             except Exception:
                 continue
 
+            # ── Dynamic target-line parsing ────────────────────────────────
+            # Collect every floor_strike listed in this event's Kalshi markets.
+            # Used below to restrict pin_lines to only lines with an active
+            # Kalshi contract, avoiding work on Pinnacle lines nothing references.
+            # Fallback: empty set → full pin_lines used in the matching step.
+            _event_total_thresholds: Set[float] = set()
+            if mkt_type == "total":
+                for _m in mkts:
+                    _fl = _m.get("floor_strike")
+                    if _fl is not None:
+                        try:
+                            _event_total_thresholds.add(float(_fl))
+                        except (ValueError, TypeError):
+                            pass
+
             for mkt in mkts:
                 prices = kalshi_prices(mkt)
                 if prices is None:
@@ -1786,6 +1801,21 @@ def scan_sport(
                         # in integer-scored sports (e.g. 8.0 == 8.5 in baseball — both
                         # require 9+ runs). Prefer exact/equivalent matches over Gaussian.
                         pin_lines    = total_info.get("pin_lines", {})
+                        # Restrict to Kalshi-listed thresholds; falls back to full
+                        # pin_lines when pre-pass returned empty (parse failure).
+                        if _event_total_thresholds:
+                            _targeted = {
+                                pt: probs for pt, probs in pin_lines.items()
+                                if any(
+                                    abs(pt - thr) <= 0.25 or _lines_equivalent(pt, thr)
+                                    for thr in _event_total_thresholds
+                                )
+                            }
+                            if _targeted:
+                                pin_lines = _targeted
+                            else:
+                                print(f"    [target-lines] fallback — 0 pin_lines matched "
+                                      f"thresholds {sorted(_event_total_thresholds)}")
                         exact_match  = None
                         for pin_pt, pin_probs in pin_lines.items():
                             if abs(pin_pt - threshold) <= 0.25 or _lines_equivalent(pin_pt, threshold):

@@ -187,6 +187,7 @@ PAPER_START_DATE     = "2026-04-07"  # bets before this date excluded from portf
 PAPER_KELLY_FRACTION       = 0.25    # props: quarter-Kelly (higher variance, smaller sample)
 PAPER_KELLY_FRACTION_GAMES = 0.125   # spreads + totals: eighth-Kelly (conservative, correlated outcomes)
 PAPER_KELLY_CAP            = 0.05    # max 5% of current balance per bet
+TAKER_EDGE_THRESHOLD       = 0.05    # ≥5% edge → TAKER (cross spread immediately); below → MAKER (rest limit)
 
 # ── Shared state (updated by background thread) ───────────────────────────────
 _lock    = threading.Lock()
@@ -368,6 +369,8 @@ if not any(b.get("id") == _detorl_id for b in _bets):
         "clv": 0.0,
         "closing_pin_pct": None,
         "clv_source": "none",
+        "execution_strategy": "TAKER",    # 6.8% edge ≥ 5% threshold
+        "resting_limit_price": None,
         "_note": "kalshi_price ~0.43 estimated — REST API has no historical orderbook snapshots",
     })
     _data_fixed = True
@@ -678,6 +681,21 @@ def _add_new_bets(edges: list) -> list:
             else:
                 pin_prob_at_flag = None  # Pinnacle not available at flag time
 
+            # ── Execution strategy ────────────────────────────────────────────
+            # TAKER (edge ≥ TAKER_EDGE_THRESHOLD): cross the spread immediately —
+            #   strong enough alpha to justify paying the spread cost.
+            # MAKER (edge < TAKER_EDGE_THRESHOLD): rest a limit order one tick
+            #   inside the current best ask, capturing spread instead of paying it.
+            # resting_limit_price: None for TAKER; entry price − 1 Kalshi tick (0.01)
+            #   for MAKER — bids inside the spread to improve fill probability while
+            #   avoiding the full ask cost.
+            _is_taker            = (e["edge_pct"] / 100.0) >= TAKER_EDGE_THRESHOLD
+            execution_strategy   = "TAKER" if _is_taker else "MAKER"
+            resting_limit_price  = (
+                None if _is_taker
+                else max(0.01, round(e["kalshi"] - 0.01, 2))
+            )
+
             new_bet = {
                 "id":                 bid,
                 "ticker":             e["ticker"],
@@ -712,6 +730,8 @@ def _add_new_bets(edges: list) -> list:
                 "paper_pnl":          None,                  # set on resolution
                 "correlated":         is_correlated,         # excluded from win-rate/Kelly stats
                 "clv_mult_applied":   _kelly_base_fraction(mkt_type_flag),  # 0.25 (prop) or 0.125 (game line)
+                "execution_strategy":  execution_strategy,    # "TAKER" (≥5% edge) or "MAKER" (rest limit)
+                "resting_limit_price": resting_limit_price,   # None for TAKER; ask − 1 tick for MAKER
             }
 
             _bets.append(new_bet)

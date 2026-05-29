@@ -1229,6 +1229,55 @@ def poisson_cdf(n: int, lam: float) -> float:
     return sum(poisson_pmf(i, lam) for i in range(max(0, int(n)) + 1))
 
 
+def calculate_poisson_probability(
+    expected_mean: float,
+    strike_threshold: float,
+    bet_type: str,
+) -> float:
+    """
+    Cumulative Poisson probability for a discrete player stat.
+
+    OVER  → P(X > floor(strike_threshold)) = 1 − P(X ≤ floor(strike_threshold))
+    UNDER → P(X ≤ floor(strike_threshold))
+
+    Kalshi prop floor_strike=k resolves YES if the stat strictly exceeds k (≥ k+1),
+    so floor() is the correct integer boundary for both half-point and integer lines.
+    Clamps result to [0.0, 1.0] to absorb floating-point rounding at the tails.
+    """
+    if expected_mean <= 0:
+        return 0.0 if bet_type == "OVER" else 1.0
+    if strike_threshold < 0:
+        return 1.0 if bet_type == "OVER" else 0.0
+    k_floor = max(0, int(strike_threshold))
+    cum = min(1.0, max(0.0, poisson_cdf(k_floor, expected_mean)))
+    return round(1.0 - cum, 6) if bet_type == "OVER" else round(cum, 6)
+
+
+def derive_synthetic_prop_fair_value(
+    current_macro_total: float,
+    opening_macro_total: float,
+    baseline_prop_value: float,
+    bet_type: str = "OVER",
+) -> float:
+    """
+    Synthetic prop fair-value probability derived from macro game-total movement.
+
+    Scales the expected prop mean by the ratio of current to opening game total:
+      scale_factor   = current_macro_total / opening_macro_total
+      dynamic_lambda = baseline_prop_value × scale_factor
+
+    When current == opening (no shift), scale_factor = 1.0 and the result is
+    the pure Poisson probability at the contract threshold.  When the game total
+    moves (e.g. 9.0 → 9.5), the prop mean scales proportionally, lifting OVER
+    probabilities and depressing UNDER probabilities.
+    """
+    if opening_macro_total <= 0 or baseline_prop_value <= 0:
+        return 0.0
+    scale_factor   = current_macro_total / opening_macro_total
+    dynamic_lambda = baseline_prop_value * scale_factor
+    return calculate_poisson_probability(dynamic_lambda, baseline_prop_value, bet_type)
+
+
 def poisson_lambda_from_line(line: float, over_prob: float) -> Optional[float]:
     """
     Invert: find λ such that P(X > floor(line)) = over_prob.
@@ -2305,6 +2354,96 @@ def build_all_player_props(
     return player_lookup
 
 
+def _make_synthetic_prop_edge(
+    kp: dict,
+    mkt_type_label: str,
+    now_utc,
+) -> Optional[dict]:
+    """
+    Shadow-mode synthetic edge for a Kalshi prop with no matching Pinnacle line.
+
+    Derives fair value via derive_synthetic_prop_fair_value() using:
+      current_macro_total = opening_macro_total = kp["threshold"]
+      (scale_factor = 1.0 — no macro-shift data yet)
+      dynamic_lambda = threshold × 1.0 = threshold
+
+    This produces the Poisson P(X > floor(threshold) | λ = threshold) baseline.
+    All synthetic edges are tagged is_synthetic=True so they can be tracked
+    separately from direct-mapped bets; never size positions based on them.
+
+    Returns an edge dict or None if EV falls below EDGE_THRESHOLD or above cap.
+    """
+    threshold = kp["threshold"]
+    yes_bid   = kp["yes_bid"]
+    yes_ask   = kp["yes_ask"]
+
+    # Synthetic fair-value: Poisson(λ = threshold), no macro shift applied yet.
+    # Future: pass real current / opening macro totals to activate scaling.
+    fair_over  = derive_synthetic_prop_fair_value(
+        current_macro_total = threshold,
+        opening_macro_total = threshold,
+        baseline_prop_value = threshold,
+        bet_type            = "OVER",
+    )
+    fair_under = 1.0 - fair_over
+
+    yes_raw  = fair_over  - yes_ask
+    no_raw   = fair_under - (1.0 - yes_bid)
+
+    yes_fee  = KALSHI_FEE_RATE * fair_over  * (1 - yes_ask)
+    no_fee   = KALSHI_FEE_RATE * fair_under * yes_bid
+    yes_adj  = (yes_raw - yes_fee) * (1 - EV_HAIRCUT)
+    no_adj   = (no_raw  - no_fee)  * (1 - EV_HAIRCUT)
+
+    best_adj = max(yes_adj, no_adj)
+    if best_adj < EDGE_THRESHOLD or best_adj > PROP_MAX_EDGE:
+        return None
+
+    if yes_adj >= no_adj:
+        side, k_side, f_side, raw_edge, adj_edge = "YES", yes_ask,     fair_over,  yes_raw, yes_adj
+    else:
+        side, k_side, f_side, raw_edge, adj_edge = "NO",  1 - yes_bid, fair_under, no_raw,  no_adj
+
+    if k_side < MIN_KALSHI_PRICE:
+        return None
+
+    matchup = (kp["mkt_title"] or kp["ev_title"] or kp["ticker"]).split(":")[0].strip()
+
+    print(
+        f"  ◈ synth {kp['prop_type']:<20} {matchup:<30} {side}  "
+        f"kalshi={k_side:.1%}  synth_fair={f_side:.1%}  adj={adj_edge:+.1%}  "
+        f"[Poisson λ={threshold:.1f}]  [SHADOW MODE — no Pinnacle line]"
+    )
+
+    return {
+        "ticker":               kp["ticker"],
+        "title":                f"{kp['mkt_title']} [SYNTHETIC λ={threshold:.1f}]",
+        "kalshi_line":          threshold,
+        "matchup":              matchup,
+        "side":                 side,
+        "kalshi":               round(k_side, 4),
+        "fair":                 round(f_side, 4),
+        "raw_edge":             round(raw_edge, 4),
+        "edge":                 round(adj_edge, 4),
+        "confidence":           0.5,    # unknown — single Poisson model, no book validation
+        "mkt_type":             mkt_type_label,
+        "pin_line":             None,   # no direct Pinnacle line
+        "prop_type":            kp["prop_type"],
+        "books_used":           [],
+        "books_detail":         {},
+        "per_book_novig":       {},
+        "consensus_yes":        round(fair_over, 4),
+        "consensus_no":         round(fair_under, 4),
+        "consensus_yes_american": prob_to_american(fair_over),
+        "consensus_no_american":  prob_to_american(fair_under),
+        "consensus_prob":       round(fair_over, 4),
+        "is_valid_consensus":   False,
+        "consensus_reason":     f"Poisson synthetic (λ={threshold:.1f}) — no Pinnacle line",
+        "is_synthetic":         True,
+        "kalshi_price_ts":      now_utc.isoformat(),
+    }
+
+
 def scan_player_props(
     odds_sport: str = "baseball_mlb",
     abbr_map: Optional[Dict[str, str]] = None,
@@ -2453,6 +2592,15 @@ def scan_player_props(
 
         matched = _find_player_in_title(search_title, prop_sublookup)
         if matched is None:
+            # ── Shadow mode: no direct Pinnacle line — attempt Poisson synthetic ──
+            # Triggers when Pinnacle has the prop type but not this specific player.
+            # is_synthetic=True tags the edge for separate performance tracking.
+            synth = _make_synthetic_prop_edge(kp, mkt_type_label, now_utc)
+            if synth is not None:
+                dedup_key = (kp["ticker"], synth["side"])
+                if dedup_key not in seen_edges:
+                    seen_edges.add(dedup_key)
+                    edges.append(synth)
             continue
 
         # ── Ghost-edge safeguard: integer boundary check ─────────────────────

@@ -387,6 +387,7 @@ if not any(b.get("id") == _detorl_id for b in _bets):
         "clv_source": "none",
         "execution_strategy": "TAKER",    # 6.8% edge ≥ 5% threshold
         "resting_limit_price": None,
+        "is_synthetic": False,
         "_note": "kalshi_price ~0.43 estimated — REST API has no historical orderbook snapshots",
     })
     _data_fixed = True
@@ -768,6 +769,7 @@ def _add_new_bets(edges: list) -> list:
                 "clv_mult_applied":   _kelly_base_fraction(mkt_type_flag),  # 0.25 (prop) or 0.125 (game line)
                 "execution_strategy":  execution_strategy,    # "TAKER" (≥5% edge) or "MAKER" (rest limit)
                 "resting_limit_price": resting_limit_price,   # None for TAKER; ask − 1 tick for MAKER
+                "is_synthetic":        e.get("is_synthetic", False),  # True → shadow-mode Poisson derivation
             }
 
             _bets.append(new_bet)

@@ -50,6 +50,8 @@ from kalshi_ev_scanner import (
     kalshi_get,
     fetch_game_scores,
     fetch_odds_index,
+    fetch_book_odds,
+    build_consensus_game_index,
     validate_bet,
     MLB_SPREAD_STD, MLB_TOTAL_STD,
     NBA_SPREAD_STD, NBA_TOTAL_STD,
@@ -116,23 +118,34 @@ def _all_games_commenced() -> bool:
 def _odds_refresh_interval() -> int:
     """Return seconds until next Pinnacle odds refresh (PDT context-aware schedule).
 
-    Credit costs (MLB only — 4 markets per call):
-      MLB odds call: 4 credits (spreads+totals+alternate_spreads+alternate_totals)
+    Credit costs (MLB only — 2 credits/refresh with parametric split):
+      spreads call: 1 credit  (regions=eu × 1 market)
+      totals  call: 1 credit  (regions=eu × 1 market)
+
+    Asymmetric game-proximity overrides (checked first):
+      > 24h until next game: 4h cooldown — no meaningful movement that far out
+      < 3h until next game:  60s hot-path — capture fast pre-game line movement
+      3–24h window:          fall through to PDT time-of-day schedule below
 
     Operating windows (PDT = UTC-7):
-      Discovery    09:00–13:00 PDT (4h):  3min — morning line-setting, lower cadence
-      Peak Trading 13:00–22:00 PDT (9h): 75s  — live game hours, fast line capture
-      Sleep        22:00–09:00 PDT (11h): 15min — overnight, minimal market movement
+      Discovery    09:00–13:00 PDT (4h):  3min
+      Peak Trading 13:00–22:00 PDT (9h): 75s
+      Sleep        22:00–09:00 PDT (11h): 15min
 
-    Game-slate short-circuit (Task 2): if all MLB games have commenced during
-    Peak Trading, automatically drops to Sleep rates to conserve credits.
-
-    Odds credit budget:
-      Discovery    (20/hr ×  4h × 4):   320/day
-      Peak Trading (48/hr ×  9h × 4): 1,728/day
-      Sleep         (4/hr × 11h × 4):   176/day
-      Total odds: ~2,224/day
+    Game-slate short-circuit: if all MLB games have commenced during Peak
+    Trading, automatically drops to Sleep rates.
     """
+    # ── Asymmetric proximity check ────────────────────────────────────────
+    # Read _next_game_start_utc under the cache lock (brief acquisition only).
+    with _odds_cache_lock:
+        _ngs = _next_game_start_utc
+    if _ngs is not None:
+        hours_until_start = (_ngs - time.time()) / 3600
+        if hours_until_start > 24:
+            return 4 * 3600   # far-out slate: 4h cooldown
+        if hours_until_start < 3:
+            return 60         # imminent game: 60s hot-path
+    # ── PDT time-of-day schedule (3–24h window or no game data yet) ──────
     h = _pdt_hour()
     if 13 <= h < 22 and _all_games_commenced():
         return 15 * 60       # Slate over — drop to Sleep rates early
@@ -232,11 +245,12 @@ print(f"  Loaded {len(_edge_price_history)} Pinnacle price entries from disk")
 # The fast 2-min Kalshi scan reads these without spending Odds API credits.
 # None = not yet fetched; scan_sport falls back to inline fetch on first run.
 _odds_cache_lock  = threading.Lock()
-_cached_mlb_index: Optional[dict] = None
-_cached_nba_index: Optional[dict] = None
-_last_odds_refresh: float        = 0.0   # epoch seconds of last ATTEMPT (success or fail)
-_last_odds_cache_success: float  = 0.0   # epoch seconds of last SUCCESSFUL index population
-_odds_game_count: int            = 0     # number of Pinnacle matchups in the cached index
+_cached_mlb_index: Optional[dict]  = None
+_cached_nba_index: Optional[dict]  = None
+_last_odds_refresh: float          = 0.0   # epoch seconds of last ATTEMPT (success or fail)
+_last_odds_cache_success: float    = 0.0   # epoch seconds of last SUCCESSFUL index population
+_odds_game_count: int              = 0     # number of Pinnacle matchups in the cached index
+_next_game_start_utc: Optional[float] = None  # epoch of earliest upcoming game; drives proximity scheduler
 
 # ── validate_bet result cache (saves 1 credit per click) ─────────────────────
 # validate_bet() calls fetch_book_odds() — 1 Odds API credit per call.
@@ -2048,29 +2062,79 @@ def _send_odds_stale_alert(minutes: float) -> None:
     print(f"  Odds-stale alert sent ({minutes:.0f} min since last refresh): {'✓' if ok else 'FAILED'}")
 
 
+def _merge_odds_responses(*games_lists: list) -> list:
+    """Merge multiple Odds API game payloads into one unified list keyed by game ID.
+
+    The parametric split fetches spreads and totals in separate calls — each
+    response contains the same events but different market types per bookmaker.
+    This merges them so build_consensus_game_index sees a single complete list.
+    """
+    merged: dict = {}
+    for games in games_lists:
+        for game in games:
+            gid = game["id"]
+            if gid not in merged:
+                merged[gid] = {k: v for k, v in game.items() if k != "bookmakers"}
+                merged[gid]["bookmakers"] = []
+            for bm in game.get("bookmakers", []):
+                existing = next(
+                    (b for b in merged[gid]["bookmakers"] if b["key"] == bm["key"]),
+                    None,
+                )
+                if existing is None:
+                    merged[gid]["bookmakers"].append({k: v for k, v in bm.items()})
+                else:
+                    existing.setdefault("markets", []).extend(bm.get("markets", []))
+    return list(merged.values())
+
+
 def _run_odds_refresh():
     """
     Fetch fresh Pinnacle odds (MLB only — NBA faded) and update the cached index.
-    MLB: spreads + totals + alternate_spreads + alternate_totals = 4 credits/call.
-    1-min peak / 10-min off-peak.  ~3,132 credits/day on 100k plan.
+
+    Parametric split: two separate calls (markets=spreads, markets=totals) with
+    regions=eu so each costs 1 credit.  Total: 2 credits/refresh vs. the previous
+    multi-region bundle.  Merged before building the consensus index.
+    Also extracts the earliest game commence_time to feed the proximity scheduler.
     """
     global _cached_mlb_index, _cached_nba_index, _last_odds_refresh, \
-           _last_odds_cache_success, _odds_game_count
+           _last_odds_cache_success, _odds_game_count, _next_game_start_utc
     print(f"\n  ── Odds index refresh  {datetime.now().strftime('%H:%M:%S')} ──")
 
     try:
-        mlb_idx, _ = fetch_odds_index(
-            "baseball_mlb", total_range=(5.0, 14.0), spread_limit=3.0
+        # Parametric split: one call per market type, regions=eu (1 credit each).
+        spreads_games, _   = fetch_book_odds("baseball_mlb", markets="spreads")
+        totals_games,  rem = fetch_book_odds("baseball_mlb", markets="totals")
+
+        # Merge payloads so the consensus builder sees both market types per game.
+        merged_games = _merge_odds_responses(spreads_games, totals_games)
+        mlb_idx = build_consensus_game_index(
+            merged_games, total_range=(5.0, 14.0), spread_limit=3.0
         )
-        if mlb_idx is not None:
-            n_games = len(mlb_idx) // max(1, 2)
-            with _odds_cache_lock:
-                _cached_mlb_index       = mlb_idx
-                _last_odds_cache_success = time.time()
-                _odds_game_count        = n_games
-            print(f"  MLB index cached: {n_games} matchups")
-        else:
-            print("  WARNING: fetch_odds_index returned None — Pinnacle cache not updated")
+        n_games = len(mlb_idx) // max(1, 2)
+
+        # Extract earliest upcoming commence_time for asymmetric proximity scheduler.
+        now_ts = time.time()
+        starts = []
+        for g in spreads_games:
+            ct = g.get("commence_time")
+            if ct:
+                try:
+                    starts.append(
+                        datetime.fromisoformat(ct.replace("Z", "+00:00")).timestamp()
+                    )
+                except (ValueError, TypeError):
+                    pass
+        next_start = min((ts for ts in starts if ts > now_ts - 3600), default=None)
+
+        with _odds_cache_lock:
+            _cached_mlb_index        = mlb_idx
+            _last_odds_cache_success = time.time()
+            _odds_game_count         = n_games
+            _next_game_start_utc     = next_start
+        hrs = f"{(next_start - now_ts)/3600:.1f}h" if next_start else "?"
+        print(f"  MLB index cached: {n_games} matchups  |  next game: {hrs}  |  credits left: {rem}")
+
     except Exception as exc:
         print(f"  ERROR refreshing MLB odds index: {exc}")
         # On 401 (credits exhausted), wipe the cache — stale odds produce phantom
@@ -2080,7 +2144,7 @@ def _run_odds_refresh():
                 _cached_mlb_index = None
             print("  MLB odds cache cleared — will not scan until credits restore")
 
-    # NBA odds fetch removed — NBA faded permanently 2026-05-26; credits reallocated to 1-min MLB scans
+    # NBA odds fetch removed — NBA faded permanently 2026-05-26; credits reallocated to MLB scans
 
     with _odds_cache_lock:
         _last_odds_refresh = time.time()

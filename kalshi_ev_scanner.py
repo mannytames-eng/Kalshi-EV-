@@ -444,16 +444,22 @@ def kalshi_prices(mkt: dict) -> Optional[Tuple[float, float]]:
 
 
 # ── The Odds API — multi-book ─────────────────────────────────────────────────
-def fetch_book_odds(sport: str) -> Tuple[List[dict], str]:
+def fetch_book_odds(sport: str, markets: str = "spreads,totals") -> Tuple[List[dict], str]:
     """
-    Fetch h2h / spreads / totals from Pinnacle only (1 credit per call).
-    Only sharp-book data is used for fair-value — DK/FanDuel have 0 weight.
+    Fetch book odds from Pinnacle only.
+
+    markets: comma-separated market types to request — pass "spreads" or "totals"
+      to make a single-market call (parametric split pattern).  Default fetches both.
+      Note: alternate_* markets are only available on the per-event endpoint.
+    regions=eu: locks to Pinnacle's home region, preventing multi-region credit
+      multipliers.  Cost = len(markets.split(",")) × 1 region per call.
     """
     sharp_books = ",".join(k for k, w in BOOK_WEIGHTS.items() if w > 0)
     r = requests.get(f"{ODDS_BASE}/sports/{sport}/odds", params={
         "apiKey":     ODDS_API_KEY,
+        "regions":    "eu",
         "bookmakers": sharp_books,
-        "markets":    "spreads,totals",   # alternate_* markets only available on per-event endpoint, not sport endpoint
+        "markets":    markets,
         "oddsFormat": "american",
     }, timeout=15)
     r.raise_for_status()

@@ -4584,9 +4584,9 @@ async function fetchPaper() {
     const settled   = d.won + d.lost;
 
     // Avg Value @ Entry — Pinnacle prob at flag minus Kalshi entry price, averaged over bets with PIN data
-    const valBets = (d.bets || []).filter(b => b.pin_prob_at_flag != null && b.kalshi_price != null);
+    const valBets = (d.bets || []).filter(b => b.fair != null && b.kalshi_price != null);
     const avgVal  = valBets.length
-      ? valBets.reduce((s, b) => s + (b.pin_prob_at_flag - b.kalshi_price * 100), 0) / valBets.length
+      ? valBets.reduce((s, b) => s + (b.fair - b.kalshi_price * 100), 0) / valBets.length
       : null;
     const valColor = avgVal == null ? 'var(--muted)' : 'var(--green)';  // always positive when bets had edge
     const valTxt   = avgVal == null ? '—' : `+${avgVal.toFixed(1)}pp`;
@@ -4924,7 +4924,8 @@ class Handler(BaseHTTPRequestHandler):
             now_iso = datetime.now(timezone.utc).isoformat()
             with _bets_lock:
                 open_bets = [
-                    b for b in _bets
+                    {**b, "kelly_bet_pct": b.get("kelly_bet_pct")}
+                    for b in _bets
                     if b.get("status") == "open"
                     and b.get("paper_stake") is not None
                 ]

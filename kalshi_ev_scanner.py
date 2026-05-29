@@ -2396,7 +2396,17 @@ def _make_synthetic_prop_edge(
     no_adj   = (no_raw  - no_fee)  * (1 - EV_HAIRCUT)
 
     best_adj = max(yes_adj, no_adj)
-    if best_adj < EDGE_THRESHOLD or best_adj > PROP_MAX_EDGE:
+    best_raw = max(yes_raw, no_raw)
+    if best_adj < EDGE_THRESHOLD:
+        return None
+    if best_adj >= MAX_EDGE or best_raw >= MAX_EDGE:
+        print(
+            f"  ⚠️ Data Mismatch Detected: Edge over 20% ceiling. "
+            f"Dropping inverted market anomaly.  "
+            f"[{kp['ticker']}  adj={best_adj:.1%}  raw={best_raw:.1%}]"
+        )
+        return None
+    if best_adj > PROP_MAX_EDGE:
         return None
 
     if yes_adj >= no_adj:
@@ -2653,7 +2663,15 @@ def scan_player_props(
         no_adj   = (no_raw  - no_fee)  * (1 - EV_HAIRCUT)
 
         best_adj = max(yes_adj, no_adj)
+        best_raw = max(yes_raw, no_raw)
         if best_adj < EDGE_THRESHOLD:
+            continue
+        if best_adj >= MAX_EDGE or best_raw >= MAX_EDGE:
+            print(
+                f"  ⚠️ Data Mismatch Detected: Edge over 20% ceiling. "
+                f"Dropping inverted market anomaly.  "
+                f"[{matched.get('player','?')}  adj={best_adj:.1%}  raw={best_raw:.1%}]"
+            )
             continue
         if best_adj > PROP_MAX_EDGE:   # 15% cap — tighter than game-line MAX_EDGE (20%); very large prop edges are almost always a mismatch
             print(

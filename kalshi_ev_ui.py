@@ -4586,7 +4586,7 @@ async function fetchPaper() {
     // Avg Value @ Entry — Pinnacle prob at flag minus Kalshi entry price, averaged over bets with PIN data
     const valBets = (d.bets || []).filter(b => b.fair != null && b.kalshi_price != null);
     const avgVal  = valBets.length
-      ? valBets.reduce((s, b) => s + (b.fair - b.kalshi_price * 100), 0) / valBets.length
+      ? valBets.reduce((s, b) => s + (b.fair - b.kalshi_price) * 100, 0) / valBets.length
       : null;
     const valColor = avgVal == null ? 'var(--muted)' : 'var(--green)';  // always positive when bets had edge
     const valTxt   = avgVal == null ? '—' : `+${avgVal.toFixed(1)}pp`;

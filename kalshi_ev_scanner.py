@@ -1959,7 +1959,7 @@ def scan_sport(
                 no_adj  = no_fee_adj  * (1 - EV_HAIRCUT)
 
                 best_adj = max(yes_adj, no_adj)
-                if best_adj > _diag_best_adj:
+                if best_adj > _diag_best_adj and best_adj <= MAX_EDGE:
                     _diag_best_adj = best_adj
                 if best_adj > 0:
                     _diag_edges_raw += 1   # count positive-EV markets before threshold filter

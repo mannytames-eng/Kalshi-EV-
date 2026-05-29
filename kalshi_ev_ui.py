@@ -188,6 +188,8 @@ PAPER_KELLY_FRACTION       = 0.25    # props: quarter-Kelly (higher variance, sm
 PAPER_KELLY_FRACTION_GAMES = 0.125   # spreads + totals: eighth-Kelly (conservative, correlated outcomes)
 PAPER_KELLY_CAP            = 0.05    # max 5% of current balance per bet
 TAKER_EDGE_THRESHOLD       = 0.05    # ≥5% edge → TAKER (cross spread immediately); below → MAKER (rest limit)
+MAX_ALLOWED_DRAWDOWN       = 0.25    # 25% peak-to-trough loss triggers full circuit breaker
+CURRENT_ACCOUNT_DRAWDOWN   = 0.00    # live drawdown ratio (0.0 = no drawdown, 0.25 = at limit)
 
 # ── Shared state (updated by background thread) ───────────────────────────────
 _lock    = threading.Lock()
@@ -613,15 +615,35 @@ def _kelly_base_fraction(mkt_type: str) -> float:
 
 
 def _paper_kelly_stake(edge_pct: float, kalshi_price: float, mkt_type: str = "") -> float:
-    """Calculate Kelly-sized paper stake against current portfolio balance."""
+    """Volatility-adjusted fractional Kelly with drawdown protection circuit breaker.
+
+    Sizing pipeline:
+      1. full_kelly      = edge / (1 − kalshi_price)          raw Kelly fraction
+      2. base_frac       = 0.25 (props) | 0.125 (game lines)  asset-class scalar
+      3. drawdown_scalar = max(0, 1 − drawdown/MAX_ALLOWED)   linearly cuts size
+         as the account approaches its peak-to-trough limit; hits 0.0 → returns 0
+      4. frac = min(full_kelly × base_frac × drawdown_scalar, PAPER_KELLY_CAP)
+    """
     k = kalshi_price
     e = edge_pct / 100.0
     if k <= 0 or k >= 1 or e <= 0:
         return 0.0
+
+    # ── Drawdown protection scalar ────────────────────────────────────────
+    # Linear ramp: 1.0 at zero drawdown → 0.0 when CURRENT_ACCOUNT_DRAWDOWN
+    # reaches MAX_ALLOWED_DRAWDOWN.  Guard against zero-denominator in case
+    # MAX_ALLOWED_DRAWDOWN is ever mis-configured.
+    drawdown_scalar = (
+        max(0.0, 1.0 - (CURRENT_ACCOUNT_DRAWDOWN / MAX_ALLOWED_DRAWDOWN))
+        if MAX_ALLOWED_DRAWDOWN > 0 else 0.0
+    )
+    if drawdown_scalar <= 0.0:
+        return 0.0   # circuit breaker: account at or beyond drawdown limit
+
     balance    = _compute_paper_balance()
     full_kelly = e / (1.0 - k)
-    base_frac  = _kelly_base_fraction(mkt_type)
-    frac = min(full_kelly * base_frac, PAPER_KELLY_CAP)
+    base_frac  = _kelly_base_fraction(mkt_type)   # 0.25 props / 0.125 game lines
+    frac = min(full_kelly * base_frac * drawdown_scalar, PAPER_KELLY_CAP)
     return round(frac * balance, 2)
 
 

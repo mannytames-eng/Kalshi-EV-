@@ -85,12 +85,13 @@ BOOK_WEIGHTS: Dict[str, float] = {
 }
 
 # ── Normal-distribution standard deviations (empirical) ─────────────────────
-# Used for Gaussian extrapolation: given Pinnacle's spread cover prob at their
-# line, compute P(margin > X) at a different threshold (the Kalshi line).
+# Used for push correction (integer Pinnacle lines) and Gaussian spread extrapolation.
+# MLB totals use _mlb_adaptive_total_sigma() instead of MLB_TOTAL_STD whenever a
+# Pinnacle line is available — the static constant below is a fallback only.
 NBA_SPREAD_STD = 12.0   # points
 NBA_TOTAL_STD  = 15.0   # points
 MLB_SPREAD_STD =  3.2   # runs (margin)
-MLB_TOTAL_STD  =  4.5   # runs (total)
+MLB_TOTAL_STD  =  4.5   # runs — fallback when pin_line is unavailable
 
 
 # ── Ticker date parser ───────────────────────────────────────────────────────
@@ -191,6 +192,22 @@ def _push_correction(no_vig_prob: float, integer_line: float, std: float) -> flo
     )
     push_prob = max(0.0, min(push_prob, 0.15))   # safety cap at 15%
     return 1.0 - push_prob
+
+
+def _mlb_adaptive_total_sigma(pin_line: float) -> float:
+    """
+    Context-aware σ for MLB total run distributions (push correction only).
+
+    Empirical linear fit: σ = 1.5 + 0.33 × total_line
+    Variance scales with the expected run environment:
+      pitcher's duel (7.5 O/U) → σ ≈ 4.0  (tight distribution)
+      average game   (9.0 O/U) → σ ≈ 4.5  (matches historical MLB_TOTAL_STD)
+      high-scoring  (10.5 O/U) → σ ≈ 5.0  (wider distribution)
+    Falls back to MLB_TOTAL_STD when pin_line is zero or unavailable.
+    """
+    if not pin_line or pin_line <= 0:
+        return MLB_TOTAL_STD
+    return 1.5 + 0.33 * pin_line
 
 
 def _gaussian_total_fair(
@@ -1789,10 +1806,13 @@ def scan_sport(
                             # true P(total > line).  Kalshi is binary — a total landing
                             # on the integer is a LOSS, not a push.  Correct before use.
                             if abs(pin_total - round(pin_total)) < 1e-9:
-                                corr      = _push_correction(po, pin_total, total_std)
+                                # MLB: sigma scales with the run environment (pitcher's duel vs. high-scoring).
+                                # NBA: use the static total_std constant.
+                                _sigma    = _mlb_adaptive_total_sigma(pin_total) if "baseball" in odds_sport else total_std
+                                corr      = _push_correction(po, pin_total, _sigma)
                                 push_pct  = (1.0 - corr) * 100
                                 print(f"    [push-corr] integer line {pin_total:.1f}: "
-                                      f"push≈{push_pct:.1f}%  "
+                                      f"σ={_sigma:.2f}  push≈{push_pct:.1f}%  "
                                       f"over {po:.3f}→{po*corr:.3f}  "
                                       f"under {pu:.3f}→{pu*corr:.3f}")
                                 po *= corr

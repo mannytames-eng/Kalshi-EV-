@@ -182,8 +182,9 @@ PERF_BANKROLL        = 1000.0    # bankroll for ROI % display
 # ── Paper trading portfolio ────────────────────────────────────────────────────
 PAPER_START_BALANCE  = 1000.0    # starting virtual bankroll
 PAPER_START_DATE     = "2026-04-07"  # bets before this date excluded from portfolio
-PAPER_KELLY_FRACTION = 0.25     # quarter-Kelly sizing
-PAPER_KELLY_CAP      = 0.05     # max 5% of current balance per bet
+PAPER_KELLY_FRACTION       = 0.25    # props: quarter-Kelly (higher variance, smaller sample)
+PAPER_KELLY_FRACTION_GAMES = 0.125   # spreads + totals: eighth-Kelly (conservative, correlated outcomes)
+PAPER_KELLY_CAP            = 0.05    # max 5% of current balance per bet
 
 # ── Shared state (updated by background thread) ───────────────────────────────
 _lock    = threading.Lock()
@@ -385,7 +386,7 @@ if not any(b.get("id") == _detorl_id for b in _bets):
         "kelly_pnl": 0.02982,
         "kelly_pnl_pct": 2.982,
         "kelly_pnl_dollars": 50.4,
-        "clv_mult_applied": 1.0,
+        "clv_mult_applied": 0.125,
         "closing_yes_pct": None,
         "clv": 0.0,
         "closing_pin_pct": None,
@@ -620,15 +621,27 @@ def _compute_paper_balance() -> float:
     return round(bal, 2)
 
 
-def _paper_kelly_stake(edge_pct: float, kalshi_price: float) -> float:
+def _kelly_base_fraction(mkt_type: str) -> float:
+    """Market-type-aware Kelly base fraction.
+    Props carry more idiosyncratic variance, so they get full quarter-Kelly.
+    Game lines (spread / total) are correlated across the slate — eighth-Kelly
+    keeps aggregate exposure conservative.
+    """
+    if mkt_type in ("prop", "nba_prop"):
+        return PAPER_KELLY_FRACTION        # 0.25 — quarter-Kelly
+    return PAPER_KELLY_FRACTION_GAMES      # 0.125 — eighth-Kelly (spread / total / moneyline)
+
+
+def _paper_kelly_stake(edge_pct: float, kalshi_price: float, mkt_type: str = "") -> float:
     """Calculate Kelly-sized paper stake against current portfolio balance."""
     k = kalshi_price
     e = edge_pct / 100.0
     if k <= 0 or k >= 1 or e <= 0:
         return 0.0
-    balance = _compute_paper_balance()
+    balance    = _compute_paper_balance()
     full_kelly = e / (1.0 - k)
-    frac = min(full_kelly * PAPER_KELLY_FRACTION, PAPER_KELLY_CAP)
+    base_frac  = _kelly_base_fraction(mkt_type)
+    frac = min(full_kelly * base_frac, PAPER_KELLY_CAP)
     return round(frac * balance, 2)
 
 
@@ -673,7 +686,8 @@ def _add_new_bets(edges: list) -> list:
 
             # entry_yes_pct = Kalshi YES ask % when flagged (for CLV calculation)
             kalshi_yes_at_flag = e["kalshi_pct"] if e["side"] == "YES" else round((1 - e["kalshi"]) * 100, 1)
-            paper_stake = _paper_kelly_stake(e["edge_pct"], e["kalshi"])
+            mkt_type_flag = e.get("mkt_type", "")
+            paper_stake   = _paper_kelly_stake(e["edge_pct"], e["kalshi"], mkt_type_flag)
 
             # Pinnacle probability at flag time — the baseline for line-shift detection
             bd = e.get("books_detail", {})
@@ -720,6 +734,7 @@ def _add_new_bets(edges: list) -> list:
                 "paper_stake":        paper_stake,           # Kelly-sized virtual wager
                 "paper_pnl":          None,                  # set on resolution
                 "correlated":         is_correlated,         # excluded from win-rate/Kelly stats
+                "clv_mult_applied":   _kelly_base_fraction(mkt_type_flag),  # 0.25 (prop) or 0.125 (game line)
             }
 
             _bets.append(new_bet)
@@ -1123,14 +1138,15 @@ def _get_performance(since: Optional[str] = None) -> dict:
     corrupted_count = sum(1 for b in bets if _is_corrupted(b))
 
     # ── Kelly sizing helper ────────────────────────────────────────────────────
-    # 0.25 Fractional Kelly for a binary prediction-market bet, with:
-    #   • Hard 5% bankroll cap per bet
-    #   • Dynamic CLV confidence multiplier — types with negative avg CLV get
-    #     0.5× applied on top of the quarter-Kelly fraction
+    # Market-type-aware fractional Kelly for a binary prediction-market bet:
+    #   Props (player props / strikeouts): quarter-Kelly (0.25)
+    #   Game lines (spread / total):       eighth-Kelly  (0.125)
+    #   Hard 5% bankroll cap per bet
+    #   Dynamic CLV confidence multiplier — types with negative avg CLV get
+    #   0.5× applied on top of the base fraction
     #
     # Full Kelly  = edge / (1 − kalshi_price)
-    # Adjusted    = full × 0.25 × clv_multiplier,  capped at 5% of bankroll
-    KELLY_FRACTION   = 0.25   # fractional Kelly scaling
+    # Adjusted    = full × base_fraction × clv_multiplier,  capped at 5% of bankroll
     KELLY_SINGLE_CAP = 0.05   # max 5% of bankroll per bet
 
     # Fetch CLV-based multipliers once for the whole performance pass
@@ -1143,8 +1159,9 @@ def _get_performance(since: Optional[str] = None) -> dict:
             return 0.0
         full_kelly  = e / (1.0 - k)
         mtype       = _infer_mkt_type(b)
+        base_frac   = _kelly_base_fraction(mtype)
         clv_mult    = clv_mults.get(mtype, 1.0)
-        return min(full_kelly * KELLY_FRACTION * clv_mult, KELLY_SINGLE_CAP)
+        return min(full_kelly * base_frac * clv_mult, KELLY_SINGLE_CAP)
 
     def _kelly_pnl(b: dict) -> Optional[float]:
         """P&L as fraction-of-bankroll under CLV-adjusted quarter-Kelly sizing."""
@@ -1254,9 +1271,9 @@ def _get_performance(since: Optional[str] = None) -> dict:
             b["kelly_pnl"]         = round(kp, 5) if kp is not None else None
             b["kelly_pnl_pct"]     = round(kp * 100, 3) if kp is not None else None  # % of bankroll
             b["kelly_pnl_dollars"] = round(kp * PERF_BANKROLL, 2) if kp is not None else None
-        # Flag which multiplier was applied so the UI can show a note
         mtype = _infer_mkt_type(b)
-        b["clv_mult_applied"]  = clv_mults.get(mtype, 1.0)
+        b["clv_mult_applied"]  = _kelly_base_fraction(mtype)   # 0.25 (prop) or 0.125 (game line)
+        b["clv_penalty_mult"]  = clv_mults.get(mtype, 1.0)     # CLV confidence multiplier (1.0 or 0.5)
 
     def _perf_label(b: dict) -> str:
         ticker = b.get("ticker", "").upper()
@@ -1705,7 +1722,7 @@ def _prob_to_american_str(p: Optional[float]) -> str:
 
 
 def _sms_kelly(e: dict) -> float:
-    """Compute 0.25 fractional Kelly (with CLV multiplier) matching the model."""
+    """Compute fractional Kelly (market-type-aware, with CLV multiplier) matching the model."""
     k    = e.get("kalshi", 0.5)
     edge = e.get("edge", 0)          # post-haircut adj. edge (0–1 decimal)
     if k <= 0 or k >= 1 or edge <= 0:
@@ -1713,8 +1730,9 @@ def _sms_kelly(e: dict) -> float:
     full_kelly = edge / (1.0 - k)
     clv_mults  = _get_clv_multipliers()
     mtype      = e.get("mkt_type", "")
+    base_frac  = _kelly_base_fraction(mtype)
     clv_mult   = clv_mults.get(mtype, 1.0)
-    return min(full_kelly * 0.25 * clv_mult, 0.05)
+    return min(full_kelly * base_frac * clv_mult, 0.05)
 
 
 def _alert_top10(newly_logged: list = None):
@@ -4332,7 +4350,7 @@ function renderPerformance(d) {
       : '…';
     // Kelly bet size as % of bankroll (dollar amount in tooltip)
     const kBet   = b.kelly_bet_pct != null
-      ? `<span class="kelly-val" title="$${b.kelly_bet_dollars != null ? b.kelly_bet_dollars.toFixed(0) : '?'} on $${bankroll} bank${b.clv_mult_applied < 1 ? ' — CLV penalty 0.5×' : ''}">${b.kelly_bet_pct.toFixed(2)}%${b.clv_mult_applied < 1 ? ' <span style="color:#e3a53a;font-size:9px;">½</span>' : ''}</span>`
+      ? `<span class="kelly-val" title="$${b.kelly_bet_dollars != null ? b.kelly_bet_dollars.toFixed(0) : '?'} on $${bankroll} bank${b.clv_penalty_mult != null && b.clv_penalty_mult < 1 ? ' — CLV penalty 0.5×' : ''}">${b.kelly_bet_pct.toFixed(2)}%${b.clv_penalty_mult != null && b.clv_penalty_mult < 1 ? ' <span style="color:#e3a53a;font-size:9px;">½</span>' : ''}</span>`
       : '<span class="kelly-na">—</span>';
     // P&L as % of bankroll (dollar amount in tooltip)
     const kPnl   = b.kelly_pnl_pct != null

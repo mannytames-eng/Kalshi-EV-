@@ -7,7 +7,9 @@ Open: http://localhost:8000
 
 import json
 import os
+import queue
 import sys
+import tempfile
 import threading
 import time
 from datetime import datetime, timezone
@@ -198,6 +200,11 @@ _state   = {
     "market_snapshot": {},     # {ticker|side: {adj_edge, kalshi, fair, edge_pct}} — all scanned markets
 }
 
+# ── Async I/O queue ───────────────────────────────────────────────────────────
+# All disk mutations are offloaded to _io_worker_loop (daemon thread).
+# Callers snapshot their data and enqueue; the worker serialises and writes.
+_io_queue: queue.Queue = queue.Queue()
+
 # Tracks first-seen and last-seen YES price for each edge key (for staleness + CLV)
 # Persisted to PIN_PRICES_FILE so Pinnacle prices survive server restarts.
 _edge_history_lock = threading.Lock()
@@ -210,16 +217,9 @@ def _load_pin_prices() -> dict:
         return {}
 
 def _save_pin_prices():
-    try:
-        import tempfile as _tempfile
-        with _edge_history_lock:
-            snapshot = dict(_edge_price_history)
-        fd, tmp = _tempfile.mkstemp(dir=DATA_DIR, suffix=".tmp")
-        with os.fdopen(fd, "w") as f:
-            json.dump(snapshot, f)
-        os.replace(tmp, PIN_PRICES_FILE)
-    except Exception as exc:
-        print(f"  WARNING: could not save pin prices: {exc}")
+    with _edge_history_lock:
+        snapshot = dict(_edge_price_history)
+    _io_queue.put({"op": "save_pin_prices", "data": snapshot})
 
 _edge_price_history: dict = _load_pin_prices()
 print(f"  Loaded {len(_edge_price_history)} Pinnacle price entries from disk")
@@ -250,14 +250,7 @@ def _load_history() -> list:
         return []
 
 def _save_history(history: list):
-    try:
-        import tempfile, os as _os
-        fd, tmp = tempfile.mkstemp(dir=DATA_DIR, suffix=".tmp")
-        with _os.fdopen(fd, "w") as f:
-            json.dump(history[-MAX_HISTORY:], f)
-        _os.replace(tmp, HISTORY_FILE)
-    except Exception as exc:
-        print(f"  WARNING: could not save history: {exc}")
+    _io_queue.put({"op": "save_history", "data": history[-MAX_HISTORY:]})
 
 _history = _load_history()
 
@@ -298,25 +291,9 @@ def _load_bets() -> list:
         return []
 
 def _save_bets(bets: list) -> bool:
-    """Save bets to disk. Returns True on success, False on failure."""
-    try:
-        import tempfile, os as _os
-        fd, tmp = tempfile.mkstemp(dir=DATA_DIR, suffix=".tmp")
-        with _os.fdopen(fd, "w") as f:
-            json.dump(bets, f, indent=2)
-        _os.replace(tmp, BETS_FILE)
-        return True
-    except Exception as exc:
-        print(f"  WARNING: could not save bets to {BETS_FILE}: {exc}")
-        # Fire a Discord alert once per session — silent disk failure = data loss on next restart
-        global _save_bets_alerted
-        if not _save_bets_alerted:
-            _save_bets_alerted = True
-            try:
-                send_discord(None, f"🚨 **Bet save failure** — `{exc}`\nPath: `{BETS_FILE}` | DATA_DIR: `{DATA_DIR}`\nBets are in memory but NOT persisting. Check Railway volume mount.")
-            except Exception:
-                pass
-        return False
+    """Enqueue a bets snapshot for async disk write. Returns True immediately."""
+    _io_queue.put({"op": "save_bets", "data": list(bets)})
+    return True
 
 _bets: list = _load_bets()
 print(f"  Bet store loaded: {len(_bets)} bets from {BETS_FILE}")
@@ -1402,14 +1379,7 @@ def _load_my_bets() -> list:
         return []
 
 def _save_my_bets(bets: list):
-    try:
-        import tempfile, os as _os
-        fd, tmp = tempfile.mkstemp(dir=DATA_DIR, suffix=".tmp")
-        with _os.fdopen(fd, "w") as f:
-            json.dump(bets, f, indent=2)
-        _os.replace(tmp, MY_BETS_FILE)
-    except Exception as exc:
-        print(f"  WARNING: could not save my_bets: {exc}")
+    _io_queue.put({"op": "save_my_bets", "data": list(bets)})
 
 _my_bets: list = _load_my_bets()
 _my_bets_lock = threading.Lock()
@@ -1609,25 +1579,10 @@ def _load_alerted_keys() -> tuple:
         return alerted, set()
 
 def _save_alerted_keys(alerted: set, gone: set):
-    try:
-        import tempfile, os as _os
-        existing = {}
-        try:
-            with open(_ALERTED_KEYS_FILE) as f:
-                existing = json.load(f)
-        except Exception:
-            pass
-        today = datetime.now(timezone.utc).date().isoformat()
-        for k in alerted:
-            existing.setdefault(k, today)
-        for k in gone:
-            existing.setdefault(f"gone:{k}", today)
-        fd, tmp = tempfile.mkstemp(dir=DATA_DIR, suffix=".tmp")
-        with _os.fdopen(fd, "w") as f:
-            json.dump(existing, f)
-        _os.replace(tmp, _ALERTED_KEYS_FILE)
-    except Exception as exc:
-        print(f"  WARNING: could not save alerted keys: {exc}")
+    _io_queue.put({
+        "op":   "save_alerted_keys",
+        "data": {"alerted": list(alerted), "gone": list(gone)},
+    })
 
 # Keys already alerted — loaded from disk so server restarts don't re-fire
 _alerted_keys, _gone_alerted_keys = _load_alerted_keys()
@@ -5067,13 +5022,101 @@ def _load_wc_alerted() -> set:
         return set()
 
 def _save_wc_alerted(alerted: set):
-    try:
-        fd, tmp = tempfile.mkstemp(dir=DATA_DIR, suffix=".tmp")
-        with __import__('os').fdopen(fd, "w") as f:
-            json.dump(list(alerted), f)
-        __import__('os').replace(tmp, _WC_ALERTED_FILE)
-    except Exception as exc:
-        print(f"  WC watcher: could not save alerted series: {exc}")
+    _io_queue.put({"op": "save_wc_alerted", "data": list(alerted)})
+
+
+def _io_worker_loop():
+    """
+    Daemon I/O worker — runs on a dedicated thread and executes all disk
+    writes for the application.
+
+    Callers snapshot their data and drop a payload into _io_queue; this
+    worker blocks on the queue, then serialises and atomically replaces
+    each target file.  Disk I/O never blocks a scan, CLV-capture, or
+    HTTP-handler thread.
+
+    Supported ops:
+      save_bets          — ev_bets.json        (data: list)
+      save_pin_prices    — ev_pin_prices.json  (data: dict)
+      save_history       — ev_history.json     (data: list)
+      save_my_bets       — my_bets.json        (data: list)
+      save_alerted_keys  — ev_alerted_keys.json (data: {alerted:[…], gone:[…]})
+      save_wc_alerted    — wc_alerted_series.json (data: list)
+    """
+    global _save_bets_alerted
+    while True:
+        try:
+            item = _io_queue.get(block=True, timeout=5)
+        except queue.Empty:
+            continue
+        try:
+            op   = item["op"]
+            data = item["data"]
+
+            if op == "save_bets":
+                fd, tmp = tempfile.mkstemp(dir=DATA_DIR, suffix=".tmp")
+                with os.fdopen(fd, "w") as f:
+                    json.dump(data, f, indent=2)
+                os.replace(tmp, BETS_FILE)
+
+            elif op == "save_pin_prices":
+                fd, tmp = tempfile.mkstemp(dir=DATA_DIR, suffix=".tmp")
+                with os.fdopen(fd, "w") as f:
+                    json.dump(data, f)
+                os.replace(tmp, PIN_PRICES_FILE)
+
+            elif op == "save_history":
+                fd, tmp = tempfile.mkstemp(dir=DATA_DIR, suffix=".tmp")
+                with os.fdopen(fd, "w") as f:
+                    json.dump(data, f)
+                os.replace(tmp, HISTORY_FILE)
+
+            elif op == "save_my_bets":
+                fd, tmp = tempfile.mkstemp(dir=DATA_DIR, suffix=".tmp")
+                with os.fdopen(fd, "w") as f:
+                    json.dump(data, f, indent=2)
+                os.replace(tmp, MY_BETS_FILE)
+
+            elif op == "save_alerted_keys":
+                existing = {}
+                try:
+                    with open(_ALERTED_KEYS_FILE) as f:
+                        existing = json.load(f)
+                except Exception:
+                    pass
+                today = datetime.now(timezone.utc).date().isoformat()
+                for k in data["alerted"]:
+                    existing.setdefault(k, today)
+                for k in data["gone"]:
+                    existing.setdefault(f"gone:{k}", today)
+                fd, tmp = tempfile.mkstemp(dir=DATA_DIR, suffix=".tmp")
+                with os.fdopen(fd, "w") as f:
+                    json.dump(existing, f)
+                os.replace(tmp, _ALERTED_KEYS_FILE)
+
+            elif op == "save_wc_alerted":
+                fd, tmp = tempfile.mkstemp(dir=DATA_DIR, suffix=".tmp")
+                with os.fdopen(fd, "w") as f:
+                    json.dump(data, f)
+                os.replace(tmp, _WC_ALERTED_FILE)
+
+            else:
+                print(f"  [io-worker] unknown op: {op!r}")
+
+        except Exception as exc:
+            print(f"  [io-worker] {item.get('op', '?')} failed: {exc}")
+            if item.get("op") == "save_bets" and not _save_bets_alerted:
+                _save_bets_alerted = True
+                try:
+                    send_discord(None,
+                        f"🚨 **Bet save failure** — `{exc}`\n"
+                        f"Path: `{BETS_FILE}` | DATA_DIR: `{DATA_DIR}`\n"
+                        f"Bets are in memory but NOT persisting. Check Railway volume mount.")
+                except Exception:
+                    pass
+        finally:
+            _io_queue.task_done()
+
 
 def _background_wc_watcher_loop():
     """
@@ -5168,6 +5211,7 @@ if __name__ == "__main__":
     def _start_bg_threads():
         """Start (or restart) all background threads. Called on launch and by watchdog."""
         specs = [
+            ("io-writer",   _io_worker_loop),
             ("scan",        _background_loop),
             ("odds",        _background_odds_loop),
             ("resolution",  _background_resolution_loop),

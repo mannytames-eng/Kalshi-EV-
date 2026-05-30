@@ -1151,6 +1151,21 @@ def validate_bet(edge: dict, max_age_seconds: int = 600) -> dict:
         fair_moved_pp = round((fair_now - fair_was) * 100, 1)
         result["fair_moved"] = fair_moved_pp
 
+        # ── Bad-data guard: reject Pinnacle re-fetch if move > 15pp ──────────
+        _PIN_RESCAN_MAX_MOVE_PP = 15.0
+        if fair_now != fair_was and abs(fair_moved_pp) > _PIN_RESCAN_MAX_MOVE_PP:
+            print(
+                f"  [pin-rescan REJECTED] {ticker} — Pinnacle line moved "
+                f"{fair_moved_pp:+.1f}pp "
+                f"({round(fair_was * 100, 1)}% → {round(fair_now * 100, 1)}%) "
+                f"exceeds {_PIN_RESCAN_MAX_MOVE_PP:.0f}pp threshold — "
+                f"likely wrong game matched in index. Keeping stored fair value."
+            )
+            fair_now              = fair_was
+            result["fair_now"]    = round(fair_now * 100, 1)
+            result["fair_moved"]  = 0.0
+            fair_moved_pp         = 0.0
+
     except Exception as exc:
         # Non-fatal — use stored fair value if Pinnacle re-fetch fails
         fair_now = fair_was

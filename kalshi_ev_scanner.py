@@ -772,8 +772,14 @@ def build_consensus_game_index(
                     # posted as the "favorite" to cover by that margin.
                     if bkey == "pinnacle":
                         for tname, cov_prob, pt in probs:
-                            # Store both favorite (pt<0) and underdog (pt>0) so
-                            # Kalshi markets referencing either team can be matched.
+                            # ONLY store entries where pt < 0 (team is the FAVORITE).
+                            # P(favorite covers -X) == P(favorite wins by X+) — the exact
+                            # question Kalshi's "wins by over X" market asks.
+                            # P(underdog covers +X) == P(underdog wins OR loses by <X),
+                            # which is semantically different and would produce phantom
+                            # 20-30% edges on underdog "wins by X+" Kalshi markets.
+                            if pt >= 0:
+                                continue  # underdog line — skip to prevent phantom edges
                             abs_pt = abs(pt)
                             if tname not in pin_spread_lines:
                                 pin_spread_lines[tname] = {}

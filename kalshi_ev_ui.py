@@ -4867,9 +4867,16 @@ class Handler(BaseHTTPRequestHandler):
                 state_copy = dict(_state)
             # Serve cached edges if the current scan produced none — prevents
             # status indicators from reading zero during off-peak/sleep windows.
+            # Filter out stale entries whose game date is before today so settled
+            # markets don't resurface from cache (e.g. a prop that lost yesterday).
             if not state_copy.get("edges") and state_copy.get("edges_cache"):
-                state_copy["edges"]           = state_copy["edges_cache"]
-                state_copy["edges_from_cache"] = True
+                _today_str = datetime.now(timezone.utc).date().isoformat()
+                fresh_cache = [
+                    e for e in state_copy["edges_cache"]
+                    if (_parse_ticker_date(e.get("ticker", "")) or _today_str) >= _today_str
+                ]
+                state_copy["edges"]            = fresh_cache
+                state_copy["edges_from_cache"] = bool(fresh_cache)
             else:
                 state_copy["edges_from_cache"] = False
             # Augment with watchdog / odds health info for observability

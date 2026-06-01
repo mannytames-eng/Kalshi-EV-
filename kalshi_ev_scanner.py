@@ -79,9 +79,9 @@ MAX_PROP_EVENTS = 10         # prop scan credit budget — MLB only (10 events �
 # _validate_book_consensus() but do NOT influence the fair-value price.
 # Including soft books in fair value adds public-money noise to the model.
 BOOK_WEIGHTS: Dict[str, float] = {
-    "pinnacle":   1.00,   # sharp book — sole fair-value anchor
-    "draftkings": 0.00,   # confirmation only — excluded from fair-value calc
-    "fanduel":    0.00,   # confirmation only — excluded from fair-value calc
+    "pinnacle":   1.00,   # sharp book — primary fair-value anchor (~98% weight)
+    "draftkings": 0.01,   # soft book — fetched for consensus verification (reactivated)
+    "fanduel":    0.01,   # soft book — fetched for consensus verification (reactivated)
 }
 
 # ── Normal-distribution standard deviations (empirical) ─────────────────────

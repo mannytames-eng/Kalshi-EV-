@@ -124,12 +124,12 @@ def _odds_refresh_interval() -> int:
 
     Asymmetric game-proximity overrides (checked first):
       > 24h until next game: 4h cooldown — no meaningful movement that far out
-      < 3h until next game:  60s hot-path — capture fast pre-game line movement
+      < 3h until next game:  20s hot-path — maximum line capture before first pitch
       3–24h window:          fall through to PDT time-of-day schedule below
 
     Operating windows (PDT = UTC-7):
-      Discovery    09:00–13:00 PDT (4h):  3min
-      Peak Trading 13:00–22:00 PDT (9h): 75s
+      Discovery    09:00–13:00 PDT (4h):  90s
+      Peak Trading 13:00–22:00 PDT (9h): 30s
       Sleep        22:00–09:00 PDT (11h): 15min
 
     Game-slate short-circuit: if all MLB games have commenced during Peak
@@ -144,49 +144,53 @@ def _odds_refresh_interval() -> int:
         if hours_until_start > 24:
             return 4 * 3600   # far-out slate: 4h cooldown
         if hours_until_start < 3:
-            return 60         # imminent game: 60s hot-path
+            return 20         # imminent game: 20s hot-path (faster than Peak Trading)
     # ── PDT time-of-day schedule (3–24h window or no game data yet) ──────
     h = _pdt_hour()
     if 13 <= h < 22 and _all_games_commenced():
         return 15 * 60       # Slate over — drop to Sleep rates early
     if 9  <= h < 13:
-        return  3 * 60       # Discovery: 3min
+        return 90            # Discovery: 90s
     if 13 <= h < 22:
-        return 75            # Peak Trading: 75s
+        return 30            # Peak Trading: 30s
     return 15 * 60           # Sleep: 15min
 
 def _props_refresh_interval() -> int:
     """Return seconds between MLB props scans (PDT context-aware schedule).
 
-    Discovery    09:00–13:00 PDT: 15min — pre-game lines forming
-    Peak Trading 13:00–22:00 PDT: 30min — active window, balanced frequency
-    Sleep        22:00–09:00 PDT:  OFF  — no upcoming games, save credits
+    Discovery    09:00–13:00 PDT:  5min — aggressive pre-game line capture
+    Peak Trading 13:00–22:00 PDT: 15min — balanced active window
+    Sleep        22:00–09:00 PDT: 30min — continuous overnight player news watch
 
-    Game-slate short-circuit: mirrors odds logic — props off when slate over.
+    Game-slate short-circuit: props off when all games have commenced
+    (checked from 09:00 PDT onward so Discovery window is also gated).
 
     Props credit budget (~21 credits/scan: 1 event list + 10 games × 2 markets):
-      Discovery    (4/hr ×  4h × 21):  336/day
-      Peak Trading (2/hr ×  9h × 21):  378/day
-      Sleep:                             0/day
-      Total props: ~714/day
+      Discovery    (12/hr ×  4h × 21):  1,008/day
+      Peak Trading  (4/hr ×  9h × 21):    756/day
+      Sleep         (2/hr × 11h × 21):    462/day
+      Total props: ~2,226/day
 
-    Combined daily budget: ~2,938/day (395/day buffer on 3,333 limit).
+    Combined daily budget: ~4,794/day (game lines ~2,568 + props ~2,226).
+    Monthly theoretical max: ~143,820 (reduced in practice by slate short-circuits
+    and far-out 4h cooldowns on off-days).
     """
     h = _pdt_hour()
-    if 13 <= h < 22 and _all_games_commenced():
-        return 10 ** 9       # Slate over — props off
+    if 9  <= h < 22 and _all_games_commenced():
+        return 10 ** 9       # Slate over — props off (active from Discovery onward)
     if 9  <= h < 13:
-        return 15 * 60       # Discovery: 15min
+        return  5 * 60       # Discovery: 5min
     if 13 <= h < 22:
-        return 30 * 60       # Peak Trading: 30min
-    return 10 ** 9           # Sleep: OFF
+        return 15 * 60       # Peak Trading: 15min
+    return 30 * 60           # Sleep: 30min (overnight player news)
 REFRESH_SECONDS       = 30         # re-scan Kalshi every 30 sec   (0 credits)
-# Monthly credit math (20k budget):
-#   Odds refresh : 2 × 144/day × 30 =  8,640
-#   Props scan   : 10 × 8/day × 30  =  2,400
-#   Kalshi scans : 0 credits (cached) =     0
-#   ─────────────────────────────────────────
-#   Total                            = 11,040  (45% under 20k budget)
+# Monthly credit math (100k budget — Offensive Mode):
+#   Odds game lines  (Peak 30s + Discovery 90s + Sleep 15min): ~77,040
+#   Props scans      (Peak 15min + Discovery 5min + Sleep 30min): ~66,780
+#   Kalshi scans     (cached):                                        0
+#   ──────────────────────────────────────────────────────────────────
+#   Theoretical max                                          ~143,820
+#   Practical (slate short-circuits + off-day cooldowns):   ~90–110k
 HISTORY_FILE    = os.path.join(DATA_DIR, "ev_history.json")
 BETS_FILE       = os.path.join(DATA_DIR, "ev_bets.json")
 MY_BETS_FILE    = os.path.join(DATA_DIR, "my_bets.json")

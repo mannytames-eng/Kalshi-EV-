@@ -7,7 +7,7 @@ and FanDuel no-vig probabilities to find +EV bets.
 Key design decisions:
   • Pinnacle-only fair value (DK/FD used for confirmation only)
   • 25% EV haircut applied to raw edge (accounts for model uncertainty)
-  • Minimum adjusted EV ≥ 3% to flag a bet (logged to paper portfolio)
+  • Minimum adjusted EV ≥ 2.5% to flag a bet (logged to paper portfolio)
   • Live display (UI cards) shows only ≥5% edges for clean, high-confidence view
   • Hard ceiling of 20% — larger edges are almost certainly data mismatches
   • Top 25 bets per scan cycle (all qualifying edges logged to paper portfolio)
@@ -56,10 +56,10 @@ ODDS_BASE   = "https://api.the-odds-api.com/v4"
 #
 # Kalshi charges ~7% of profits on winning trades (verify at kalshi.com/fees).
 # For a typical 52% fair / 45¢ entry, this costs ~2pp of the apparent edge.
-# A raw gap of 3% becomes ~0.9% true EV — still positive but thin.
+# A raw gap of 2.5% becomes ~0.5% true EV — very thin but still positive.
 KALSHI_FEE_RATE    = 0.07    # Kalshi profit fee (7% of winnings) — update if tier changes
-EDGE_THRESHOLD     = 0.03    # ≥3% fee+haircut-adjusted EV to flag (matches ALERT_MIN_EDGE)
-                             # Equivalent to ~4.5–5% raw gap before fees and haircut.
+EDGE_THRESHOLD     = 0.025   # ≥2.5% fee+haircut-adjusted EV to flag (matches ALERT_MIN_EDGE)
+                             # Equivalent to ~3.8–5% raw gap before fees and haircut.
 MAX_EDGE           = 0.20    # reject edges >20% — almost certainly a stale line
 EV_HAIRCUT         = 0.10    # model-uncertainty discount (separate from fee)
 TOP_BETS_PER_CYCLE = 25      # surface up to 25 qualifying bets per scan
@@ -1987,7 +1987,7 @@ def scan_sport(
 
                 # ── Market snapshot: record current edge for BOTH sides ───────
                 # Used by Open Positions to show live value on existing bets even
-                # when below the 3% flag threshold.  Zero extra credits — we've
+                # when below the 2.5% flag threshold.  Zero extra credits — we've
                 # already computed this data, we're just capturing it.
                 _snap_ticker = mkt.get("ticker", "")
                 if _snap_ticker:
@@ -2806,24 +2806,17 @@ def scan_nba_player_props() -> List[dict]:
 # ── Main ──────────────────────────────────────────────────────────────────────
 def run_once() -> int:
     mlb_edges, _ = scan_sport(
-        label         = "MLB — Run Line & Totals",
+        label         = "MLB — Run Line, Totals & Moneyline",
         spread_series = "KXMLBSPREAD",
         total_series  = "KXMLBTOTAL",
+        ml_series     = "KXMLBML",
         odds_sport    = "baseball_mlb",
         abbr_map      = MLB_ABBR,
         spread_std    = MLB_SPREAD_STD,
         total_std     = MLB_TOTAL_STD,
     )
-    nba_edges, _ = scan_sport(
-        label         = "NBA — Spread & Totals",
-        spread_series = "KXNBASPREAD",
-        total_series  = "KXNBATOTAL",
-        odds_sport    = "basketball_nba",
-        abbr_map      = NBA_ABBR,
-        spread_std    = NBA_SPREAD_STD,
-        total_std     = NBA_TOTAL_STD,
-    )
-    total = len(mlb_edges) + len(nba_edges)
+    # NBA faded permanently — credits reallocated to MLB
+    total = len(mlb_edges)
     print(f"\n  Total edges flagged (adj. ≥{EDGE_THRESHOLD*100:.0f}%): {total}")
     return total
 
@@ -2839,9 +2832,9 @@ def main():
     print("╔══════════════════════════════════════════════════════════════════╗")
     print("║          Kalshi EV Scanner  —  MLB & NBA  (v2)                  ║")
     print("║  Sources : Pinnacle (70%) + DraftKings (20%) + FanDuel (10%)    ║")
-    print(f"║  EV      : raw edge × {1-EV_HAIRCUT:.0%} haircut ≥ {EDGE_THRESHOLD*100:.0f}% to flag              ║")
+    print(f"║  EV      : raw edge × {1-EV_HAIRCUT:.0%} haircut ≥ {EDGE_THRESHOLD*100:.1f}% to flag            ║")
     print(f"║  Output  : Top {TOP_BETS_PER_CYCLE} bets, max {MAX_BETS_PER_GROUP} per game group                      ║")
-    print("║  Markets : KXMLBSPREAD, KXMLBTOTAL, KXNBASPREAD, KXNBATOTAL    ║")
+    print("║  Markets : KXMLBSPREAD, KXMLBTOTAL, KXMLBML (MLB only)        ║")
     print("╚══════════════════════════════════════════════════════════════════╝")
 
     if args.loop <= 0:

@@ -64,7 +64,7 @@ from kalshi_ev_scanner import (
 PORT = int(os.environ.get("PORT", 8000))   # Railway injects PORT; falls back to 8000 locally
 # ── Refresh cadence (credit budget) ──────────────────────────────────────────
 # Two independent loops:
-#   ODDS_REFRESH  : fetches Pinnacle/DK/FD lines  — costs 2 credits (MLB + NBA)
+#   ODDS_REFRESH  : fetches Pinnacle lines only    — costs 2 credits (MLB)
 #   KALSHI_REFRESH: re-scans Kalshi prices only    — costs 0 credits (uses cache)
 #
 # Monthly credit math (20k budget):
@@ -1958,9 +1958,9 @@ def send_test_discord() -> bool:
             {"name": "Confidence",   "value": "★★ MED CONF",        "inline": True},
             {"name": "Kalshi Price", "value": "`-120`  (55¢)",      "inline": True},
             {"name": "Fair Value",   "value": "`-138`",             "inline": True},
-            {"name": "Books",        "value": "PIN+DK+FD",          "inline": True},
+            {"name": "Books",        "value": "PIN",                "inline": True},
         ],
-        "footer": {"text": f"Bankroll $1000  •  Min edge {round(_ALERT_MIN*100,1)}%  •  Pinnacle fair value · DK+FD confirm"},
+        "footer": {"text": f"Bankroll $1000  •  Min edge {round(_ALERT_MIN*100,1)}%  •  Pinnacle fair value only"},
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
     return send_discord(embed, content)
@@ -3762,13 +3762,13 @@ function updateCountdown() {
 // ── Best 10 — All Edges (MLB + NBA spreads/totals) ───────────────────────────
 function confStars(c, booksUsed) {
   // Visual confidence indicator.
-  // ★★★ = Triple-book confirmation: all 3 books (PIN+DK+FD) within ≤2pp (c ≥ 0.80)
-  // ★★  = Dual-book agreement OR tight single-book (c ≥ 0.50)
-  // ★   = High divergence or only 1 book
+  // ★★★ = Pinnacle line very tight / high confidence (c ≥ 0.80)
+  // ★★  = Moderate Pinnacle confidence (c ≥ 0.50)
+  // ★   = Lower confidence
   if (c == null) return '<span style="color:var(--muted)" title="No confidence data">?</span>';
   const n = (booksUsed && booksUsed.length) ? booksUsed.length : 0;
-  if (c >= 0.80 && n >= 3) {
-    return `<span style="color:#3fb950" title="★★★ Triple-book confirmation — PIN+DK+FD all within 2pp">★★★</span>`;
+  if (c >= 0.80) {
+    return `<span style="color:#3fb950" title="★★★ High Pinnacle confidence">★★★</span>`;
   }
   if (c >= 0.50) {
     const tip = n >= 3 ? `3 books but spread >2pp (${Math.round((1-c)*10)}pp)` : `${n} book(s) — moderate agreement`;
@@ -3984,7 +3984,7 @@ function renderLiveEdges() {
     const consReason  = e.consensus_reason || '';
     const confBooks   = consReason.replace('Confirmed by ','').replace('Pinnacle','PIN').replace('DraftKings','DK').replace('FanDuel','FD');
     const sharpBadge  = e.sharp_led
-      ? `<span class="badge-sharp" title="PIN moved vs DK/FD">⚡ SHARP</span>` : '';
+      ? `<span class="badge-sharp" title="Pinnacle line moved">⚡ SHARP</span>` : '';
     const ageMins     = e.age_min != null ? e.age_min : 0;
     const ageBadge    = ageMins < 5 && ageMins > 0
       ? `<span style="font-size:9px;color:#3fb950;margin-left:4px;font-weight:600;">●NEW</span>`
@@ -4090,7 +4090,7 @@ function renderTop10() {
     });
     const tip10 = bLines10.length
       ? `No-vig per book:\\n${bLines10.join('\\n')}\\nFair value: Pinnacle only`
-      : 'Fair value: Pinnacle only (DK+FD confirm)';
+      : 'Fair value: Pinnacle only';
 
     // Fair-value American odds for the exact Kalshi threshold
     const fairAmer10  = e.fair != null ? probToAmerican(e.fair) : '—';
@@ -4148,7 +4148,7 @@ function renderTop10() {
       <th>#</th><th>Matchup / Player</th><th>Prop</th><th>Side</th>
       <th class="num">Adj. EV</th>
       <th class="num" title="Model fair value for this exact Kalshi threshold → Kalshi ask price (both in American odds). Hover for per-book breakdown.">Fair → Kalshi</th>
-      <th class="num" title="How closely Pinnacle, DraftKings, and FanDuel agree on fair probability. ★★★ = tight agreement = higher confidence.">Confidence</th>
+      <th class="num" title="Pinnacle line confidence. ★★★ = high confidence.">Confidence</th>
       <th class="num">Kelly Bet</th>
       <th class="num" title="Re-fetch Kalshi + Pinnacle right now and confirm the edge is still valid before betting">Pre-Bet Check</th>
     </tr></thead>

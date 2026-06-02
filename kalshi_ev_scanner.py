@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
 """
-Kalshi EV Scanner — MLB & NBA
-Compares Kalshi prices against a weighted consensus of Pinnacle, DraftKings,
-and FanDuel no-vig probabilities to find +EV bets.
+Kalshi EV Scanner — MLB
+Compares Kalshi prices against Pinnacle no-vig probabilities to find +EV bets.
 
 Key design decisions:
-  • Pinnacle-only fair value (DK/FD used for confirmation only)
+  • Pinnacle-only fair value — sole source of truth, no soft-book confirmation
   • 25% EV haircut applied to raw edge (accounts for model uncertainty)
   • Minimum adjusted EV ≥ 2.5% to flag a bet (logged to paper portfolio)
   • Live display (UI cards) shows only ≥5% edges for clean, high-confidence view
@@ -74,14 +73,13 @@ MIN_KALSHI_PRICE   = 0.15
 MAX_PROP_EVENTS = 10         # prop scan credit budget — MLB only (10 events × 1 credit each)
 
 # ── Book weights for consensus probability ───────────────────────────────────
-# Fair value is Pinnacle ONLY — the sharpest closing-line book.
-# DK and FD are still fetched and used as CONFIRMATION signals in
-# _validate_book_consensus() but do NOT influence the fair-value price.
-# Including soft books in fair value adds public-money noise to the model.
+# Pinnacle is the sole source of truth for fair value.
+# DK/FD are not fetched — soft-book confirmation removed.
+# Only books with weight > 0 are included in the Odds API request.
 BOOK_WEIGHTS: Dict[str, float] = {
-    "pinnacle":   1.00,   # sharp book — primary fair-value anchor (~98% weight)
-    "draftkings": 0.01,   # soft book — fetched for consensus verification (reactivated)
-    "fanduel":    0.01,   # soft book — fetched for consensus verification (reactivated)
+    "pinnacle":   1.00,   # sharp book — sole fair-value anchor
+    "draftkings": 0.00,   # excluded — not fetched
+    "fanduel":    0.00,   # excluded — not fetched
 }
 
 # ── Normal-distribution standard deviations (empirical) ─────────────────────
@@ -579,90 +577,16 @@ def _validate_book_consensus(
     k_side: float,
 ) -> Tuple[bool, str]:
     """
-    Validate that Pinnacle AND at least one of DraftKings / FanDuel both
-    indicate value on the same side before we count a bet as +EV.
+    Pinnacle-only validation: confirm Pinnacle data is present for this market.
+    Soft-book (DK/FD) confirmation removed — Pinnacle sharp line is the sole
+    source of truth.  Any contract that clears the EV threshold on Pinnacle
+    fair value alone is instantly approved.
 
-    books_detail: {book_key: yes_side_no_vig_prob}  (canonical YES probability)
-    side:   "YES" or "NO" — the proposed bet direction
-    k_side: Kalshi ask price for the bet side (tradeable cost)
-
-    A book "indicates value on a side" when its no-vig probability for that
-    side exceeds the Kalshi price you would pay to buy it.
-
-    Returns (is_valid: bool, reason: str).
-      is_valid=True  → reason is ""
-      is_valid=False → reason explains why the bet was rejected
+    Returns (True, "Pinnacle") when Pinnacle data exists, (False, reason) otherwise.
     """
-    def _side_prob(book: str) -> Optional[float]:
-        """Return this book's no-vig prob for the bet side."""
-        p_yes = books_detail.get(book)
-        if p_yes is None:
-            return None
-        return p_yes if side == "YES" else 1.0 - p_yes
-
-    pin_p = _side_prob("pinnacle")
-    dk_p  = _side_prob("draftkings")
-    fd_p  = _side_prob("fanduel")
-
-    opp_side = "NO" if side == "YES" else "YES"
-
-    # ── 1. Pinnacle must be present and must confirm the bet side ─────────
-    if pin_p is None:
-        return False, "Pinnacle odds not available — cannot validate direction"
-
-    if pin_p <= k_side:
-        return (
-            False,
-            f"Pinnacle does not confirm {side} "
-            f"(PIN {pin_p:.1%} ≤ Kalshi {k_side:.1%}; "
-            f"Pinnacle implies {opp_side} has value instead)",
-        )
-
-    # ── 2. Classify each retail book as confirming, neutral, or disagreeing ─
-    #   confirm  : book's no-vig prob for bet side > Kalshi price  → sees +EV on our side
-    #   disagree : book's no-vig prob for bet side < Kalshi price  → sees +EV on opposite side
-    #   neutral  : probability ≈ Kalshi price (within 0.5pp rounding)
-    confirm_books:  List[str] = []
-    disagree_books: List[str] = []
-
-    retail = [("draftkings", dk_p, "DraftKings"), ("fanduel", fd_p, "FanDuel")]
-    for bkey, bp, bname in retail:
-        if bp is None:
-            continue
-        if bp > k_side:
-            confirm_books.append(bname)
-        elif bp < k_side:
-            disagree_books.append(bname)
-        # bp == k_side → neutral (skip)
-
-    # ── 3. Reject if retail books actively disagree and none confirm ──────
-    if disagree_books and not confirm_books:
-        parts = []
-        for bkey, bp, bname in retail:
-            if bp is not None:
-                parts.append(f"{bname}={bp:.1%}")
-        return (
-            False,
-            f"Books disagree on direction: Pinnacle confirms {side} "
-            f"but {' and '.join(disagree_books)} indicate {opp_side} "
-            f"({', '.join(parts)}; Kalshi={k_side:.1%})",
-        )
-
-    # ── 4. Retail confirmation (DK/FD) — optional when not fetched ──────────
-    # If retail books are available, at least one must confirm.
-    # If none are available (Pinnacle-only mode), Pinnacle alone is sufficient.
-    available_retail = [(bname, bp) for _, bp, bname in retail if bp is not None]
-    if available_retail and not confirm_books:
-        detail = ", ".join(f"{n}={p:.1%}" for n, p in available_retail)
-        return (
-            False,
-            f"Neither DraftKings nor FanDuel confirms value on {side} "
-            f"({detail} ≤ Kalshi {k_side:.1%})",
-        )
-
-    # ── 5. Valid — build a short confirmation string for the edge payload ─
-    confirmed_by = ["Pinnacle"] + confirm_books
-    return True, f"Confirmed by {' + '.join(confirmed_by)}"
+    if books_detail.get("pinnacle") is None:
+        return False, "Pinnacle odds not available — cannot evaluate edge"
+    return True, "Pinnacle"
 
 
 def _weighted_consensus(probs_by_book: Dict[str, float]) -> Tuple[float, List[str]]:
@@ -1622,7 +1546,7 @@ def scan_sport(
 ) -> List[dict]:
     """
     Scan one sport's Kalshi spread, total, and optionally moneyline markets
-    vs the weighted-consensus fair probability from Pinnacle / DraftKings / FanDuel.
+    vs Pinnacle no-vig fair probability (sole source of truth).
 
     Returns a list of edge dicts, each containing:
       ticker, title, matchup, side, kalshi, fair, raw_edge, edge (adj),
@@ -2831,7 +2755,7 @@ def main():
 
     print("╔══════════════════════════════════════════════════════════════════╗")
     print("║          Kalshi EV Scanner  —  MLB & NBA  (v2)                  ║")
-    print("║  Sources : Pinnacle (70%) + DraftKings (20%) + FanDuel (10%)    ║")
+    print("║  Sources : Pinnacle (100%) — sole sharp-line source of truth     ║")
     print(f"║  EV      : raw edge × {1-EV_HAIRCUT:.0%} haircut ≥ {EDGE_THRESHOLD*100:.1f}% to flag            ║")
     print(f"║  Output  : Top {TOP_BETS_PER_CYCLE} bets, max {MAX_BETS_PER_GROUP} per game group                      ║")
     print("║  Markets : KXMLBSPREAD, KXMLBTOTAL, KXMLBML (MLB only)        ║")

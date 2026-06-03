@@ -4873,10 +4873,12 @@ class Handler(BaseHTTPRequestHandler):
             # Filter out stale entries whose game date is before today so settled
             # markets don't resurface from cache (e.g. a prop that lost yesterday).
             if not state_copy.get("edges") and state_copy.get("edges_cache"):
-                _today_str = datetime.now(timezone.utc).date().isoformat()
+                _today_str    = datetime.now(timezone.utc).date().isoformat()
+                _min_edge_pct = EDGE_THRESHOLD * 100
                 fresh_cache = [
                     e for e in state_copy["edges_cache"]
                     if (_parse_ticker_date(e.get("ticker", "")) or _today_str) >= _today_str
+                    and e.get("edge_pct", 0) >= _min_edge_pct
                 ]
                 state_copy["edges"]            = fresh_cache
                 state_copy["edges_from_cache"] = bool(fresh_cache)
@@ -4929,18 +4931,21 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, "application/json", json.dumps(points).encode())
 
         elif path == "/api/today_edges":
-            # Return all open bets (game not yet started), sorted newest-first.
-            # Renamed from "today_edges" — shows active positions regardless of when flagged.
+            # Return open bets at or above the current EV threshold, sorted newest-first.
+            # EV filter applied at read time so legacy sub-threshold bets never resurface
+            # on the UI board after a threshold change.
             now_iso = datetime.now(timezone.utc).isoformat()
+            _min_edge_pct = EDGE_THRESHOLD * 100   # e.g. 0.015 → 1.5
             with _bets_lock:
                 open_bets = [
                     {**b, "kelly_bet_pct": b.get("kelly_bet_pct")}
                     for b in _bets
                     if b.get("status") == "open"
                     and b.get("paper_stake") is not None
+                    and b.get("edge_pct", 0) >= _min_edge_pct
                 ]
             open_bets.sort(key=lambda b: b.get("flagged_at", ""), reverse=True)
-            print(f"  /api/today_edges: found {len(open_bets)} open positions")
+            print(f"  /api/today_edges: found {len(open_bets)} open positions ≥{_min_edge_pct:.1f}% adj EV")
             try:
                 payload = json.dumps(open_bets).encode()
             except Exception as _je:

@@ -2109,13 +2109,11 @@ def _run_odds_refresh():
 
     try:
         # Parametric split: one call per market type, regions=eu (1 credit each).
-        # Use alternate_* variants — these return every Pinnacle line (main + all
-        # alternates) for the same credit cost as the main-only call.  This means
-        # pin_spread_lines gets -0.5/-1.5/-2.5/... and pin_total_lines gets
-        # 7.5/8.5/9.0/9.5/10.5/... so the scanner can exact-match any Kalshi
-        # threshold without falling back to Gaussian approximation.
-        spreads_games, _   = fetch_book_odds("baseball_mlb", markets="alternate_spreads")
-        totals_games,  rem = fetch_book_odds("baseball_mlb", markets="alternate_totals")
+        # Standard spreads + totals endpoints (alternate_* not supported on bulk).
+        # Adjacent Kalshi thresholds without an exact Pinnacle match fall back to
+        # _gaussian_total_fallback() within ±1.0 run; beyond that they are skipped.
+        spreads_games, _   = fetch_book_odds("baseball_mlb", markets="spreads")
+        totals_games,  rem = fetch_book_odds("baseball_mlb", markets="totals")
 
         # Merge payloads so the consensus builder sees both market types per game.
         merged_games = _merge_odds_responses(spreads_games, totals_games)

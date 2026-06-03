@@ -208,6 +208,26 @@ def _mlb_adaptive_total_sigma(pin_line: float) -> float:
     return 1.5 + 0.33 * pin_line
 
 
+def _gaussian_total_fallback(main_line: float, main_over_prob: float, target_line: float) -> float:
+    """
+    Shift a Pinnacle over-probability from main_line to target_line using a
+    standard-normal approximation with σ = 1.8 runs (MLB totals).
+
+    Only call when abs(target_line - main_line) <= 1.0 (enforced by caller).
+    Returns the adjusted over-probability clamped to [0.01, 0.99].
+
+    Math: z_main   = Φ⁻¹(1 − main_over_prob)         (z-score of main line)
+          z_target  = z_main + (target_line − main_line) / σ
+          P(over target_line) = 1 − Φ(z_target)
+
+    Sign check: higher target_line → larger z_target → smaller 1−Φ(z) ✓
+    """
+    _STD     = 1.8
+    z_main   = _norm_ppf(1.0 - main_over_prob)
+    z_target = z_main + (target_line - main_line) / _STD
+    return max(0.01, min(0.99, 1.0 - _norm_cdf(z_target)))
+
+
 def _gaussian_total_fair(
     pin_over_prob: float,
     pin_line: float,
@@ -1848,11 +1868,26 @@ def scan_sport(
                                 po *= corr
                                 pu *= corr
                         else:
-                            # No exact Pinnacle alternate line — skip entirely.
-                            # Gaussian extrapolation was removed: even a 0.5-run
-                            # step can systematically mis-estimate edge direction
-                            # and was the likely cause of YES/over bias.
-                            continue
+                            # No exact Pinnacle line — bounded Gaussian fallback.
+                            # Only interpolate within ±1.0 run of the main Pinnacle
+                            # line; beyond that the approximation error exceeds the
+                            # edge signal and we skip.
+                            _main_line   = total_info.get("over_point")
+                            _main_over_p = total_info.get("over_prob")
+                            if (
+                                _main_line is None
+                                or _main_over_p is None
+                                or abs(threshold - _main_line) > 1.0
+                            ):
+                                continue
+                            po             = _gaussian_total_fallback(_main_line, _main_over_p, threshold)
+                            pu             = 1.0 - po
+                            total_fair_src = "gaussian"
+                            _diag_line_matches += 1
+                            print(
+                                f"    [gaussian-fb] {threshold:.1f} from main={_main_line:.1f} "
+                                f"({threshold - _main_line:+.1f}r): over {_main_over_p:.3f}→{po:.3f}"
+                            )
 
                         books_used   = ["pinnacle"]     # alternate lines are Pinnacle-only by construction
                         books_detail = {"pinnacle": po} # matched alternate-line prob, not main-line

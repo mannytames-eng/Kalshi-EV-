@@ -61,7 +61,7 @@ EDGE_THRESHOLD     = 0.025   # ≥2.5% fee+haircut-adjusted EV to flag (matches 
                              # Equivalent to ~3.8–5% raw gap before fees and haircut.
 MAX_EDGE           = 0.20    # reject edges >20% — almost certainly a stale line
 EV_HAIRCUT         = 0.10    # model-uncertainty discount (separate from fee)
-TOP_BETS_PER_CYCLE = 25      # surface up to 25 qualifying bets per scan
+TOP_BETS_PER_CYCLE = 50      # surface up to 50 qualifying bets per scan (data collection mode)
 MAX_BETS_PER_GROUP = 2       # max bets per (matchup, mkt_type) group
 
 # Minimum Kalshi price for any side we'll consider betting.
@@ -70,7 +70,7 @@ MAX_BETS_PER_GROUP = 2       # max bets per (matchup, mkt_type) group
 # ">8.5 runs") or rare-event props where model error is amplified.
 MIN_KALSHI_PRICE   = 0.15
 
-MAX_PROP_EVENTS = 10         # prop scan credit budget — MLB only (10 events × 1 credit each)
+MAX_PROP_EVENTS = 15         # prop scan credit budget — MLB only (15 events × 1 credit each)
 
 # ── Book weights for consensus probability ───────────────────────────────────
 # Pinnacle is the sole source of truth for fair value.
@@ -1493,16 +1493,15 @@ def _book_confidence(books_detail: dict) -> float:
     """
     How tightly do the contributing books agree on fair probability?
     Returns 0.0 – 1.0:
-      1.0  all books identical (perfect agreement)
+      1.0  single book (Pinnacle-only mode) or all books identical
       0.0  books spread ≥ 10 pp apart (high disagreement / stale line)
-      0.5  only one book available (unverified)
 
     High confidence + high EV = strongest bet signal.
     Low confidence can mean: line moving, injury news, one book is stale.
     """
     probs = [v for v in books_detail.values() if isinstance(v, (int, float))]
     if len(probs) < 2:
-        return 0.5
+        return 1.0   # Pinnacle-only — no disagreement possible, full confidence
     spread = max(probs) - min(probs)
     return round(max(0.0, 1.0 - spread / 0.10), 3)
 

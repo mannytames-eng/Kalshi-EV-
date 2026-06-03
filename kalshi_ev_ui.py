@@ -1593,7 +1593,7 @@ def _settle_my_bets():
 
 
 # ── Twilio SMS alerts ─────────────────────────────────────────────────────────
-_ALERT_MIN    = float(os.getenv("ALERT_MIN_EDGE", "0.025"))  # Discord alerts at ≥2.5% edge (matches .env default)
+_ALERT_MIN    = float(os.getenv("ALERT_MIN_EDGE", "0.005"))  # Discord alerts at ≥0.5% edge — data collection mode
 _BET_SIZE     = float(os.getenv("ALERT_BET_SIZE", "20"))
 
 # ── Discord webhook alert config ───────────────────────────────────────────────
@@ -3828,7 +3828,7 @@ function renderTodayEdges() {
     // Using the same formula (curFair - MIN_EDGE) is correct for both sides.
     // Bug: the old code used (1 - curFair - MIN_EDGE) for NO, which substituted
     // fair_yes back in — causing aboveCutoff to fire even on strong NO edges.
-    const MIN_EDGE = 0.025;
+    const MIN_EDGE = 0.005;  // data collection mode — revert to 0.025 post-collection
     let cutoffLabel = null;
     let cutoffCents = null;
     if (curFair != null) {

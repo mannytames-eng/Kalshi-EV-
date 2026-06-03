@@ -55,12 +55,12 @@ ODDS_BASE   = "https://api.the-odds-api.com/v4"
 #
 # Kalshi charges ~7% of profits on winning trades (verify at kalshi.com/fees).
 # For a typical 52% fair / 45¢ entry, this costs ~2pp of the apparent edge.
-# A raw gap of 2.5% becomes ~0.5% true EV — very thin but still positive.
+# A raw gap of ~2% becomes ~0.5% true EV at current threshold and haircut.
 KALSHI_FEE_RATE    = 0.07    # Kalshi profit fee (7% of winnings) — update if tier changes
-EDGE_THRESHOLD     = 0.025   # ≥2.5% fee+haircut-adjusted EV to flag (matches ALERT_MIN_EDGE)
-                             # Equivalent to ~3.8–5% raw gap before fees and haircut.
+EDGE_THRESHOLD     = 0.005   # ≥0.5% fee+haircut-adjusted EV to flag — data collection mode
+                             # (lowered from 2.5% to surface near-misses; revert to 0.025 post-collection)
 MAX_EDGE           = 0.20    # reject edges >20% — almost certainly a stale line
-EV_HAIRCUT         = 0.10    # model-uncertainty discount (separate from fee)
+EV_HAIRCUT         = 0.05    # model-uncertainty discount — lowered from 10% for data collection
 TOP_BETS_PER_CYCLE = 50      # surface up to 50 qualifying bets per scan (data collection mode)
 MAX_BETS_PER_GROUP = 2       # max bets per (matchup, mkt_type) group
 
@@ -385,6 +385,7 @@ def fetch_kalshi_events(series_ticker: str) -> List[dict]:
             data = kalshi_get("/events", params)
         except requests.HTTPError as e:
             if e.response is not None and e.response.status_code == 404:
+                print(f"  [warn] Kalshi series 404: '{series_ticker}' does not exist")
                 return []
             raise
         batch = data.get("events", [])
@@ -1927,9 +1928,9 @@ def scan_sport(
                         "edge_pct": round(no_adj * 100, 1),
                     }
 
-                # Log near-misses: markets within 5pp of threshold in either direction
+                # Log near-misses: markets within 1pp below threshold
                 _near_miss_gap = best_adj - EDGE_THRESHOLD  # negative = below threshold
-                if -0.05 < _near_miss_gap < 0:
+                if -0.01 < _near_miss_gap < 0:
                     _best_side = "YES" if yes_adj >= no_adj else "NO"
                     _matchup_str = f"{game_info.get('away','?')} @ {game_info.get('home','?')}"
                     print(

@@ -882,16 +882,30 @@ def _apply_correlation_control(
     max_per_group: int = MAX_BETS_PER_GROUP,
 ) -> List[dict]:
     """
-    Limit to max_per_group edges per (matchup, mkt_type) group.
-    With MAX_BETS_PER_GROUP=1 this enforces "one line per game" — the
-    highest-EV threshold for each market type survives; all others are
-    discarded.  Input must be pre-sorted by adj. edge descending so the
-    first edge seen per group is always the best one.
+    Limit to max_per_group edges per (matchup, normalized_mkt_type) group.
+    Market types are collapsed into three buckets so all prop types (KS, HIT,
+    TB, RBI, mlb_prop, nba_prop …) count against a single shared quota:
+      "spread" — run lines / point spreads
+      "total"  — game totals (including Gaussian-fallback alternate lines)
+      "prop"   — all player props regardless of stat category
+
+    With MAX_BETS_PER_GROUP=1 each game produces at most:
+      1 spread edge  +  1 total edge  +  1 prop edge
+    Input must be pre-sorted by adj. edge descending so the first edge
+    seen per group is always the highest-EV one.
     """
+    def _norm_mkt(mkt_type: str) -> str:
+        m = mkt_type.lower()
+        if m in ("spread", "kxmlbspread", "spread_team"):
+            return "spread"
+        if m in ("total", "kxmlbtotal", "total_over", "total_under"):
+            return "total"
+        return "prop"   # KS, HIT, TB, RBI, mlb_prop, nba_prop, etc.
+
     group_counts: Dict[tuple, int] = {}
     result = []
     for e in edges:
-        key = (e.get("matchup", ""), e.get("mkt_type", ""))
+        key = (e.get("matchup", ""), _norm_mkt(e.get("mkt_type", "")))
         cnt = group_counts.get(key, 0)
         if cnt < max_per_group:
             group_counts[key] = cnt + 1

@@ -1593,7 +1593,7 @@ def _settle_my_bets():
 
 
 # ── Twilio SMS alerts ─────────────────────────────────────────────────────────
-_ALERT_MIN    = float(os.getenv("ALERT_MIN_EDGE", "0.005"))  # Discord alerts at ≥0.5% edge — data collection mode
+_ALERT_MIN    = float(os.getenv("ALERT_MIN_EDGE", "0.015"))  # Discord alerts at ≥1.5% edge
 _BET_SIZE     = float(os.getenv("ALERT_BET_SIZE", "20"))
 
 # ── Discord webhook alert config ───────────────────────────────────────────────
@@ -2212,12 +2212,11 @@ def _run_scan():
                 _state["scanning"] = False
             return
 
-        # MLB spreads, totals + moneyline
+        # MLB spreads + totals (moneyline omitted — KXMLBML unverified on Kalshi)
         mlb, mlb_stats, mlb_snapshot = scan_sport(
-            label="MLB — Run Line, Totals & Moneyline",
+            label="MLB — Run Line & Totals",
             spread_series="KXMLBSPREAD",
             total_series="KXMLBTOTAL",
-            ml_series="KXMLBML",
             odds_sport="baseball_mlb",
             abbr_map=MLB_ABBR,
             spread_std=MLB_SPREAD_STD,
@@ -3828,7 +3827,7 @@ function renderTodayEdges() {
     // Using the same formula (curFair - MIN_EDGE) is correct for both sides.
     // Bug: the old code used (1 - curFair - MIN_EDGE) for NO, which substituted
     // fair_yes back in — causing aboveCutoff to fire even on strong NO edges.
-    const MIN_EDGE = 0.005;  // data collection mode — revert to 0.025 post-collection
+    const MIN_EDGE = 0.015;
     let cutoffLabel = null;
     let cutoffCents = null;
     if (curFair != null) {

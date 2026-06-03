@@ -57,10 +57,10 @@ ODDS_BASE   = "https://api.the-odds-api.com/v4"
 # For a typical 52% fair / 45¢ entry, this costs ~2pp of the apparent edge.
 # A raw gap of ~2% becomes ~0.5% true EV at current threshold and haircut.
 KALSHI_FEE_RATE    = 0.07    # Kalshi profit fee (7% of winnings) — update if tier changes
-EDGE_THRESHOLD     = 0.005   # ≥0.5% fee+haircut-adjusted EV to flag — data collection mode
-                             # (lowered from 2.5% to surface near-misses; revert to 0.025 post-collection)
+EDGE_THRESHOLD     = 0.015   # ≥1.5% fee+haircut-adjusted EV to flag — optimal sweet spot
+                             # filters low-value noise while catching sustainable edges
 MAX_EDGE           = 0.20    # reject edges >20% — almost certainly a stale line
-EV_HAIRCUT         = 0.05    # model-uncertainty discount — lowered from 10% for data collection
+EV_HAIRCUT         = 0.05    # model-uncertainty discount (5% — reduced from 10%)
 TOP_BETS_PER_CYCLE = 50      # surface up to 50 qualifying bets per scan (data collection mode)
 MAX_BETS_PER_GROUP = 2       # max bets per (matchup, mkt_type) group
 
@@ -2730,10 +2730,10 @@ def scan_nba_player_props() -> List[dict]:
 # ── Main ──────────────────────────────────────────────────────────────────────
 def run_once() -> int:
     mlb_edges, _ = scan_sport(
-        label         = "MLB — Run Line, Totals & Moneyline",
+        label         = "MLB — Run Line & Totals",
         spread_series = "KXMLBSPREAD",
         total_series  = "KXMLBTOTAL",
-        ml_series     = "KXMLBML",
+        # ml_series omitted — KXMLBML returns 0 events (series unverified on Kalshi)
         odds_sport    = "baseball_mlb",
         abbr_map      = MLB_ABBR,
         spread_std    = MLB_SPREAD_STD,
@@ -2758,7 +2758,7 @@ def main():
     print("║  Sources : Pinnacle (100%) — sole sharp-line source of truth     ║")
     print(f"║  EV      : raw edge × {1-EV_HAIRCUT:.0%} haircut ≥ {EDGE_THRESHOLD*100:.1f}% to flag            ║")
     print(f"║  Output  : Top {TOP_BETS_PER_CYCLE} bets, max {MAX_BETS_PER_GROUP} per game group                      ║")
-    print("║  Markets : KXMLBSPREAD, KXMLBTOTAL, KXMLBML (MLB only)        ║")
+    print("║  Markets : KXMLBSPREAD, KXMLBTOTAL (MLB only)                  ║")
     print("╚══════════════════════════════════════════════════════════════════╝")
 
     if args.loop <= 0:

@@ -880,7 +880,7 @@ def build_game_index(
 def _apply_correlation_control(
     edges: List[dict],
     max_per_group: int = MAX_BETS_PER_GROUP,
-) -> List[dict]:
+) -> Tuple[List[dict], List[dict]]:
     """
     Limit to max_per_group edges per (matchup, normalized_mkt_type) group.
     Market types are collapsed into three buckets so all prop types (KS, HIT,
@@ -893,6 +893,9 @@ def _apply_correlation_control(
       1 spread edge  +  1 total edge  +  1 prop edge
     Input must be pre-sorted by adj. edge descending so the first edge
     seen per group is always the highest-EV one.
+
+    Returns (apex_edges, pass_edges).  pass_edges are non-apex competitors
+    tagged correlated_pass=True — they are never logged as bets.
     """
     def _norm_mkt(mkt_type: str) -> str:
         m = mkt_type.lower()
@@ -903,14 +906,17 @@ def _apply_correlation_control(
         return "prop"   # KS, HIT, TB, RBI, mlb_prop, nba_prop, etc.
 
     group_counts: Dict[tuple, int] = {}
-    result = []
+    apex:  List[dict] = []
+    passed: List[dict] = []
     for e in edges:
         key = (e.get("matchup", ""), _norm_mkt(e.get("mkt_type", "")))
         cnt = group_counts.get(key, 0)
         if cnt < max_per_group:
             group_counts[key] = cnt + 1
-            result.append(e)
-    return result
+            apex.append(e)
+        else:
+            passed.append({**e, "correlated_pass": True})
+    return apex, passed
 
 
 # ── Pre-execution EV recheck ─────────────────────────────────────────────────
@@ -1441,9 +1447,10 @@ def _parse_nba_event(ticker: str, abbr_map: Dict[str, str]) -> Tuple[Optional[st
 
 
 def _parse_mlb_event(ticker: str, abbr_map: Dict[str, str]) -> Tuple[Optional[str], Optional[str]]:
-    suffix = re.sub(r"^KX\w+?-\d+[A-Z]+\d+\d{4}", "", ticker)
+    base   = re.sub(r"-\d+$", "", ticker)   # strip trailing threshold suffix (-8, -10, etc.)
+    suffix = re.sub(r"^KX\w+?-\d+[A-Z]+\d+\d{4}", "", base)
     if not suffix:
-        suffix = re.sub(r"^KX\w+?-\d+[A-Z]+\d+", "", ticker).lstrip("-")
+        suffix = re.sub(r"^KX\w+?-\d+[A-Z]+\d+", "", base).lstrip("-")
     for i in range(2, len(suffix) - 1):
         a, b = suffix[:i], suffix[i:]
         na = _abbr_to_name(a, abbr_map)
@@ -2166,8 +2173,8 @@ def scan_sport(
         key=lambda x: (x["confidence"] * x["edge"], -(x.get("kalshi_line") or 0)),
         reverse=True,
     )
-    edges = _apply_correlation_control(edges)
-    edges = edges[:TOP_BETS_PER_CYCLE]
+    apex_edges, pass_edges = _apply_correlation_control(edges)
+    edges = apex_edges[:TOP_BETS_PER_CYCLE] + pass_edges
 
     # ── 4. Print final table ──────────────────────────────────────────────
     if not edges:
@@ -2754,8 +2761,8 @@ def scan_player_props(
 
     # Sort by confidence × adj_edge, correlation-control, top N
     edges.sort(key=lambda x: x["confidence"] * x["edge"], reverse=True)
-    edges = _apply_correlation_control(edges)
-    edges = edges[:TOP_BETS_PER_CYCLE]
+    apex_edges, pass_edges = _apply_correlation_control(edges)
+    edges = apex_edges[:TOP_BETS_PER_CYCLE] + pass_edges
 
     if not edges:
         print(f"  No player-prop edges ≥ {EDGE_THRESHOLD:.0%} (adj.) found.")

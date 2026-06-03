@@ -577,11 +577,10 @@ def _bet_id(ticker: str, side: str) -> str:
 
 def _best_edge_per_game(edges: list) -> list:
     """
-    Keep only the single best edge per (matchup, mkt_type, side) group.
-    This eliminates correlated bets on the same game — e.g. if a game has
-    edges at >7.5, >8.5, and >9.5 total runs YES, only the highest-edge one
-    is kept.  YES and NO on the same market are treated as distinct slots so
-    both can surface if both are genuinely +EV.
+    Keep only the single best edge per (matchup, mkt_type) bucket.
+    Side (YES/NO) is intentionally excluded from the key: betting both YES on
+    one threshold and NO on a different threshold for the same game is a hedge
+    that violates the one-line-per-bucket rule.
 
     NOTE: uses the raw 'edge' field (0–1 decimal) so this function is safe to
     call before 'edge_pct' is computed.
@@ -591,13 +590,17 @@ def _best_edge_per_game(edges: list) -> list:
 
     best: dict = {}
     for e in edges:
-        key = (e.get("matchup", ""), e.get("mkt_type", ""), e.get("side", ""))
+        if e.get("correlated_pass"):
+            continue   # scanner already tagged these as non-apex; never log
+        key = (e.get("matchup", ""), e.get("mkt_type", ""))
         if key not in best or _score(e) > _score(best[key]):
             best[key] = e
     seen = set()
     result = []
     for e in edges:
-        key = (e.get("matchup", ""), e.get("mkt_type", ""), e.get("side", ""))
+        if e.get("correlated_pass"):
+            continue
+        key = (e.get("matchup", ""), e.get("mkt_type", ""))
         if key not in seen and best[key] is e:
             seen.add(key)
             result.append(e)
@@ -674,25 +677,38 @@ def _add_new_bets(edges: list) -> list:
         detected.  Stored on the bet so we can detect line movement later.
       • DK / FD confirmation steps removed — Pinnacle is the sole fair-value anchor.
 
-    Every qualifying edge is logged so the notification and paper portfolio are
-    always in sync.  If a second edge on the same (matchup, mkt_type, side) slot
-    is logged, it is marked correlated=True and excluded from win-rate / Kelly
-    P&L stats — but still tracked for CLV and the full paper record.
+    One bet per (matchup, mkt_type-bucket, game_date) slot.  If a competing
+    alternate line for the same game+bucket arrives in a later scan, it is
+    silently skipped — never logged — so the tracker never holds more than one
+    total or spread position per game.
     """
+    def _mkt_bucket(mkt_type: str) -> str:
+        m = mkt_type.lower()
+        if m in ("spread", "kxmlbspread", "spread_team"):
+            return "spread"
+        if m in ("total", "kxmlbtotal", "total_over", "total_under"):
+            return "total"
+        return "prop"
+
     edges = _best_edge_per_game(edges)
     newly_added = []
     with _bets_lock:
         existing_ids = {b["id"] for b in _bets}
-        # Track slots already occupied by open bets to detect correlated entries.
-        # Include game date so same matchup on consecutive days is NOT correlated.
+        # Side-agnostic slots: (matchup, bucket, game_date).
+        # Excludes side so YES on 7.5-over and NO on 9.5-under for the same
+        # game both map to the same slot and the second is rejected.
+        # Include game date so the same matchup on consecutive days is allowed.
         open_slots = {
-            (b["matchup"], b.get("mkt_type", ""), b["side"], _parse_ticker_date(b.get("ticker", "")))
+            (_mkt_bucket(b.get("mkt_type", "")), b["matchup"], _parse_ticker_date(b.get("ticker", "")))
             for b in _bets if b["status"] == "open"
         }
         added = 0
         for e in edges:
             # Skip edges already invalidated by Pinnacle line movement
             if e.get("pin_invalidated"):
+                continue
+            # Skip non-apex lines tagged by _apply_correlation_control
+            if e.get("correlated_pass"):
                 continue
             bid = _bet_id(e["ticker"], e["side"])
             if bid in existing_ids:
@@ -702,8 +718,10 @@ def _add_new_bets(edges: list) -> list:
             existing_ids.add(bid)   # prevent same ticker appearing twice in one cycle
 
             game_date = _parse_ticker_date(e.get("ticker", ""))
-            slot = (e.get("matchup", ""), e.get("mkt_type", ""), e.get("side", ""), game_date)
-            is_correlated = slot in open_slots
+            slot = (_mkt_bucket(e.get("mkt_type", "")), e.get("matchup", ""), game_date)
+            if slot in open_slots:
+                continue   # alternate line for same game+bucket already open — PASS
+            is_correlated = False   # slot is unoccupied; this becomes the primary bet
 
             # entry_yes_pct = Kalshi YES ask % when flagged (for CLV calculation)
             kalshi_yes_at_flag = e["kalshi_pct"] if e["side"] == "YES" else round((1 - e["kalshi"]) * 100, 1)
@@ -779,8 +797,7 @@ def _add_new_bets(edges: list) -> list:
             _bets.append(new_bet)
             newly_added.append(new_bet)
             existing_ids.add(bid)
-            if not is_correlated:
-                open_slots.add(slot)   # only primary bet claims the slot
+            open_slots.add(slot)   # claim the slot so later alternate lines are blocked
             added += 1
         if added:
             save_ok = _save_bets(_bets)

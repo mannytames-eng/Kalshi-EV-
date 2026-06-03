@@ -5128,6 +5128,28 @@ class Handler(BaseHTTPRequestHandler):
                 if len(_bets) < before:
                     _save_bets(_bets)
             self._send(200, "application/json", json.dumps({"ok": True, "removed": before - len(_bets)}).encode())
+
+        elif path == "/api/admin/purge_subthreshold_open":
+            # One-shot: delete all open bets whose edge_pct is below the current
+            # EDGE_THRESHOLD.  Used to erase bets flagged under a looser temporary
+            # threshold (e.g. data-collection mode at 0.5%) that should never have
+            # entered the paper portfolio under normal operating rules.
+            _floor = EDGE_THRESHOLD * 100
+            with _bets_lock:
+                before  = len(_bets)
+                purged  = [b for b in _bets
+                           if b.get("status") == "open"
+                           and isinstance(b.get("edge_pct"), (int, float))
+                           and b["edge_pct"] < _floor]
+                _bets[:] = [b for b in _bets if b not in purged]
+                if purged:
+                    _save_bets(_bets)
+            ids = [b.get("id", "?") for b in purged]
+            print(f"  [admin] purge_subthreshold_open: removed {len(purged)} bet(s) below {_floor:.1f}%: {ids}")
+            self._send(200, "application/json", json.dumps({
+                "ok": True, "purged": len(purged), "threshold_pct": _floor, "ids": ids
+            }).encode())
+
         else:
             self._send(404, "text/plain", b"Not found")
 

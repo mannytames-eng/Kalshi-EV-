@@ -62,7 +62,9 @@ EDGE_THRESHOLD     = 0.015   # ≥1.5% fee+haircut-adjusted EV to flag — optim
 MAX_EDGE           = 0.20    # reject edges >20% — almost certainly a stale line
 EV_HAIRCUT         = 0.05    # model-uncertainty discount (5% — reduced from 10%)
 TOP_BETS_PER_CYCLE = 50      # surface up to 50 qualifying bets per scan (data collection mode)
-MAX_BETS_PER_GROUP = 2       # max bets per (matchup, mkt_type) group
+MAX_BETS_PER_GROUP = 1       # one bet per (matchup, mkt_type) group — prevents
+                             # Gaussian-fallback alternate totals from double-allocating
+                             # Kelly capital to the same game
 
 # Minimum Kalshi price for any side we'll consider betting.
 # Data shows 0/18 wins on markets priced below 15¢ — these are almost always
@@ -880,8 +882,11 @@ def _apply_correlation_control(
     max_per_group: int = MAX_BETS_PER_GROUP,
 ) -> List[dict]:
     """
-    Limit to max_per_group bets per (matchup, mkt_type) group.
-    Input should already be sorted by adj. edge descending.
+    Limit to max_per_group edges per (matchup, mkt_type) group.
+    With MAX_BETS_PER_GROUP=1 this enforces "one line per game" — the
+    highest-EV threshold for each market type survives; all others are
+    discarded.  Input must be pre-sorted by adj. edge descending so the
+    first edge seen per group is always the best one.
     """
     group_counts: Dict[tuple, int] = {}
     result = []
@@ -2139,10 +2144,14 @@ def scan_sport(
     )
 
     # ── 3. Sort by confidence × adj_edge, correlation-control, top N ─────
-    # Confidence-weighted score: rewards bets where all books agree AND edge is large.
-    # A 10% edge where DK/FD/Pinnacle all agree outranks a 12% edge where only one
-    # book has data or books are far apart.
-    edges.sort(key=lambda x: x["confidence"] * x["edge"], reverse=True)
+    # Primary sort: confidence × adj_edge descending (highest EV wins).
+    # Tiebreaker: lower kalshi_line preferred — less extreme threshold, cleaner signal.
+    # _apply_correlation_control then keeps only the top-1 edge per (matchup, mkt_type)
+    # so Gaussian-fallback alternate totals never double-allocate Kelly capital.
+    edges.sort(
+        key=lambda x: (x["confidence"] * x["edge"], -(x.get("kalshi_line") or 0)),
+        reverse=True,
+    )
     edges = _apply_correlation_control(edges)
     edges = edges[:TOP_BETS_PER_CYCLE]
 

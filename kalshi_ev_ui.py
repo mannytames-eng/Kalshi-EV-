@@ -122,43 +122,48 @@ def _odds_refresh_interval() -> int:
       spreads call: 1 credit  (regions=eu × 1 market)
       totals  call: 1 credit  (regions=eu × 1 market)
 
-    Asymmetric game-proximity overrides (checked first):
-      > 24h until next game: 4h cooldown — no meaningful movement that far out
-      < 3h until next game:  20s hot-path — maximum line capture before first pitch
-      3–24h window:          fall through to PDT time-of-day schedule below
+    Proximity override (checked first):
+      > 24h until next game: 4h cooldown — no meaningful line movement that far out
+      (the 3h hot-path was removed — it fired all day because MLB has staggered
+       games throughout the afternoon and the cursor always pointed at an imminent
+       start, keeping the scanner at 20s/poll continuously and burning ~4,700
+       extra credits/day vs the intended schedule)
 
     Operating windows (PDT = UTC-7):
-      Discovery    09:00–13:00 PDT (4h):  90s
-      Peak Trading 13:00–22:00 PDT (9h): 30s
+      Discovery    09:00–13:00 PDT (4h): 120s
+      Peak Trading 13:00–22:00 PDT (9h):  60s
       Sleep        22:00–09:00 PDT (11h): 15min
 
     Game-slate short-circuit: if all MLB games have commenced during Peak
     Trading, automatically drops to Sleep rates.
+
+    Daily credit budget (game lines only):
+      Discovery  (30/hr ×  4h × 2):   240
+      Peak       (60/hr ×  9h × 2): 1,080
+      Sleep       (4/hr × 11h × 2):    88
+      Total game lines: ~1,408/day
     """
-    # ── Asymmetric proximity check ────────────────────────────────────────
-    # Read _next_game_start_utc under the cache lock (brief acquisition only).
+    # ── Proximity check (far-out cooldown only) ───────────────────────────
     with _odds_cache_lock:
         _ngs = _next_game_start_utc
     if _ngs is not None:
         hours_until_start = (_ngs - time.time()) / 3600
         if hours_until_start > 24:
             return 4 * 3600   # far-out slate: 4h cooldown
-        if hours_until_start < 3:
-            return 20         # imminent game: 20s hot-path (faster than Peak Trading)
-    # ── PDT time-of-day schedule (3–24h window or no game data yet) ──────
+    # ── PDT time-of-day schedule ──────────────────────────────────────────
     h = _pdt_hour()
     if 13 <= h < 22 and _all_games_commenced():
         return 15 * 60       # Slate over — drop to Sleep rates early
     if 9  <= h < 13:
-        return 90            # Discovery: 90s
+        return 120           # Discovery: 120s
     if 13 <= h < 22:
-        return 30            # Peak Trading: 30s
+        return 60            # Peak Trading: 60s
     return 15 * 60           # Sleep: 15min
 
 def _props_refresh_interval() -> int:
     """Return seconds between MLB props scans (PDT context-aware schedule).
 
-    Discovery    09:00–13:00 PDT:  5min — aggressive pre-game line capture
+    Discovery    09:00–13:00 PDT: 10min — pre-game line capture (was 5min)
     Peak Trading 13:00–22:00 PDT: 15min — balanced active window
     Sleep        22:00–09:00 PDT: 30min — continuous overnight player news watch
 
@@ -166,31 +171,31 @@ def _props_refresh_interval() -> int:
     (checked from 09:00 PDT onward so Discovery window is also gated).
 
     Props credit budget (~21 credits/scan: 1 event list + 10 games × 2 markets):
-      Discovery    (12/hr ×  4h × 21):  1,008/day
-      Peak Trading  (4/hr ×  9h × 21):    756/day
-      Sleep         (2/hr × 11h × 21):    462/day
-      Total props: ~2,226/day
+      Discovery    (6/hr  ×  4h × 21):    504/day
+      Peak Trading (4/hr  ×  9h × 21):    756/day
+      Sleep        (2/hr  × 11h × 21):    462/day
+      Total props: ~1,722/day
 
-    Combined daily budget: ~4,794/day (game lines ~2,568 + props ~2,226).
-    Monthly theoretical max: ~143,820 (reduced in practice by slate short-circuits
-    and far-out 4h cooldowns on off-days).
+    Combined daily budget: ~3,130/day (game lines ~1,408 + props ~1,722).
+    Monthly projection: ~93,900 — safely under 100k budget.
     """
     h = _pdt_hour()
     if 9  <= h < 22 and _all_games_commenced():
         return 10 ** 9       # Slate over — props off (active from Discovery onward)
     if 9  <= h < 13:
-        return  5 * 60       # Discovery: 5min
+        return 10 * 60       # Discovery: 10min (was 5min)
     if 13 <= h < 22:
         return 15 * 60       # Peak Trading: 15min
     return 30 * 60           # Sleep: 30min (overnight player news)
 REFRESH_SECONDS       = 30         # re-scan Kalshi every 30 sec   (0 credits)
-# Monthly credit math (100k budget — Offensive Mode):
-#   Odds game lines  (Peak 30s + Discovery 90s + Sleep 15min): ~77,040
-#   Props scans      (Peak 15min + Discovery 5min + Sleep 30min): ~66,780
-#   Kalshi scans     (cached):                                        0
-#   ──────────────────────────────────────────────────────────────────
-#   Theoretical max                                          ~143,820
-#   Practical (slate short-circuits + off-day cooldowns):   ~90–110k
+# Monthly credit math (100k budget):
+#   Odds game lines  (Peak 60s + Discovery 120s + Sleep 15min): ~42,240
+#   Props scans      (Peak 15min + Discovery 10min + Sleep 30min): ~51,660
+#   Kalshi scans     (cached):                                          0
+#   ────────────────────────────────────────────────────────────────────
+#   Daily projection: ~3,130  |  Monthly projection: ~93,900
+#   NOTE: hot-path (20s when < 3h to game) was removed — it fired all day
+#   across staggered MLB slates, burning ~4,700 extra credits/day.
 HISTORY_FILE    = os.path.join(DATA_DIR, "ev_history.json")
 BETS_FILE       = os.path.join(DATA_DIR, "ev_bets.json")
 MY_BETS_FILE    = os.path.join(DATA_DIR, "my_bets.json")

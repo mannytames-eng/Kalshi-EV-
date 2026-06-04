@@ -206,9 +206,24 @@ PERF_BANKROLL        = 1000.0    # bankroll for ROI % display
 # ── Paper trading portfolio ────────────────────────────────────────────────────
 PAPER_START_BALANCE  = 1000.0    # starting virtual bankroll
 PAPER_START_DATE     = "2026-04-07"  # bets before this date excluded from portfolio
-PAPER_KELLY_FRACTION       = 0.25    # props: quarter-Kelly (higher variance, smaller sample)
-PAPER_KELLY_FRACTION_GAMES = 0.25    # spreads + totals: quarter-Kelly (matched to props fraction)
+PAPER_KELLY_FRACTION       = 0.50    # half-Kelly baseline (all market types)
+PAPER_KELLY_FRACTION_GAMES = 0.50    # half-Kelly baseline (spread / total / moneyline)
 PAPER_KELLY_CAP            = 0.05    # max 5% of current balance per bet
+
+# ── Time-Adaptive EV Cap ──────────────────────────────────────────────────────
+# Maximum EV (decimal) passed into the Kelly formula, gated by hours to game.
+# The cap limits position size for early-horizon bets without blocking them.
+# The actual edge is preserved in full on the bet record for model diagnostics.
+KELLY_EV_CAP_FAR   = 0.025   # > 8h:  2.5% cap — overnight / early-morning lines
+KELLY_EV_CAP_MID   = 0.040   # 3–8h:  4.0% cap — same-day, pre-peak window
+KELLY_EV_CAP_NEAR  = 0.060   # < 3h:  6.0% cap — imminent game, full signal
+
+# ── Edge Persistence Gate ─────────────────────────────────────────────────────
+# For games > 3h away, an edge must survive at least this many minutes (≈ one
+# full scan cycle) before a paper bet is logged and Discord fires.
+# Filters transient API sync glitches and flash-line anomalies.
+# Peak Trading scan interval = 60s; Discovery = 120s → 2.5 min covers both.
+PERSISTENCE_MIN_AGE_MIN = 2.5   # minutes edge must be "in memory" before logging
 TAKER_EDGE_THRESHOLD       = 0.05    # ≥5% edge → TAKER (cross spread immediately); below → MAKER (rest limit)
 MAX_ALLOWED_DRAWDOWN       = 0.25    # 25% peak-to-trough loss triggers full circuit breaker
 CURRENT_ACCOUNT_DRAWDOWN   = 0.00    # live drawdown ratio (0.0 = no drawdown, 0.25 = at limit)
@@ -631,14 +646,35 @@ def _compute_paper_balance() -> float:
 
 
 def _kelly_base_fraction(mkt_type: str) -> float:
-    """Market-type-aware Kelly base fraction.
-    Props carry more idiosyncratic variance, so they get full quarter-Kelly.
-    Game lines (spread / total) are correlated across the slate — eighth-Kelly
-    keeps aggregate exposure conservative.
+    """Market-type-aware Kelly base fraction — unified half-Kelly baseline.
+    The Time-Adaptive EV Cap controls horizon-specific exposure; the base
+    fraction sets the global sizing floor.
     """
     if mkt_type in ("prop", "nba_prop"):
-        return PAPER_KELLY_FRACTION        # 0.25 — quarter-Kelly
-    return PAPER_KELLY_FRACTION_GAMES      # 0.125 — eighth-Kelly (spread / total / moneyline)
+        return PAPER_KELLY_FRACTION        # 0.50 — half-Kelly
+    return PAPER_KELLY_FRACTION_GAMES      # 0.50 — half-Kelly (spread / total / moneyline)
+
+
+def _horizon_ev_cap(game_start: Optional[datetime]) -> float:
+    """Return the maximum EV (decimal) allowed for Kelly sizing based on
+    hours remaining until first pitch.
+
+    > 8h :  2.5% cap — overnight/early-morning lines; model signal weakest
+    3–8h :  4.0% cap — same-day pre-peak; moderate certainty
+    < 3h :  6.0% cap — imminent game; full pre-game signal confirmed
+    None :  4.0% cap — unknown horizon → conservative middle tier
+
+    The cap is applied to the EV *input* to Kelly, not to the final stake.
+    The true edge is always preserved unmodified on the bet record.
+    """
+    if game_start is None:
+        return KELLY_EV_CAP_MID
+    hours = (game_start - datetime.now(timezone.utc)).total_seconds() / 3600
+    if hours > 8:
+        return KELLY_EV_CAP_FAR
+    if hours > 3:
+        return KELLY_EV_CAP_MID
+    return KELLY_EV_CAP_NEAR
 
 
 def _paper_kelly_stake(edge_pct: float, kalshi_price: float, mkt_type: str = "") -> float:
@@ -697,6 +733,7 @@ def _add_new_bets(edges: list) -> list:
 
     edges = _best_edge_per_game(edges)
     newly_added = []
+    now_utc = datetime.now(timezone.utc)
     with _bets_lock:
         existing_ids = {b["id"] for b in _bets}
         # Side-agnostic slots: (matchup, bucket, game_date).
@@ -722,16 +759,61 @@ def _add_new_bets(edges: list) -> list:
                 continue   # permanently suppressed ghost/bad-match edge — never re-flag
             existing_ids.add(bid)   # prevent same ticker appearing twice in one cycle
 
-            game_date = _parse_ticker_date(e.get("ticker", ""))
+            game_date  = _parse_ticker_date(e.get("ticker", ""))
+            game_start = _parse_ticker_start_time(e.get("ticker", ""))
+            if game_start is None:
+                gt = e.get("game_time")
+                if gt:
+                    try:
+                        game_start = datetime.fromisoformat(gt.replace("Z", "+00:00"))
+                    except (ValueError, AttributeError):
+                        pass
+            hours_to_game = (
+                (game_start - now_utc).total_seconds() / 3600
+                if game_start is not None else None
+            )
+
+            # ── Persistence Gate ───────────────────────────────────────────────
+            # For games > 3h away, require the edge to have been seen for at
+            # least PERSISTENCE_MIN_AGE_MIN minutes (one full scan cycle) before
+            # logging a bet or firing a Discord alert.  Blocks transient API
+            # glitches and flash-line anomalies from becoming paper positions.
+            # age_min is set by scan_sport; prop edges lack it → gate skipped.
+            age_min = e.get("age_min")
+            if (age_min is not None
+                    and hours_to_game is not None
+                    and hours_to_game > 3
+                    and age_min < PERSISTENCE_MIN_AGE_MIN):
+                print(
+                    f"  [Persistence] {e.get('matchup','')} {e.get('mkt_type','')} "
+                    f"{e.get('side','')} — first detection ({age_min:.1f}m old), "
+                    f"game {hours_to_game:.1f}h away — holding for next cycle"
+                )
+                continue
+
             slot = (_mkt_bucket(e.get("mkt_type", "")), e.get("matchup", ""), game_date)
             if slot in open_slots:
                 continue   # alternate line for same game+bucket already open — PASS
             is_correlated = False   # slot is unoccupied; this becomes the primary bet
 
+            # ── Time-Adaptive EV Cap ───────────────────────────────────────────
+            # Clamp the EV input to the Kelly formula based on hours to game.
+            # The true edge is stored unmodified; only the Kelly input is capped.
+            ev_cap        = _horizon_ev_cap(game_start)
+            raw_edge_pct  = e["edge_pct"]
+            kelly_edge_pct = min(raw_edge_pct, ev_cap * 100)
+            ev_was_capped = kelly_edge_pct < raw_edge_pct
+            if ev_was_capped:
+                print(
+                    f"  [Kelly Calc] Input EV clamped {raw_edge_pct:.1f}% → "
+                    f"{kelly_edge_pct:.1f}% "
+                    f"({hours_to_game:.1f}h horizon, cap tier {ev_cap*100:.1f}%)"
+                )
+
             # entry_yes_pct = Kalshi YES ask % when flagged (for CLV calculation)
             kalshi_yes_at_flag = e["kalshi_pct"] if e["side"] == "YES" else round((1 - e["kalshi"]) * 100, 1)
             mkt_type_flag = e.get("mkt_type", "")
-            paper_stake   = _paper_kelly_stake(e["edge_pct"], e["kalshi"], mkt_type_flag)
+            paper_stake   = _paper_kelly_stake(kelly_edge_pct, e["kalshi"], mkt_type_flag)
 
             # Pinnacle probability at flag time — the baseline for line-shift detection
             bd = e.get("books_detail", {})
@@ -781,9 +863,12 @@ def _add_new_bets(edges: list) -> list:
                 # ─────────────────────────────────────────────────────────────
                 "kalshi_price":       e["kalshi"],
                 "kalshi_yes_at_flag": kalshi_yes_at_flag,
-                "flagged_at":         datetime.now(timezone.utc).isoformat(),
-                "game_time":          _parse_ticker_start_time(e["ticker"]).isoformat()
-                                      if _parse_ticker_start_time(e["ticker"]) else None,
+                "flagged_at":         now_utc.isoformat(),
+                "game_time":          game_start.isoformat() if game_start else None,
+                # ── Time-adaptive EV cap metadata ─────────────────────────────
+                "ev_horizon_h":        round(hours_to_game, 1) if hours_to_game is not None else None,
+                "ev_capped_from_pct":  round(raw_edge_pct, 1) if ev_was_capped else None,
+                "ev_cap_applied_pct":  round(ev_cap * 100, 1),   # active cap tier (2.5/4.0/6.0)
                 "status":             "open",
                 "resolved_at":        None,
                 "pnl":                None,
@@ -793,7 +878,7 @@ def _add_new_bets(edges: list) -> list:
                 "paper_stake":        paper_stake,           # Kelly-sized virtual wager
                 "paper_pnl":          None,                  # set on resolution
                 "correlated":         is_correlated,         # excluded from win-rate/Kelly stats
-                "clv_mult_applied":   _kelly_base_fraction(mkt_type_flag),  # 0.25 (prop) or 0.125 (game line)
+                "clv_mult_applied":   _kelly_base_fraction(mkt_type_flag),  # 0.50 — half-Kelly baseline
                 "execution_strategy":  execution_strategy,    # "TAKER" (≥5% edge) or "MAKER" (rest limit)
                 "resting_limit_price": resting_limit_price,   # None for TAKER; ask − 1 tick for MAKER
                 "is_synthetic":        e.get("is_synthetic", False),  # True → shadow-mode Poisson derivation

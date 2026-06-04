@@ -1234,14 +1234,25 @@ def _get_performance(since: Optional[str] = None) -> dict:
             return f * (1.0 - k) / k   # profit = stake × net_odds
         return -f                        # loss = −stake (fraction of bankroll)
 
-    # CLV stats — game lines only, all bets with Pinnacle or Kalshi data
-    clv_bets = [b for b in gl_bets if b.get("clv_source") in ("pin", "pin_entry", "kalshi")]
-    avg_clv  = round(sum(b["clv"] for b in clv_bets) / len(clv_bets), 1) if clv_bets else None
+    # CLV stats — settled game lines only, Pinnacle closing-line bets only.
+    # Strictly filtered to clv_source == "pin":
+    #   "pin_entry" = Pinnacle prob at detection time, not true close — excluded
+    #   "kalshi"    = Kalshi market drift only, no Pinnacle reference — excluded
+    #   "none"      = no price captured at all — excluded
+    # Only "pin" represents a genuine closing-line edge measurement.
+    clv_bets   = [b for b in gl_bets
+                  if b.get("clv_source") == "pin"
+                  and b.get("status") in ("won", "lost")]
+    avg_clv    = round(sum(b["clv"] for b in clv_bets) / len(clv_bets), 1) if clv_bets else None
+    clv_sample = len(clv_bets)   # expose sample size so UI can flag low-N readings
 
-    # Average line movement — settled game lines only (open bets have no real closing line yet)
+    # Average line movement — settled game lines with true Pinnacle close only.
+    # Excludes pin_entry (closing_pin_pct = entry prob, not real close → move = ~0).
     line_moves = []
     for b in gl_bets:
         if b.get("status") not in ("won", "lost"):
+            continue
+        if b.get("clv_source") != "pin":   # only real closing-line captures
             continue
         entry = (b.get("kalshi_price") or 0) * 100
         close = b.get("closing_pin_pct")
@@ -1364,9 +1375,9 @@ def _get_performance(since: Optional[str] = None) -> dict:
             by_type[label]["units"].append(-1.0)
         if kp is not None:
             by_type[label]["kelly"].append(kp)
-        clv_val = b.get("clv")
-        if clv_val is not None:
-            by_type[label]["clv"].append(clv_val)
+        # Only "pin" CLV is true closing-line data — exclude pin_entry/kalshi/none
+        if b.get("clv_source") == "pin" and b.get("clv") is not None:
+            by_type[label]["clv"].append(b["clv"])
 
     MIN_SAMPLE = 20   # need at least 20 settled bets before win rate is meaningful
 
@@ -1437,7 +1448,8 @@ def _get_performance(since: Optional[str] = None) -> dict:
         "total_kelly_pct":      total_kelly_pct,    # total P&L as % of bankroll
         "avg_kelly_units":      avg_kelly_units,
         "avg_kalshi_implied":   avg_kalshi_implied,
-        "avg_clv":              avg_clv,
+        "avg_clv":              avg_clv,       # pin-only closing-line CLV (pp)
+        "clv_sample":           clv_sample,    # number of bets behind avg_clv
         "avg_line_move":        avg_line_move,
         "kelly_bankroll":       PERF_BANKROLL,
         "bets":                 table_bets,
@@ -2735,6 +2747,13 @@ def _capture_clv_prices():
                     except (ValueError, AttributeError):
                         pass
             if game_start is None:
+                # Last-resort fallback: estimate game_start from Kalshi close_time.
+                # Reached only when BOTH ticker parsing AND the stored game_time field
+                # fail — practically never for standard MLB tickers.
+                # MLB: close_time ≈ game_start + avg_game_duration (3h) + buffer (0.5h)
+                #   → game_start ≈ close_time − 3.5h.  Conservative: if a game ran
+                #   long the estimate will be slightly early, but the 15¢/85¢ guard
+                #   below catches any in-game prices that sneak through.
                 close_str = mkt.get("close_time") or mkt.get("expected_expiration_time")
                 if close_str:
                     try:
@@ -2774,11 +2793,13 @@ def _capture_clv_prices():
             yes_close_pct = round(ask_c if side == "YES" else bid_c, 1)
 
             # Safety guard: reject prices that have collapsed to in-game extremes.
-            # Pre-game markets rarely close below 8¢ or above 92¢ — anything
-            # beyond those bounds is almost certainly a live in-game price
+            # Pre-game totals and spreads never trade below 15¢ or above 85¢ —
+            # anything outside that band is almost certainly a live in-game price
             # reflecting a near-decided outcome, not a true closing line.
-            # This is a backstop for the game_start guard above.
-            if yes_close_pct >= 92.0 or yes_close_pct <= 8.0:
+            # Tightened from 8¢/92¢ to 15¢/85¢ to catch mid-game prices that
+            # pass the game_start time guard (e.g. if ticker parse falls back
+            # to close_time estimate).
+            if yes_close_pct >= 85.0 or yes_close_pct <= 15.0:
                 continue
 
             # True CLV: compare entry Kalshi price to the last known Pinnacle
@@ -2805,6 +2826,11 @@ def _capture_clv_prices():
                             # Primary: true CLV vs Pinnacle closing line.
                             b["clv"]        = round(closing_pin - entry_k, 1)
                             b["clv_source"] = "pin"
+                        elif b.get("clv_source") == "pin":
+                            # Pinnacle data temporarily missing from history but a clean
+                            # pre-close Pinnacle capture already set clv_source = "pin".
+                            # Never downgrade to "kalshi" — preserve the better source.
+                            pass
                         else:
                             # Fallback: Kalshi drift using matched ask/bid prices
                             entry_yes = b.get("kalshi_yes_at_flag")

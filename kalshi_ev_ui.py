@@ -3290,14 +3290,14 @@ HTML = """<!DOCTYPE html>
 </div>
 
 <div id="today-edges-card" class="card">
-  <div class="card-header exec-card-header" onclick="toggleCard('today-edges-body')">📋 Open Positions &nbsp;<span style="font-size:10px;color:var(--muted);font-weight:400;">all open bets · updates every 2 min</span> <span class="card-toggle" id="today-edges-body-toggle">▾</span></div>
-  <div id="today-edges-body" class="card-body"><div class="empty">No open positions.</div></div>
+  <div class="card-header exec-card-header" onclick="toggleCard('today-edges-body')">📡 Active Arbitrage Signals / Pending Queue &nbsp;<span style="font-size:10px;color:var(--muted);font-weight:400;">fresh edges ≤30 min · positive EV only · updates every 2 min</span> <span class="card-toggle" id="today-edges-body-toggle">▾</span></div>
+  <div id="today-edges-body" class="card-body"><div class="empty">No active signals.</div></div>
 </div>
 
 
 
 <div id="paper-card" class="card">
-  <div class="card-header" onclick="toggleCard('paper-body')" style="border-left:3px solid #3fb950;">📊 Paper Portfolio — 0.25 Kelly · All 3%+ Edges · $1,000 Starting Balance <span class="card-toggle" id="paper-body-toggle">▾</span></div>
+  <div class="card-header" onclick="toggleCard('paper-body')" style="border-left:3px solid #3fb950;">📊 Paper Portfolio — 0.5 Kelly · All 2%+ Edges · $1,000 Starting Balance <span class="card-toggle" id="paper-body-toggle">▾</span></div>
   <div id="paper-body" class="card-body"><div class="empty"><span class="spinner"></span>Loading portfolio…</div></div>
 </div>
 
@@ -3330,7 +3330,7 @@ HTML = """<!DOCTYPE html>
 
 
 <div id="mybets-card" class="card">
-  <div class="card-header" style="border-left:3px solid #f0c000;" onclick="toggleCard('mybets-body')">💰 My Bets — Real P&amp;L <span class="card-toggle" id="mybets-body-toggle">▾</span></div>
+  <div class="card-header" style="border-left:3px solid #f0c000;" onclick="toggleCard('mybets-body')">💼 Live Portfolio / Filled Positions <span style="font-size:10px;color:var(--muted);font-weight:400;">contracts actually entered on Kalshi</span> <span class="card-toggle" id="mybets-body-toggle">▾</span></div>
   <div id="mybets-body" class="card-body">
     <div id="mybets-stats" style="padding:8px 10px;border-bottom:1px solid var(--border);display:flex;gap:12px;flex-wrap:wrap;align-items:center;">
       <span style="color:var(--muted);font-size:11px;">Add a bet you placed on Kalshi to track real P&amp;L.</span>
@@ -3929,20 +3929,46 @@ async function fetchTodayEdges() {
 function renderTodayEdges() {
   const el = document.getElementById('today-edges-body');
   if (!el) return;
-  if (!todayEdgesList.length) {
-    el.innerHTML = '<div class="empty">No open positions. Edges will appear here when flagged.</div>';
-    return;
-  }
 
-  // Build live lookup: ticker|side -> live edge object (≥3% only)
+  // ── Signal TTL: 30-minute window ──────────────────────────────────────
+  // Only show signals flagged within the last 30 minutes.  Older entries
+  // are "zombie" signals — the edge has been resolved (taken, passed, or
+  // collapsed) and should not appear in the actionable queue.
+  const SIGNAL_TTL_MS = 30 * 60 * 1000;
+  const nowMs = Date.now();
+
+  // Build live lookup: ticker|side -> live edge object (≥threshold only)
   const liveMap = {};
   for (const e of lastEdges) {
     liveMap[e.ticker + '|' + e.side] = e;
   }
 
-  const rows = [...todayEdgesList].reverse().map(b => {
+  // Filter to fresh, positive-edge signals only
+  const activeSignals = todayEdgesList.filter(b => {
+    const ageMs = b.flagged_at ? nowMs - new Date(b.flagged_at).getTime() : Infinity;
+    if (ageMs >= SIGNAL_TTL_MS) return false;   // expired — purge from queue
     const key  = b.ticker + '|' + b.side;
-    const live = liveMap[key];           // present only if ≥3% in last scan
+    const live = liveMap[key];
+    const snap = marketSnapshot[key];
+    const curEdgePct = live != null ? (live.edge_pct != null ? live.edge_pct : 0)
+                     : snap != null ? snap.edge_pct : null;
+    // Remove if we have a live reading that confirms the edge is gone/negative
+    if (curEdgePct !== null && curEdgePct <= 0) return false;
+    return true;
+  });
+
+  const expiredCount = todayEdgesList.length - activeSignals.length;
+
+  if (!activeSignals.length) {
+    el.innerHTML = '<div class="empty">No active signals.'
+      + (expiredCount > 0 ? ` ${expiredCount} signal${expiredCount > 1 ? 's' : ''} expired or edge collapsed — see portfolio for filled positions.` : ' Edges will appear here when flagged.')
+      + '</div>';
+    return;
+  }
+
+  const rows = [...activeSignals].reverse().map(b => {
+    const key  = b.ticker + '|' + b.side;
+    const live = liveMap[key];           // present only if ≥threshold in last scan
     const snap = marketSnapshot[key];    // present for ANY market scanned this cycle
 
     // ── Resolve current edge from best available source ───────────────────
@@ -3956,13 +3982,14 @@ function renderTodayEdges() {
                      : snap != null ? snap.kalshi : null;
     const inSnapshot = snap != null || live != null;
 
-    // ── Cutoff price: max Kalshi price that preserves ≥3% edge ───────────
+    // ── Cutoff price: max Kalshi price that preserves ≥2% edge ───────────
     // curFair is already expressed from the perspective of the bet side:
-    //   YES bet → curFair = fair_yes     → max YES price = fair_yes - 0.03
-    //   NO  bet → curFair = 1-fair_yes   → max NO  price = (1-fair_yes) - 0.03
+    //   YES bet → curFair = fair_yes     → max YES price = fair_yes - 0.02
+    //   NO  bet → curFair = 1-fair_yes   → max NO  price = (1-fair_yes) - 0.02
     // Using the same formula (curFair - MIN_EDGE) is correct for both sides.
-    // Bug: the old code used (1 - curFair - MIN_EDGE) for NO, which substituted
-    // fair_yes back in — causing aboveCutoff to fire even on strong NO edges.
+    // Cutoff label uses CENTS (¢) not American odds — negative American numbers
+    // compare counter-intuitively (e.g. -144 > -232 numerically even though
+    // -144 implies a lower probability, making inequality direction confusing).
     const MIN_EDGE = 0.020;
     let cutoffLabel = null;
     let cutoffCents = null;
@@ -3970,12 +3997,11 @@ function renderTodayEdges() {
       const maxPrice = curFair - MIN_EDGE;
       if (maxPrice > 0 && maxPrice < 1) {
         cutoffCents = maxPrice;
-        cutoffLabel = `${b.side} ≤ ${kalshiToAmerican(maxPrice)}`;
+        // Display in cents: "YES ≤ 69¢" means buy only if Kalshi asks ≤ 69¢
+        cutoffLabel = `${b.side} ≤ ${Math.round(maxPrice * 100)}¢`;
       }
     }
-    const liveKalshiSide = curKalshi != null
-      ? (b.side === 'YES' ? curKalshi : curKalshi)   // snapshot already stores the bet-side price
-      : null;
+    const liveKalshiSide = curKalshi != null ? curKalshi : null;
     const aboveCutoff = cutoffCents != null && liveKalshiSide != null
       && liveKalshiSide > cutoffCents + 0.005;
 
@@ -3992,7 +4018,7 @@ function renderTodayEdges() {
       recLabel = 'PASS';
       recColor = '#f85149';
       recTip   = aboveCutoff && cutoffLabel
-        ? `Kalshi price above cutoff for 3% edge (${cutoffLabel}). Current edge: ${curEdgePct != null ? curEdgePct.toFixed(1) : '—'}%. Line has moved — do not bet.`
+        ? `Kalshi price above cutoff (${cutoffLabel}) — need ≥2% edge. Current edge: ${curEdgePct != null ? curEdgePct.toFixed(1) : '—'}%. Line has moved — do not enter.`
         : `Edge gone — current edge ${curEdgePct != null ? curEdgePct.toFixed(1) : '—'}% (was +${b.edge_pct}% at flag). Kalshi corrected.`;
     } else if (curEdgePct < 3.0) {
       recLabel = `WEAK +${curEdgePct.toFixed(1)}%`;
@@ -4006,8 +4032,8 @@ function renderTodayEdges() {
       recLabel = cutoffLabel ? `BET if ${cutoffLabel}` : `BET +${curEdgePct.toFixed(1)}%`;
       recColor = '#3fb950';
       recTip   = cutoffLabel
-        ? `Current edge +${curEdgePct.toFixed(1)}%. Scan prices up to 2 min old — edge holds while ${cutoffLabel}.`
-        : `Current edge +${curEdgePct.toFixed(1)}%. Always verify live price on Kalshi before placing.`;
+        ? `Current edge +${curEdgePct.toFixed(1)}%. Scan prices up to 2 min old — edge holds while Kalshi ${cutoffLabel}.`
+        : `Current edge +${curEdgePct.toFixed(1)}%. Verify live Kalshi price before entering.`;
     }
     const recBadge = `<span style="font-weight:700;font-size:12px;color:${recColor};" title="${recTip}">${recLabel}</span>`;
 

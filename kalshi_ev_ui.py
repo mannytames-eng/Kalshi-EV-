@@ -3117,8 +3117,8 @@ HTML = """<!DOCTYPE html>
 </div>
 
 <div id="today-edges-card" class="card">
-  <div class="card-header exec-card-header" onclick="toggleCard('today-edges-body')">📋 Open Positions &nbsp;<span style="font-size:10px;color:var(--muted);font-weight:400;">all open bets · updates every 2 min</span> <span class="card-toggle" id="today-edges-body-toggle">▾</span></div>
-  <div id="today-edges-body" class="card-body"><div class="empty">No open positions.</div></div>
+  <div class="card-header exec-card-header" onclick="toggleCard('today-edges-body')">📡 Live Portfolio Tracker &nbsp;<span style="font-size:10px;color:var(--muted);font-weight:400;">all open bets · updates every 2 min</span> <span class="card-toggle" id="today-edges-body-toggle">▾</span></div>
+  <div id="today-edges-body" class="card-body"><div class="empty">No open positions. Edges will appear here when flagged.</div></div>
 </div>
 
 
@@ -3768,7 +3768,7 @@ function renderTodayEdges() {
   const el = document.getElementById('today-edges-body');
   if (!el) return;
   if (!todayEdgesList.length) {
-    el.innerHTML = '<div class="empty">No open positions. Edges will appear here when flagged.</div>';
+    el.innerHTML = '<div class="empty">No live positions. Flagged edges will appear here.</div>';
     return;
   }
 

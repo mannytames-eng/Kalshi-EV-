@@ -184,8 +184,29 @@ PERF_BANKROLL        = 1000.0    # bankroll for ROI % display
 # ── Paper trading portfolio ────────────────────────────────────────────────────
 PAPER_START_BALANCE  = 1000.0    # starting virtual bankroll
 PAPER_START_DATE     = "2026-04-07"  # bets before this date excluded from portfolio
-PAPER_KELLY_FRACTION = 0.25     # quarter-Kelly sizing
-PAPER_KELLY_CAP      = 0.05     # max 5% of current balance per bet
+PAPER_KELLY_FRACTION = 0.25     # quarter-Kelly base fraction
+PAPER_KELLY_CAP      = 0.03     # max 3% of current balance per bet (validation-phase cap)
+
+# ── Time-to-matchup Kelly multipliers ────────────────────────────────────────
+# Lines are softest and liquidity thinnest far from first pitch; scale down
+# early entries and trust the full edge only when the market has settled.
+#   > 12 h  →  0.25× (overnight / speculative lines)
+#   4–12 h  →  0.50× (mid-day discovery window)
+#   < 4 h   →  1.00× (peak liquidity — full edge)
+def _time_kelly_mult(game_time_iso: str | None) -> float:
+    """Return the time-to-matchup Kelly multiplier for a given game_time ISO string."""
+    if not game_time_iso:
+        return 0.50   # unknown game time — treat as mid-range
+    try:
+        gt = datetime.fromisoformat(game_time_iso.replace("Z", "+00:00"))
+        hours_until = (gt - datetime.now(timezone.utc)).total_seconds() / 3600
+    except (ValueError, AttributeError):
+        return 0.50
+    if hours_until > 12:
+        return 0.25
+    if hours_until >= 4:
+        return 0.50
+    return 1.00
 
 # ── Shared state (updated by background thread) ───────────────────────────────
 _lock    = threading.Lock()
@@ -622,15 +643,25 @@ def _compute_paper_balance() -> float:
     return round(bal, 2)
 
 
-def _paper_kelly_stake(edge_pct: float, kalshi_price: float) -> float:
-    """Calculate Kelly-sized paper stake against current portfolio balance."""
+def _paper_kelly_stake(edge_pct: float, kalshi_price: float,
+                       game_time_iso: str | None = None) -> float:
+    """Calculate Kelly-sized paper stake against current portfolio balance.
+
+    Sizing chain:
+      full_kelly  = edge / (1 − kalshi_price)          ← raw Kelly fraction
+      base        = full_kelly × PAPER_KELLY_FRACTION   ← quarter-Kelly
+      calibrated  = base × _time_kelly_mult(game_time)  ← time-to-game discount
+      capped       = min(calibrated, PAPER_KELLY_CAP)   ← 3% hard ceiling
+      stake        = capped × portfolio_balance
+    """
     k = kalshi_price
     e = edge_pct / 100.0
     if k <= 0 or k >= 1 or e <= 0:
         return 0.0
-    balance = _compute_paper_balance()
+    balance    = _compute_paper_balance()
     full_kelly = e / (1.0 - k)
-    frac = min(full_kelly * PAPER_KELLY_FRACTION, PAPER_KELLY_CAP)
+    time_mult  = _time_kelly_mult(game_time_iso)
+    frac       = min(full_kelly * PAPER_KELLY_FRACTION * time_mult, PAPER_KELLY_CAP)
     return round(frac * balance, 2)
 
 
@@ -675,7 +706,10 @@ def _add_new_bets(edges: list) -> list:
 
             # entry_yes_pct = Kalshi YES ask % when flagged (for CLV calculation)
             kalshi_yes_at_flag = e["kalshi_pct"] if e["side"] == "YES" else round((1 - e["kalshi"]) * 100, 1)
-            paper_stake = _paper_kelly_stake(e["edge_pct"], e["kalshi"])
+            # Resolve game_time for the time-adaptive Kelly multiplier
+            _gt_dt = _parse_ticker_start_time(e["ticker"])
+            _game_time_iso = _gt_dt.isoformat() if _gt_dt else None
+            paper_stake = _paper_kelly_stake(e["edge_pct"], e["kalshi"], _game_time_iso)
 
             # Pinnacle probability at flag time — the baseline for line-shift detection
             bd = e.get("books_detail", {})
@@ -1125,15 +1159,17 @@ def _get_performance(since: Optional[str] = None) -> dict:
     corrupted_count = sum(1 for b in bets if _is_corrupted(b))
 
     # ── Kelly sizing helper ────────────────────────────────────────────────────
-    # 0.25 Fractional Kelly for a binary prediction-market bet, with:
-    #   • Hard 5% bankroll cap per bet
-    #   • Dynamic CLV confidence multiplier — types with negative avg CLV get
-    #     0.5× applied on top of the quarter-Kelly fraction
+    # Mirrors _paper_kelly_stake() exactly so dashboard metrics stay in sync
+    # with real-time portfolio tracking.
     #
-    # Full Kelly  = edge / (1 − kalshi_price)
-    # Adjusted    = full × 0.25 × clv_multiplier,  capped at 5% of bankroll
-    KELLY_FRACTION   = 0.25   # fractional Kelly scaling
-    KELLY_SINGLE_CAP = 0.05   # max 5% of bankroll per bet
+    # Sizing chain (identical to live staking):
+    #   full_kelly  = edge / (1 − kalshi_price)
+    #   base        = full_kelly × 0.25            ← quarter-Kelly
+    #   calibrated  = base × time_mult             ← time-to-game discount
+    #   adjusted    = calibrated × clv_mult        ← CLV confidence penalty
+    #   capped      = min(adjusted, 3%)            ← validation-phase hard ceiling
+    KELLY_FRACTION   = 0.25   # fractional Kelly base (matches PAPER_KELLY_FRACTION)
+    KELLY_SINGLE_CAP = PAPER_KELLY_CAP   # 3% — always references the same constant
 
     # Fetch CLV-based multipliers once for the whole performance pass
     clv_mults = _get_clv_multipliers()
@@ -1143,10 +1179,11 @@ def _get_performance(since: Optional[str] = None) -> dict:
         e = b.get("edge_pct", 0) / 100.0
         if k <= 0 or k >= 1 or e <= 0:
             return 0.0
-        full_kelly  = e / (1.0 - k)
-        mtype       = _infer_mkt_type(b)
-        clv_mult    = clv_mults.get(mtype, 1.0)
-        return min(full_kelly * KELLY_FRACTION * clv_mult, KELLY_SINGLE_CAP)
+        full_kelly = e / (1.0 - k)
+        time_mult  = _time_kelly_mult(b.get("game_time"))
+        mtype      = _infer_mkt_type(b)
+        clv_mult   = clv_mults.get(mtype, 1.0)
+        return min(full_kelly * KELLY_FRACTION * time_mult * clv_mult, KELLY_SINGLE_CAP)
 
     def _kelly_pnl(b: dict) -> Optional[float]:
         """P&L as fraction-of-bankroll under CLV-adjusted quarter-Kelly sizing."""

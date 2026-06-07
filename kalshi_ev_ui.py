@@ -698,6 +698,18 @@ def _add_new_bets(edges: list) -> list:
                 continue   # exact same market already logged
             if bid in _bad_match_ids:
                 continue   # permanently suppressed ghost/bad-match edge — never re-flag
+
+            # ── Prop-specific edge floor ──────────────────────────────────────
+            # MLB props (KS, HIT, TB, RBI) are less liquid than game lines —
+            # smaller books, wider spreads, slower Kalshi repricing.  A 3% edge
+            # on a prop carries far more variance than 3% on a total or spread,
+            # so we require a 7% minimum before logging or staking.
+            # Game lines (total, spread) remain at the global 3% floor.
+            if e.get("mkt_type") == "prop" and e.get("edge_pct", 0) < 7.0:
+                print(f"  PASS (prop <7%): {e.get('title','')} "
+                      f"{e.get('side','')} edge={e.get('edge_pct',0):.1f}% — skipped")
+                continue
+
             existing_ids.add(bid)   # prevent same ticker appearing twice in one cycle
 
             game_date = _parse_ticker_date(e.get("ticker", ""))

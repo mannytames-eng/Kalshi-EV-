@@ -2355,7 +2355,31 @@ def _run_scan():
             _state["last_scan"]       = now_iso
             _state["scanning"]        = False
             _state["last_scan_stats"] = mlb_stats   # diagnostic counters for /api/scan
-            _state["market_snapshot"] = mlb_snapshot  # all processed markets, not just ≥3%
+
+            # ── Merge prop edges into market_snapshot ─────────────────────────
+            # scan_player_props() returns a flat edge list, not a snapshot dict,
+            # so we build snapshot entries here using the same schema as scan_sport().
+            # Zero extra credits — this data is already in memory from the props scan.
+            # Without this, renderTodayEdges() finds no key for prop tickers and
+            # shows a blank "Last Scan" column for all prop bets.
+            prop_snapshot: dict = {}
+            for _pe in mlb_props:
+                _ticker = _pe.get("ticker", "")
+                _side   = _pe.get("side", "")
+                if not _ticker or not _side:
+                    continue
+                _adj_edge = _pe.get("edge", 0.0)      # decimal adj edge for this side
+                _kalshi   = _pe.get("kalshi", 0.0)    # bet-side Kalshi price (decimal)
+                _fair     = _pe.get("fair", 0.0)      # bet-side fair prob (decimal)
+                prop_snapshot[f"{_ticker}|{_side}"] = {
+                    "adj_edge": round(_adj_edge, 4),
+                    "kalshi":   round(_kalshi, 4),
+                    "fair":     round(_fair, 4),
+                    "edge_pct": round(_adj_edge * 100, 1),
+                }
+            combined_snapshot = {**mlb_snapshot, **prop_snapshot}
+
+            _state["market_snapshot"] = combined_snapshot  # game lines + props
 
         # Log new bets and capture what was just added for the alert
         newly_logged = _add_new_bets(edges)

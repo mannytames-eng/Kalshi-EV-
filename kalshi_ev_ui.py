@@ -7,9 +7,7 @@ Open: http://localhost:8000
 
 import json
 import os
-import queue
 import sys
-import tempfile
 import threading
 import time
 from datetime import datetime, timezone
@@ -50,8 +48,6 @@ from kalshi_ev_scanner import (
     kalshi_get,
     fetch_game_scores,
     fetch_odds_index,
-    fetch_book_odds,
-    build_consensus_game_index,
     validate_bet,
     MLB_SPREAD_STD, MLB_TOTAL_STD,
     NBA_SPREAD_STD, NBA_TOTAL_STD,
@@ -64,7 +60,7 @@ from kalshi_ev_scanner import (
 PORT = int(os.environ.get("PORT", 8000))   # Railway injects PORT; falls back to 8000 locally
 # ── Refresh cadence (credit budget) ──────────────────────────────────────────
 # Two independent loops:
-#   ODDS_REFRESH  : fetches Pinnacle lines only    — costs 2 credits (MLB)
+#   ODDS_REFRESH  : fetches Pinnacle/DK/FD lines  — costs 2 credits (MLB + NBA)
 #   KALSHI_REFRESH: re-scans Kalshi prices only    — costs 0 credits (uses cache)
 #
 # Monthly credit math (20k budget):
@@ -118,84 +114,66 @@ def _all_games_commenced() -> bool:
 def _odds_refresh_interval() -> int:
     """Return seconds until next Pinnacle odds refresh (PDT context-aware schedule).
 
-    Credit costs (MLB only — 2 credits/refresh with parametric split):
-      spreads call: 1 credit  (regions=eu × 1 market)
-      totals  call: 1 credit  (regions=eu × 1 market)
-
-    Proximity override (checked first):
-      > 24h until next game: 4h cooldown — no meaningful line movement that far out
-      (the 3h hot-path was removed — it fired all day because MLB has staggered
-       games throughout the afternoon and the cursor always pointed at an imminent
-       start, keeping the scanner at 20s/poll continuously and burning ~4,700
-       extra credits/day vs the intended schedule)
+    Credit costs (MLB only — 4 markets per call):
+      MLB odds call: 4 credits (spreads+totals+alternate_spreads+alternate_totals)
 
     Operating windows (PDT = UTC-7):
-      Discovery    09:00–13:00 PDT (4h): 120s
-      Peak Trading 13:00–22:00 PDT (9h):  60s
-      Sleep        22:00–09:00 PDT (11h): 15min
+      Discovery    09:00–13:00 PDT (4h):  3min — morning line-setting, lower cadence
+      Peak Trading 13:00–22:00 PDT (9h): 75s  — live game hours, fast line capture
+      Sleep        22:00–09:00 PDT (11h): 15min — overnight, minimal market movement
 
-    Game-slate short-circuit: if all MLB games have commenced during Peak
-    Trading, automatically drops to Sleep rates.
+    Game-slate short-circuit (Task 2): if all MLB games have commenced during
+    Peak Trading, automatically drops to Sleep rates to conserve credits.
 
-    Daily credit budget (game lines only):
-      Discovery  (30/hr ×  4h × 2):   240
-      Peak       (60/hr ×  9h × 2): 1,080
-      Sleep       (4/hr × 11h × 2):    88
-      Total game lines: ~1,408/day
+    Odds credit budget:
+      Discovery    (20/hr ×  4h × 4):   320/day
+      Peak Trading (48/hr ×  9h × 4): 1,728/day
+      Sleep         (4/hr × 11h × 4):   176/day
+      Total odds: ~2,224/day
     """
-    # ── Proximity check (far-out cooldown only) ───────────────────────────
-    with _odds_cache_lock:
-        _ngs = _next_game_start_utc
-    if _ngs is not None:
-        hours_until_start = (_ngs - time.time()) / 3600
-        if hours_until_start > 24:
-            return 4 * 3600   # far-out slate: 4h cooldown
-    # ── PDT time-of-day schedule ──────────────────────────────────────────
     h = _pdt_hour()
     if 13 <= h < 22 and _all_games_commenced():
         return 15 * 60       # Slate over — drop to Sleep rates early
     if 9  <= h < 13:
-        return 120           # Discovery: 120s
+        return  3 * 60       # Discovery: 3min
     if 13 <= h < 22:
-        return 60            # Peak Trading: 60s
+        return 75            # Peak Trading: 75s
     return 15 * 60           # Sleep: 15min
 
 def _props_refresh_interval() -> int:
     """Return seconds between MLB props scans (PDT context-aware schedule).
 
-    Discovery    09:00–13:00 PDT: 10min — pre-game line capture (was 5min)
-    Peak Trading 13:00–22:00 PDT: 15min — balanced active window
-    Sleep        22:00–09:00 PDT: 30min — continuous overnight player news watch
+    Discovery    09:00–13:00 PDT: 10min — pre-game lines forming
+    Peak Trading 13:00–22:00 PDT:  8min — lineups locked, scratches happen here
+    Sleep        22:00–09:00 PDT:  OFF  — no upcoming games, save credits
 
-    Game-slate short-circuit: props off when all games have commenced
-    (checked from 09:00 PDT onward so Discovery window is also gated).
+    Game-slate short-circuit: mirrors odds logic — props off when slate over.
+
+    Rationale: props markets (pitcher strikeouts, batter hits) are less liquid
+    than totals — Kalshi can lag Pinnacle by 15-30min after a lineup change or
+    pitcher scratch.  Scanning 3× more often catches those windows.
 
     Props credit budget (~21 credits/scan: 1 event list + 10 games × 2 markets):
-      Discovery    (6/hr  ×  4h × 21):    504/day
-      Peak Trading (4/hr  ×  9h × 21):    756/day
-      Sleep        (2/hr  × 11h × 21):    462/day
-      Total props: ~1,722/day
-
-    Combined daily budget: ~3,130/day (game lines ~1,408 + props ~1,722).
-    Monthly projection: ~93,900 — safely under 100k budget.
+      Discovery    (7.5/hr ×  4h × 21):  630/day
+      Peak Trading (  6/hr ×  9h × 21): 1,134/day
+      Sleep:                                0/day
+      Total props: ~1,764/day  (well within 100k credit budget)
     """
     h = _pdt_hour()
-    if 9  <= h < 22 and _all_games_commenced():
-        return 10 ** 9       # Slate over — props off (active from Discovery onward)
+    if 13 <= h < 22 and _all_games_commenced():
+        return 10 ** 9       # Slate over — props off
     if 9  <= h < 13:
-        return 10 * 60       # Discovery: 10min (was 5min)
+        return 10 * 60       # Discovery: 10min
     if 13 <= h < 22:
-        return 15 * 60       # Peak Trading: 15min
-    return 30 * 60           # Sleep: 30min (overnight player news)
+        return  8 * 60       # Peak Trading: 8min
+    return 10 ** 9           # Sleep: OFF
 REFRESH_SECONDS       = 30         # re-scan Kalshi every 30 sec   (0 credits)
-# Monthly credit math (100k budget):
-#   Odds game lines  (Peak 60s + Discovery 120s + Sleep 15min): ~42,240
-#   Props scans      (Peak 15min + Discovery 10min + Sleep 30min): ~51,660
-#   Kalshi scans     (cached):                                          0
-#   ────────────────────────────────────────────────────────────────────
-#   Daily projection: ~3,130  |  Monthly projection: ~93,900
-#   NOTE: hot-path (20s when < 3h to game) was removed — it fired all day
-#   across staggered MLB slates, burning ~4,700 extra credits/day.
+# Monthly credit math (20k budget):
+#   Odds refresh : 2 × 144/day × 30 =  8,640
+#   Props scan   : 10 × 8/day × 30  =  2,400
+#   Kalshi scans : 0 credits (cached) =     0
+#   ─────────────────────────────────────────
+#   Total                            = 11,040  (45% under 20k budget)
 HISTORY_FILE    = os.path.join(DATA_DIR, "ev_history.json")
 BETS_FILE       = os.path.join(DATA_DIR, "ev_bets.json")
 MY_BETS_FILE    = os.path.join(DATA_DIR, "my_bets.json")
@@ -206,27 +184,8 @@ PERF_BANKROLL        = 1000.0    # bankroll for ROI % display
 # ── Paper trading portfolio ────────────────────────────────────────────────────
 PAPER_START_BALANCE  = 1000.0    # starting virtual bankroll
 PAPER_START_DATE     = "2026-04-07"  # bets before this date excluded from portfolio
-PAPER_KELLY_FRACTION       = 0.50    # half-Kelly baseline (all market types)
-PAPER_KELLY_FRACTION_GAMES = 0.50    # half-Kelly baseline (spread / total / moneyline)
-PAPER_KELLY_CAP            = 0.05    # max 5% of current balance per bet
-
-# ── Time-Adaptive EV Cap ──────────────────────────────────────────────────────
-# Maximum EV (decimal) passed into the Kelly formula, gated by hours to game.
-# The cap limits position size for early-horizon bets without blocking them.
-# The actual edge is preserved in full on the bet record for model diagnostics.
-KELLY_EV_CAP_FAR   = 0.025   # > 8h:  2.5% cap — overnight / early-morning lines
-KELLY_EV_CAP_MID   = 0.040   # 3–8h:  4.0% cap — same-day, pre-peak window
-KELLY_EV_CAP_NEAR  = 0.060   # < 3h:  6.0% cap — imminent game, full signal
-
-# ── Edge Persistence Gate ─────────────────────────────────────────────────────
-# For games > 3h away, an edge must survive at least this many minutes (≈ one
-# full scan cycle) before a paper bet is logged and Discord fires.
-# Filters transient API sync glitches and flash-line anomalies.
-# Peak Trading scan interval = 60s; Discovery = 120s → 2.5 min covers both.
-PERSISTENCE_MIN_AGE_MIN = 2.5   # minutes edge must be "in memory" before logging
-TAKER_EDGE_THRESHOLD       = 0.05    # ≥5% edge → TAKER (cross spread immediately); below → MAKER (rest limit)
-MAX_ALLOWED_DRAWDOWN       = 0.25    # 25% peak-to-trough loss triggers full circuit breaker
-CURRENT_ACCOUNT_DRAWDOWN   = 0.00    # live drawdown ratio (0.0 = no drawdown, 0.25 = at limit)
+PAPER_KELLY_FRACTION = 0.25     # quarter-Kelly sizing
+PAPER_KELLY_CAP      = 0.05     # max 5% of current balance per bet
 
 # ── Shared state (updated by background thread) ───────────────────────────────
 _lock    = threading.Lock()
@@ -240,11 +199,6 @@ _state   = {
     "market_snapshot": {},     # {ticker|side: {adj_edge, kalshi, fair, edge_pct}} — all scanned markets
 }
 
-# ── Async I/O queue ───────────────────────────────────────────────────────────
-# All disk mutations are offloaded to _io_worker_loop (daemon thread).
-# Callers snapshot their data and enqueue; the worker serialises and writes.
-_io_queue: queue.Queue = queue.Queue()
-
 # Tracks first-seen and last-seen YES price for each edge key (for staleness + CLV)
 # Persisted to PIN_PRICES_FILE so Pinnacle prices survive server restarts.
 _edge_history_lock = threading.Lock()
@@ -257,9 +211,16 @@ def _load_pin_prices() -> dict:
         return {}
 
 def _save_pin_prices():
-    with _edge_history_lock:
-        snapshot = dict(_edge_price_history)
-    _io_queue.put({"op": "save_pin_prices", "data": snapshot})
+    try:
+        import tempfile as _tempfile
+        with _edge_history_lock:
+            snapshot = dict(_edge_price_history)
+        fd, tmp = _tempfile.mkstemp(dir=DATA_DIR, suffix=".tmp")
+        with os.fdopen(fd, "w") as f:
+            json.dump(snapshot, f)
+        os.replace(tmp, PIN_PRICES_FILE)
+    except Exception as exc:
+        print(f"  WARNING: could not save pin prices: {exc}")
 
 _edge_price_history: dict = _load_pin_prices()
 print(f"  Loaded {len(_edge_price_history)} Pinnacle price entries from disk")
@@ -269,12 +230,11 @@ print(f"  Loaded {len(_edge_price_history)} Pinnacle price entries from disk")
 # The fast 2-min Kalshi scan reads these without spending Odds API credits.
 # None = not yet fetched; scan_sport falls back to inline fetch on first run.
 _odds_cache_lock  = threading.Lock()
-_cached_mlb_index: Optional[dict]  = None
-_cached_nba_index: Optional[dict]  = None
-_last_odds_refresh: float          = 0.0   # epoch seconds of last ATTEMPT (success or fail)
-_last_odds_cache_success: float    = 0.0   # epoch seconds of last SUCCESSFUL index population
-_odds_game_count: int              = 0     # number of Pinnacle matchups in the cached index
-_next_game_start_utc: Optional[float] = None  # epoch of earliest upcoming game; drives proximity scheduler
+_cached_mlb_index: Optional[dict] = None
+_cached_nba_index: Optional[dict] = None
+_last_odds_refresh: float        = 0.0   # epoch seconds of last ATTEMPT (success or fail)
+_last_odds_cache_success: float  = 0.0   # epoch seconds of last SUCCESSFUL index population
+_odds_game_count: int            = 0     # number of Pinnacle matchups in the cached index
 
 # ── validate_bet result cache (saves 1 credit per click) ─────────────────────
 # validate_bet() calls fetch_book_odds() — 1 Odds API credit per call.
@@ -291,7 +251,14 @@ def _load_history() -> list:
         return []
 
 def _save_history(history: list):
-    _io_queue.put({"op": "save_history", "data": history[-MAX_HISTORY:]})
+    try:
+        import tempfile, os as _os
+        fd, tmp = tempfile.mkstemp(dir=DATA_DIR, suffix=".tmp")
+        with _os.fdopen(fd, "w") as f:
+            json.dump(history[-MAX_HISTORY:], f)
+        _os.replace(tmp, HISTORY_FILE)
+    except Exception as exc:
+        print(f"  WARNING: could not save history: {exc}")
 
 _history = _load_history()
 
@@ -332,9 +299,25 @@ def _load_bets() -> list:
         return []
 
 def _save_bets(bets: list) -> bool:
-    """Enqueue a bets snapshot for async disk write. Returns True immediately."""
-    _io_queue.put({"op": "save_bets", "data": list(bets)})
-    return True
+    """Save bets to disk. Returns True on success, False on failure."""
+    try:
+        import tempfile, os as _os
+        fd, tmp = tempfile.mkstemp(dir=DATA_DIR, suffix=".tmp")
+        with _os.fdopen(fd, "w") as f:
+            json.dump(bets, f, indent=2)
+        _os.replace(tmp, BETS_FILE)
+        return True
+    except Exception as exc:
+        print(f"  WARNING: could not save bets to {BETS_FILE}: {exc}")
+        # Fire a Discord alert once per session — silent disk failure = data loss on next restart
+        global _save_bets_alerted
+        if not _save_bets_alerted:
+            _save_bets_alerted = True
+            try:
+                send_discord(None, f"🚨 **Bet save failure** — `{exc}`\nPath: `{BETS_FILE}` | DATA_DIR: `{DATA_DIR}`\nBets are in memory but NOT persisting. Check Railway volume mount.")
+            except Exception:
+                pass
+        return False
 
 _bets: list = _load_bets()
 print(f"  Bet store loaded: {len(_bets)} bets from {BETS_FILE}")
@@ -404,14 +387,11 @@ if not any(b.get("id") == _detorl_id for b in _bets):
         "kelly_pnl": 0.02982,
         "kelly_pnl_pct": 2.982,
         "kelly_pnl_dollars": 50.4,
-        "clv_mult_applied": 0.125,
+        "clv_mult_applied": 1.0,
         "closing_yes_pct": None,
         "clv": 0.0,
         "closing_pin_pct": None,
         "clv_source": "none",
-        "execution_strategy": "TAKER",    # 6.8% edge ≥ 5% threshold
-        "resting_limit_price": None,
-        "is_synthetic": False,
         "_note": "kalshi_price ~0.43 estimated — REST API has no historical orderbook snapshots",
     })
     _data_fixed = True
@@ -597,10 +577,11 @@ def _bet_id(ticker: str, side: str) -> str:
 
 def _best_edge_per_game(edges: list) -> list:
     """
-    Keep only the single best edge per (matchup, mkt_type) bucket.
-    Side (YES/NO) is intentionally excluded from the key: betting both YES on
-    one threshold and NO on a different threshold for the same game is a hedge
-    that violates the one-line-per-bucket rule.
+    Keep only the single best edge per (matchup, mkt_type, side) group.
+    This eliminates correlated bets on the same game — e.g. if a game has
+    edges at >7.5, >8.5, and >9.5 total runs YES, only the highest-edge one
+    is kept.  YES and NO on the same market are treated as distinct slots so
+    both can surface if both are genuinely +EV.
 
     NOTE: uses the raw 'edge' field (0–1 decimal) so this function is safe to
     call before 'edge_pct' is computed.
@@ -610,17 +591,13 @@ def _best_edge_per_game(edges: list) -> list:
 
     best: dict = {}
     for e in edges:
-        if e.get("correlated_pass"):
-            continue   # scanner already tagged these as non-apex; never log
-        key = (e.get("matchup", ""), e.get("mkt_type", ""))
+        key = (e.get("matchup", ""), e.get("mkt_type", ""), e.get("side", ""))
         if key not in best or _score(e) > _score(best[key]):
             best[key] = e
     seen = set()
     result = []
     for e in edges:
-        if e.get("correlated_pass"):
-            continue
-        key = (e.get("matchup", ""), e.get("mkt_type", ""))
+        key = (e.get("matchup", ""), e.get("mkt_type", ""), e.get("side", ""))
         if key not in seen and best[key] is e:
             seen.add(key)
             result.append(e)
@@ -645,68 +622,15 @@ def _compute_paper_balance() -> float:
     return round(bal, 2)
 
 
-def _kelly_base_fraction(mkt_type: str) -> float:
-    """Market-type-aware Kelly base fraction — unified half-Kelly baseline.
-    The Time-Adaptive EV Cap controls horizon-specific exposure; the base
-    fraction sets the global sizing floor.
-    """
-    if mkt_type in ("prop", "nba_prop"):
-        return PAPER_KELLY_FRACTION        # 0.50 — half-Kelly
-    return PAPER_KELLY_FRACTION_GAMES      # 0.50 — half-Kelly (spread / total / moneyline)
-
-
-def _horizon_ev_cap(game_start: Optional[datetime]) -> float:
-    """Return the maximum EV (decimal) allowed for Kelly sizing based on
-    hours remaining until first pitch.
-
-    > 8h :  2.5% cap — overnight/early-morning lines; model signal weakest
-    3–8h :  4.0% cap — same-day pre-peak; moderate certainty
-    < 3h :  6.0% cap — imminent game; full pre-game signal confirmed
-    None :  4.0% cap — unknown horizon → conservative middle tier
-
-    The cap is applied to the EV *input* to Kelly, not to the final stake.
-    The true edge is always preserved unmodified on the bet record.
-    """
-    if game_start is None:
-        return KELLY_EV_CAP_MID
-    hours = (game_start - datetime.now(timezone.utc)).total_seconds() / 3600
-    if hours > 8:
-        return KELLY_EV_CAP_FAR
-    if hours > 3:
-        return KELLY_EV_CAP_MID
-    return KELLY_EV_CAP_NEAR
-
-
-def _paper_kelly_stake(edge_pct: float, kalshi_price: float, mkt_type: str = "") -> float:
-    """Volatility-adjusted fractional Kelly with drawdown protection circuit breaker.
-
-    Sizing pipeline:
-      1. full_kelly      = edge / (1 − kalshi_price)          raw Kelly fraction
-      2. base_frac       = 0.25 (props) | 0.125 (game lines)  asset-class scalar
-      3. drawdown_scalar = max(0, 1 − drawdown/MAX_ALLOWED)   linearly cuts size
-         as the account approaches its peak-to-trough limit; hits 0.0 → returns 0
-      4. frac = min(full_kelly × base_frac × drawdown_scalar, PAPER_KELLY_CAP)
-    """
+def _paper_kelly_stake(edge_pct: float, kalshi_price: float) -> float:
+    """Calculate Kelly-sized paper stake against current portfolio balance."""
     k = kalshi_price
     e = edge_pct / 100.0
     if k <= 0 or k >= 1 or e <= 0:
         return 0.0
-
-    # ── Drawdown protection scalar ────────────────────────────────────────
-    # Linear ramp: 1.0 at zero drawdown → 0.0 when CURRENT_ACCOUNT_DRAWDOWN
-    # reaches MAX_ALLOWED_DRAWDOWN.  Guard against zero-denominator in case
-    # MAX_ALLOWED_DRAWDOWN is ever mis-configured.
-    drawdown_scalar = (
-        max(0.0, 1.0 - (CURRENT_ACCOUNT_DRAWDOWN / MAX_ALLOWED_DRAWDOWN))
-        if MAX_ALLOWED_DRAWDOWN > 0 else 0.0
-    )
-    if drawdown_scalar <= 0.0:
-        return 0.0   # circuit breaker: account at or beyond drawdown limit
-
-    balance    = _compute_paper_balance()
+    balance = _compute_paper_balance()
     full_kelly = e / (1.0 - k)
-    base_frac  = _kelly_base_fraction(mkt_type)   # 0.25 props / 0.125 game lines
-    frac = min(full_kelly * base_frac * drawdown_scalar, PAPER_KELLY_CAP)
+    frac = min(full_kelly * PAPER_KELLY_FRACTION, PAPER_KELLY_CAP)
     return round(frac * balance, 2)
 
 
@@ -718,39 +642,25 @@ def _add_new_bets(edges: list) -> list:
         detected.  Stored on the bet so we can detect line movement later.
       • DK / FD confirmation steps removed — Pinnacle is the sole fair-value anchor.
 
-    One bet per (matchup, mkt_type-bucket, game_date) slot.  If a competing
-    alternate line for the same game+bucket arrives in a later scan, it is
-    silently skipped — never logged — so the tracker never holds more than one
-    total or spread position per game.
+    Every qualifying edge is logged so the notification and paper portfolio are
+    always in sync.  If a second edge on the same (matchup, mkt_type, side) slot
+    is logged, it is marked correlated=True and excluded from win-rate / Kelly
+    P&L stats — but still tracked for CLV and the full paper record.
     """
-    def _mkt_bucket(mkt_type: str) -> str:
-        m = mkt_type.lower()
-        if m in ("spread", "kxmlbspread", "spread_team"):
-            return "spread"
-        if m in ("total", "kxmlbtotal", "total_over", "total_under"):
-            return "total"
-        return "prop"
-
     edges = _best_edge_per_game(edges)
     newly_added = []
-    now_utc = datetime.now(timezone.utc)
     with _bets_lock:
         existing_ids = {b["id"] for b in _bets}
-        # Side-agnostic slots: (matchup, bucket, game_date).
-        # Excludes side so YES on 7.5-over and NO on 9.5-under for the same
-        # game both map to the same slot and the second is rejected.
-        # Include game date so the same matchup on consecutive days is allowed.
+        # Track slots already occupied by open bets to detect correlated entries.
+        # Include game date so same matchup on consecutive days is NOT correlated.
         open_slots = {
-            (_mkt_bucket(b.get("mkt_type", "")), b["matchup"], _parse_ticker_date(b.get("ticker", "")))
+            (b["matchup"], b.get("mkt_type", ""), b["side"], _parse_ticker_date(b.get("ticker", "")))
             for b in _bets if b["status"] == "open"
         }
         added = 0
         for e in edges:
             # Skip edges already invalidated by Pinnacle line movement
             if e.get("pin_invalidated"):
-                continue
-            # Skip non-apex lines tagged by _apply_correlation_control
-            if e.get("correlated_pass"):
                 continue
             bid = _bet_id(e["ticker"], e["side"])
             if bid in existing_ids:
@@ -759,61 +669,13 @@ def _add_new_bets(edges: list) -> list:
                 continue   # permanently suppressed ghost/bad-match edge — never re-flag
             existing_ids.add(bid)   # prevent same ticker appearing twice in one cycle
 
-            game_date  = _parse_ticker_date(e.get("ticker", ""))
-            game_start = _parse_ticker_start_time(e.get("ticker", ""))
-            if game_start is None:
-                gt = e.get("game_time")
-                if gt:
-                    try:
-                        game_start = datetime.fromisoformat(gt.replace("Z", "+00:00"))
-                    except (ValueError, AttributeError):
-                        pass
-            hours_to_game = (
-                (game_start - now_utc).total_seconds() / 3600
-                if game_start is not None else None
-            )
-
-            # ── Persistence Gate ───────────────────────────────────────────────
-            # For games > 3h away, require the edge to have been seen for at
-            # least PERSISTENCE_MIN_AGE_MIN minutes (one full scan cycle) before
-            # logging a bet or firing a Discord alert.  Blocks transient API
-            # glitches and flash-line anomalies from becoming paper positions.
-            # age_min is set by scan_sport; prop edges lack it → gate skipped.
-            age_min = e.get("age_min")
-            if (age_min is not None
-                    and hours_to_game is not None
-                    and hours_to_game > 3
-                    and age_min < PERSISTENCE_MIN_AGE_MIN):
-                print(
-                    f"  [Persistence] {e.get('matchup','')} {e.get('mkt_type','')} "
-                    f"{e.get('side','')} — first detection ({age_min:.1f}m old), "
-                    f"game {hours_to_game:.1f}h away — holding for next cycle"
-                )
-                continue
-
-            slot = (_mkt_bucket(e.get("mkt_type", "")), e.get("matchup", ""), game_date)
-            if slot in open_slots:
-                continue   # alternate line for same game+bucket already open — PASS
-            is_correlated = False   # slot is unoccupied; this becomes the primary bet
-
-            # ── Time-Adaptive EV Cap ───────────────────────────────────────────
-            # Clamp the EV input to the Kelly formula based on hours to game.
-            # The true edge is stored unmodified; only the Kelly input is capped.
-            ev_cap        = _horizon_ev_cap(game_start)
-            raw_edge_pct  = e["edge_pct"]
-            kelly_edge_pct = min(raw_edge_pct, ev_cap * 100)
-            ev_was_capped = kelly_edge_pct < raw_edge_pct
-            if ev_was_capped:
-                print(
-                    f"  [Kelly Calc] Input EV clamped {raw_edge_pct:.1f}% → "
-                    f"{kelly_edge_pct:.1f}% "
-                    f"({hours_to_game:.1f}h horizon, cap tier {ev_cap*100:.1f}%)"
-                )
+            game_date = _parse_ticker_date(e.get("ticker", ""))
+            slot = (e.get("matchup", ""), e.get("mkt_type", ""), e.get("side", ""), game_date)
+            is_correlated = slot in open_slots
 
             # entry_yes_pct = Kalshi YES ask % when flagged (for CLV calculation)
             kalshi_yes_at_flag = e["kalshi_pct"] if e["side"] == "YES" else round((1 - e["kalshi"]) * 100, 1)
-            mkt_type_flag = e.get("mkt_type", "")
-            paper_stake   = _paper_kelly_stake(kelly_edge_pct, e["kalshi"], mkt_type_flag)
+            paper_stake = _paper_kelly_stake(e["edge_pct"], e["kalshi"])
 
             # Pinnacle probability at flag time — the baseline for line-shift detection
             bd = e.get("books_detail", {})
@@ -826,21 +688,6 @@ def _add_new_bets(edges: list) -> list:
                 )
             else:
                 pin_prob_at_flag = None  # Pinnacle not available at flag time
-
-            # ── Execution strategy ────────────────────────────────────────────
-            # TAKER (edge ≥ TAKER_EDGE_THRESHOLD): cross the spread immediately —
-            #   strong enough alpha to justify paying the spread cost.
-            # MAKER (edge < TAKER_EDGE_THRESHOLD): rest a limit order one tick
-            #   inside the current best ask, capturing spread instead of paying it.
-            # resting_limit_price: None for TAKER; entry price − 1 Kalshi tick (0.01)
-            #   for MAKER — bids inside the spread to improve fill probability while
-            #   avoiding the full ask cost.
-            _is_taker            = (e["edge_pct"] / 100.0) >= TAKER_EDGE_THRESHOLD
-            execution_strategy   = "TAKER" if _is_taker else "MAKER"
-            resting_limit_price  = (
-                None if _is_taker
-                else max(0.01, round(e["kalshi"] - 0.01, 2))
-            )
 
             new_bet = {
                 "id":                 bid,
@@ -863,12 +710,9 @@ def _add_new_bets(edges: list) -> list:
                 # ─────────────────────────────────────────────────────────────
                 "kalshi_price":       e["kalshi"],
                 "kalshi_yes_at_flag": kalshi_yes_at_flag,
-                "flagged_at":         now_utc.isoformat(),
-                "game_time":          game_start.isoformat() if game_start else None,
-                # ── Time-adaptive EV cap metadata ─────────────────────────────
-                "ev_horizon_h":        round(hours_to_game, 1) if hours_to_game is not None else None,
-                "ev_capped_from_pct":  round(raw_edge_pct, 1) if ev_was_capped else None,
-                "ev_cap_applied_pct":  round(ev_cap * 100, 1),   # active cap tier (2.5/4.0/6.0)
+                "flagged_at":         datetime.now(timezone.utc).isoformat(),
+                "game_time":          _parse_ticker_start_time(e["ticker"]).isoformat()
+                                      if _parse_ticker_start_time(e["ticker"]) else None,
                 "status":             "open",
                 "resolved_at":        None,
                 "pnl":                None,
@@ -878,16 +722,13 @@ def _add_new_bets(edges: list) -> list:
                 "paper_stake":        paper_stake,           # Kelly-sized virtual wager
                 "paper_pnl":          None,                  # set on resolution
                 "correlated":         is_correlated,         # excluded from win-rate/Kelly stats
-                "clv_mult_applied":   _kelly_base_fraction(mkt_type_flag),  # 0.50 — half-Kelly baseline
-                "execution_strategy":  execution_strategy,    # "TAKER" (≥5% edge) or "MAKER" (rest limit)
-                "resting_limit_price": resting_limit_price,   # None for TAKER; ask − 1 tick for MAKER
-                "is_synthetic":        e.get("is_synthetic", False),  # True → shadow-mode Poisson derivation
             }
 
             _bets.append(new_bet)
             newly_added.append(new_bet)
             existing_ids.add(bid)
-            open_slots.add(slot)   # claim the slot so later alternate lines are blocked
+            if not is_correlated:
+                open_slots.add(slot)   # only primary bet claims the slot
             added += 1
         if added:
             save_ok = _save_bets(_bets)
@@ -1284,15 +1125,14 @@ def _get_performance(since: Optional[str] = None) -> dict:
     corrupted_count = sum(1 for b in bets if _is_corrupted(b))
 
     # ── Kelly sizing helper ────────────────────────────────────────────────────
-    # Market-type-aware fractional Kelly for a binary prediction-market bet:
-    #   Props (player props / strikeouts): quarter-Kelly (0.25)
-    #   Game lines (spread / total):       eighth-Kelly  (0.125)
-    #   Hard 5% bankroll cap per bet
-    #   Dynamic CLV confidence multiplier — types with negative avg CLV get
-    #   0.5× applied on top of the base fraction
+    # 0.25 Fractional Kelly for a binary prediction-market bet, with:
+    #   • Hard 5% bankroll cap per bet
+    #   • Dynamic CLV confidence multiplier — types with negative avg CLV get
+    #     0.5× applied on top of the quarter-Kelly fraction
     #
     # Full Kelly  = edge / (1 − kalshi_price)
-    # Adjusted    = full × base_fraction × clv_multiplier,  capped at 5% of bankroll
+    # Adjusted    = full × 0.25 × clv_multiplier,  capped at 5% of bankroll
+    KELLY_FRACTION   = 0.25   # fractional Kelly scaling
     KELLY_SINGLE_CAP = 0.05   # max 5% of bankroll per bet
 
     # Fetch CLV-based multipliers once for the whole performance pass
@@ -1305,9 +1145,8 @@ def _get_performance(since: Optional[str] = None) -> dict:
             return 0.0
         full_kelly  = e / (1.0 - k)
         mtype       = _infer_mkt_type(b)
-        base_frac   = _kelly_base_fraction(mtype)
         clv_mult    = clv_mults.get(mtype, 1.0)
-        return min(full_kelly * base_frac * clv_mult, KELLY_SINGLE_CAP)
+        return min(full_kelly * KELLY_FRACTION * clv_mult, KELLY_SINGLE_CAP)
 
     def _kelly_pnl(b: dict) -> Optional[float]:
         """P&L as fraction-of-bankroll under CLV-adjusted quarter-Kelly sizing."""
@@ -1319,25 +1158,22 @@ def _get_performance(since: Optional[str] = None) -> dict:
             return f * (1.0 - k) / k   # profit = stake × net_odds
         return -f                        # loss = −stake (fraction of bankroll)
 
-    # CLV stats — settled game lines only, Pinnacle closing-line bets only.
-    # Strictly filtered to clv_source == "pin":
-    #   "pin_entry" = Pinnacle prob at detection time, not true close — excluded
-    #   "kalshi"    = Kalshi market drift only, no Pinnacle reference — excluded
-    #   "none"      = no price captured at all — excluded
-    # Only "pin" represents a genuine closing-line edge measurement.
-    clv_bets   = [b for b in gl_bets
-                  if b.get("clv_source") == "pin"
-                  and b.get("status") in ("won", "lost")]
-    avg_clv    = round(sum(b["clv"] for b in clv_bets) / len(clv_bets), 1) if clv_bets else None
-    clv_sample = len(clv_bets)   # expose sample size so UI can flag low-N readings
+    # CLV stats — game lines only, settled bets only.
+    # Open bets have a live-updating clv (current Pinnacle drift) that is NOT a
+    # locked closing line.  Including them inflates avg_clv while those bets are
+    # showing favourable drift and deflates it when they aren't — phantom signal
+    # that has nothing to do with historical model accuracy.
+    clv_bets = [
+        b for b in gl_bets
+        if b.get("clv_source") in ("pin", "pin_entry", "kalshi")
+        and b.get("status") in ("won", "lost")   # Restricts the metric to settled history
+    ]
+    avg_clv  = round(sum(b["clv"] for b in clv_bets) / len(clv_bets), 1) if clv_bets else None
 
-    # Average line movement — settled game lines with true Pinnacle close only.
-    # Excludes pin_entry (closing_pin_pct = entry prob, not real close → move = ~0).
+    # Average line movement — settled game lines only (open bets have no real closing line yet)
     line_moves = []
     for b in gl_bets:
         if b.get("status") not in ("won", "lost"):
-            continue
-        if b.get("clv_source") != "pin":   # only real closing-line captures
             continue
         entry = (b.get("kalshi_price") or 0) * 100
         close = b.get("closing_pin_pct")
@@ -1428,9 +1264,9 @@ def _get_performance(since: Optional[str] = None) -> dict:
             b["kelly_pnl"]         = round(kp, 5) if kp is not None else None
             b["kelly_pnl_pct"]     = round(kp * 100, 3) if kp is not None else None  # % of bankroll
             b["kelly_pnl_dollars"] = round(kp * PERF_BANKROLL, 2) if kp is not None else None
+        # Flag which multiplier was applied so the UI can show a note
         mtype = _infer_mkt_type(b)
-        b["clv_mult_applied"]  = _kelly_base_fraction(mtype)   # 0.25 (prop) or 0.125 (game line)
-        b["clv_penalty_mult"]  = clv_mults.get(mtype, 1.0)     # CLV confidence multiplier (1.0 or 0.5)
+        b["clv_mult_applied"]  = clv_mults.get(mtype, 1.0)
 
     def _perf_label(b: dict) -> str:
         ticker = b.get("ticker", "").upper()
@@ -1460,9 +1296,9 @@ def _get_performance(since: Optional[str] = None) -> dict:
             by_type[label]["units"].append(-1.0)
         if kp is not None:
             by_type[label]["kelly"].append(kp)
-        # Only "pin" CLV is true closing-line data — exclude pin_entry/kalshi/none
-        if b.get("clv_source") == "pin" and b.get("clv") is not None:
-            by_type[label]["clv"].append(b["clv"])
+        clv_val = b.get("clv")
+        if clv_val is not None:
+            by_type[label]["clv"].append(clv_val)
 
     MIN_SAMPLE = 20   # need at least 20 settled bets before win rate is meaningful
 
@@ -1533,8 +1369,7 @@ def _get_performance(since: Optional[str] = None) -> dict:
         "total_kelly_pct":      total_kelly_pct,    # total P&L as % of bankroll
         "avg_kelly_units":      avg_kelly_units,
         "avg_kalshi_implied":   avg_kalshi_implied,
-        "avg_clv":              avg_clv,       # pin-only closing-line CLV (pp)
-        "clv_sample":           clv_sample,    # number of bets behind avg_clv
+        "avg_clv":              avg_clv,
         "avg_line_move":        avg_line_move,
         "kelly_bankroll":       PERF_BANKROLL,
         "bets":                 table_bets,
@@ -1560,7 +1395,14 @@ def _load_my_bets() -> list:
         return []
 
 def _save_my_bets(bets: list):
-    _io_queue.put({"op": "save_my_bets", "data": list(bets)})
+    try:
+        import tempfile, os as _os
+        fd, tmp = tempfile.mkstemp(dir=DATA_DIR, suffix=".tmp")
+        with _os.fdopen(fd, "w") as f:
+            json.dump(bets, f, indent=2)
+        _os.replace(tmp, MY_BETS_FILE)
+    except Exception as exc:
+        print(f"  WARNING: could not save my_bets: {exc}")
 
 _my_bets: list = _load_my_bets()
 _my_bets_lock = threading.Lock()
@@ -1712,7 +1554,7 @@ def _settle_my_bets():
 
 
 # ── Twilio SMS alerts ─────────────────────────────────────────────────────────
-_ALERT_MIN    = float(os.getenv("ALERT_MIN_EDGE", "0.020"))  # Discord alerts at ≥2.0% edge
+_ALERT_MIN    = float(os.getenv("ALERT_MIN_EDGE", "0.03"))  # Discord alerts at ≥3% edge (matches .env default)
 _BET_SIZE     = float(os.getenv("ALERT_BET_SIZE", "20"))
 
 # ── Discord webhook alert config ───────────────────────────────────────────────
@@ -1760,10 +1602,25 @@ def _load_alerted_keys() -> tuple:
         return alerted, set()
 
 def _save_alerted_keys(alerted: set, gone: set):
-    _io_queue.put({
-        "op":   "save_alerted_keys",
-        "data": {"alerted": list(alerted), "gone": list(gone)},
-    })
+    try:
+        import tempfile, os as _os
+        existing = {}
+        try:
+            with open(_ALERTED_KEYS_FILE) as f:
+                existing = json.load(f)
+        except Exception:
+            pass
+        today = datetime.now(timezone.utc).date().isoformat()
+        for k in alerted:
+            existing.setdefault(k, today)
+        for k in gone:
+            existing.setdefault(f"gone:{k}", today)
+        fd, tmp = tempfile.mkstemp(dir=DATA_DIR, suffix=".tmp")
+        with _os.fdopen(fd, "w") as f:
+            json.dump(existing, f)
+        _os.replace(tmp, _ALERTED_KEYS_FILE)
+    except Exception as exc:
+        print(f"  WARNING: could not save alerted keys: {exc}")
 
 # Keys already alerted — loaded from disk so server restarts don't re-fire
 _alerted_keys, _gone_alerted_keys = _load_alerted_keys()
@@ -1858,7 +1715,7 @@ def _prob_to_american_str(p: Optional[float]) -> str:
 
 
 def _sms_kelly(e: dict) -> float:
-    """Compute fractional Kelly (market-type-aware, with CLV multiplier) matching the model."""
+    """Compute 0.25 fractional Kelly (with CLV multiplier) matching the model."""
     k    = e.get("kalshi", 0.5)
     edge = e.get("edge", 0)          # post-haircut adj. edge (0–1 decimal)
     if k <= 0 or k >= 1 or edge <= 0:
@@ -1866,9 +1723,8 @@ def _sms_kelly(e: dict) -> float:
     full_kelly = edge / (1.0 - k)
     clv_mults  = _get_clv_multipliers()
     mtype      = e.get("mkt_type", "")
-    base_frac  = _kelly_base_fraction(mtype)
     clv_mult   = clv_mults.get(mtype, 1.0)
-    return min(full_kelly * base_frac * clv_mult, 0.05)
+    return min(full_kelly * 0.25 * clv_mult, 0.05)
 
 
 def _alert_top10(newly_logged: list = None):
@@ -2077,9 +1933,9 @@ def send_test_discord() -> bool:
             {"name": "Confidence",   "value": "★★ MED CONF",        "inline": True},
             {"name": "Kalshi Price", "value": "`-120`  (55¢)",      "inline": True},
             {"name": "Fair Value",   "value": "`-138`",             "inline": True},
-            {"name": "Books",        "value": "PIN",                "inline": True},
+            {"name": "Books",        "value": "PIN+DK+FD",          "inline": True},
         ],
-        "footer": {"text": f"Bankroll $1000  •  Min edge {round(_ALERT_MIN*100,1)}%  •  Pinnacle fair value only"},
+        "footer": {"text": f"Bankroll $1000  •  Min edge {round(_ALERT_MIN*100,1)}%  •  Pinnacle fair value · DK+FD confirm"},
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
     return send_discord(embed, content)
@@ -2187,82 +2043,29 @@ def _send_odds_stale_alert(minutes: float) -> None:
     print(f"  Odds-stale alert sent ({minutes:.0f} min since last refresh): {'✓' if ok else 'FAILED'}")
 
 
-def _merge_odds_responses(*games_lists: list) -> list:
-    """Merge multiple Odds API game payloads into one unified list keyed by game ID.
-
-    The parametric split fetches spreads and totals in separate calls — each
-    response contains the same events but different market types per bookmaker.
-    This merges them so build_consensus_game_index sees a single complete list.
-    """
-    merged: dict = {}
-    for games in games_lists:
-        for game in games:
-            gid = game["id"]
-            if gid not in merged:
-                merged[gid] = {k: v for k, v in game.items() if k != "bookmakers"}
-                merged[gid]["bookmakers"] = []
-            for bm in game.get("bookmakers", []):
-                existing = next(
-                    (b for b in merged[gid]["bookmakers"] if b["key"] == bm["key"]),
-                    None,
-                )
-                if existing is None:
-                    merged[gid]["bookmakers"].append({k: v for k, v in bm.items()})
-                else:
-                    existing.setdefault("markets", []).extend(bm.get("markets", []))
-    return list(merged.values())
-
-
 def _run_odds_refresh():
     """
     Fetch fresh Pinnacle odds (MLB only — NBA faded) and update the cached index.
-
-    Parametric split: two separate calls (markets=spreads, markets=totals) with
-    regions=eu so each costs 1 credit.  Total: 2 credits/refresh vs. the previous
-    multi-region bundle.  Merged before building the consensus index.
-    Also extracts the earliest game commence_time to feed the proximity scheduler.
+    MLB: spreads + totals + alternate_spreads + alternate_totals = 4 credits/call.
+    1-min peak / 10-min off-peak.  ~3,132 credits/day on 100k plan.
     """
     global _cached_mlb_index, _cached_nba_index, _last_odds_refresh, \
-           _last_odds_cache_success, _odds_game_count, _next_game_start_utc
+           _last_odds_cache_success, _odds_game_count
     print(f"\n  ── Odds index refresh  {datetime.now().strftime('%H:%M:%S')} ──")
 
     try:
-        # Parametric split: one call per market type, regions=eu (1 credit each).
-        # Standard spreads + totals endpoints (alternate_* not supported on bulk).
-        # Adjacent Kalshi thresholds without an exact Pinnacle match fall back to
-        # _gaussian_total_fallback() within ±1.0 run; beyond that they are skipped.
-        spreads_games, _   = fetch_book_odds("baseball_mlb", markets="spreads")
-        totals_games,  rem = fetch_book_odds("baseball_mlb", markets="totals")
-
-        # Merge payloads so the consensus builder sees both market types per game.
-        merged_games = _merge_odds_responses(spreads_games, totals_games)
-        mlb_idx = build_consensus_game_index(
-            merged_games, total_range=(5.0, 14.0), spread_limit=3.0
+        mlb_idx, _ = fetch_odds_index(
+            "baseball_mlb", total_range=(5.0, 14.0), spread_limit=3.0
         )
-        n_games = len(mlb_idx) // max(1, 2)
-
-        # Extract earliest upcoming commence_time for asymmetric proximity scheduler.
-        now_ts = time.time()
-        starts = []
-        for g in spreads_games:
-            ct = g.get("commence_time")
-            if ct:
-                try:
-                    starts.append(
-                        datetime.fromisoformat(ct.replace("Z", "+00:00")).timestamp()
-                    )
-                except (ValueError, TypeError):
-                    pass
-        next_start = min((ts for ts in starts if ts > now_ts - 3600), default=None)
-
-        with _odds_cache_lock:
-            _cached_mlb_index        = mlb_idx
-            _last_odds_cache_success = time.time()
-            _odds_game_count         = n_games
-            _next_game_start_utc     = next_start
-        hrs = f"{(next_start - now_ts)/3600:.1f}h" if next_start else "?"
-        print(f"  MLB index cached: {n_games} matchups  |  next game: {hrs}  |  credits left: {rem}")
-
+        if mlb_idx is not None:
+            n_games = len(mlb_idx) // max(1, 2)
+            with _odds_cache_lock:
+                _cached_mlb_index       = mlb_idx
+                _last_odds_cache_success = time.time()
+                _odds_game_count        = n_games
+            print(f"  MLB index cached: {n_games} matchups")
+        else:
+            print("  WARNING: fetch_odds_index returned None — Pinnacle cache not updated")
     except Exception as exc:
         print(f"  ERROR refreshing MLB odds index: {exc}")
         # On 401 (credits exhausted), wipe the cache — stale odds produce phantom
@@ -2272,7 +2075,7 @@ def _run_odds_refresh():
                 _cached_mlb_index = None
             print("  MLB odds cache cleared — will not scan until credits restore")
 
-    # NBA odds fetch removed — NBA faded permanently 2026-05-26; credits reallocated to MLB scans
+    # NBA odds fetch removed — NBA faded permanently 2026-05-26; credits reallocated to 1-min MLB scans
 
     with _odds_cache_lock:
         _last_odds_refresh = time.time()
@@ -2334,11 +2137,12 @@ def _run_scan():
                 _state["scanning"] = False
             return
 
-        # MLB spreads + totals (moneyline omitted — KXMLBML unverified on Kalshi)
+        # MLB spreads + totals — ML removed (not used for fair-value)
         mlb, mlb_stats, mlb_snapshot = scan_sport(
-            label="MLB — Run Line & Totals",
+            label="MLB — Spread & Totals",
             spread_series="KXMLBSPREAD",
             total_series="KXMLBTOTAL",
+            ml_series=None,
             odds_sport="baseball_mlb",
             abbr_map=MLB_ABBR,
             spread_std=MLB_SPREAD_STD,
@@ -2832,13 +2636,6 @@ def _capture_clv_prices():
                     except (ValueError, AttributeError):
                         pass
             if game_start is None:
-                # Last-resort fallback: estimate game_start from Kalshi close_time.
-                # Reached only when BOTH ticker parsing AND the stored game_time field
-                # fail — practically never for standard MLB tickers.
-                # MLB: close_time ≈ game_start + avg_game_duration (3h) + buffer (0.5h)
-                #   → game_start ≈ close_time − 3.5h.  Conservative: if a game ran
-                #   long the estimate will be slightly early, but the 15¢/85¢ guard
-                #   below catches any in-game prices that sneak through.
                 close_str = mkt.get("close_time") or mkt.get("expected_expiration_time")
                 if close_str:
                     try:
@@ -2878,13 +2675,11 @@ def _capture_clv_prices():
             yes_close_pct = round(ask_c if side == "YES" else bid_c, 1)
 
             # Safety guard: reject prices that have collapsed to in-game extremes.
-            # Pre-game totals and spreads never trade below 15¢ or above 85¢ —
-            # anything outside that band is almost certainly a live in-game price
+            # Pre-game markets rarely close below 8¢ or above 92¢ — anything
+            # beyond those bounds is almost certainly a live in-game price
             # reflecting a near-decided outcome, not a true closing line.
-            # Tightened from 8¢/92¢ to 15¢/85¢ to catch mid-game prices that
-            # pass the game_start time guard (e.g. if ticker parse falls back
-            # to close_time estimate).
-            if yes_close_pct >= 85.0 or yes_close_pct <= 15.0:
+            # This is a backstop for the game_start guard above.
+            if yes_close_pct >= 92.0 or yes_close_pct <= 8.0:
                 continue
 
             # True CLV: compare entry Kalshi price to the last known Pinnacle
@@ -2911,11 +2706,6 @@ def _capture_clv_prices():
                             # Primary: true CLV vs Pinnacle closing line.
                             b["clv"]        = round(closing_pin - entry_k, 1)
                             b["clv_source"] = "pin"
-                        elif b.get("clv_source") == "pin":
-                            # Pinnacle data temporarily missing from history but a clean
-                            # pre-close Pinnacle capture already set clv_source = "pin".
-                            # Never downgrade to "kalshi" — preserve the better source.
-                            pass
                         else:
                             # Fallback: Kalshi drift using matched ask/bid prices
                             entry_yes = b.get("kalshi_yes_at_flag")
@@ -3290,14 +3080,14 @@ HTML = """<!DOCTYPE html>
 </div>
 
 <div id="today-edges-card" class="card">
-  <div class="card-header exec-card-header" onclick="toggleCard('today-edges-body')">📡 Active Arbitrage Signals / Pending Queue &nbsp;<span style="font-size:10px;color:var(--muted);font-weight:400;">fresh edges ≤30 min · positive EV only · updates every 2 min</span> <span class="card-toggle" id="today-edges-body-toggle">▾</span></div>
-  <div id="today-edges-body" class="card-body"><div class="empty">No active signals.</div></div>
+  <div class="card-header exec-card-header" onclick="toggleCard('today-edges-body')">📋 Open Positions &nbsp;<span style="font-size:10px;color:var(--muted);font-weight:400;">all open bets · updates every 2 min</span> <span class="card-toggle" id="today-edges-body-toggle">▾</span></div>
+  <div id="today-edges-body" class="card-body"><div class="empty">No open positions.</div></div>
 </div>
 
 
 
 <div id="paper-card" class="card">
-  <div class="card-header" onclick="toggleCard('paper-body')" style="border-left:3px solid #3fb950;">📊 Paper Portfolio — 0.5 Kelly · All 2%+ Edges · $1,000 Starting Balance <span class="card-toggle" id="paper-body-toggle">▾</span></div>
+  <div class="card-header" onclick="toggleCard('paper-body')" style="border-left:3px solid #3fb950;">📊 Paper Portfolio — 0.25 Kelly · All 3%+ Edges · $1,000 Starting Balance <span class="card-toggle" id="paper-body-toggle">▾</span></div>
   <div id="paper-body" class="card-body"><div class="empty"><span class="spinner"></span>Loading portfolio…</div></div>
 </div>
 
@@ -3330,7 +3120,7 @@ HTML = """<!DOCTYPE html>
 
 
 <div id="mybets-card" class="card">
-  <div class="card-header" style="border-left:3px solid #f0c000;" onclick="toggleCard('mybets-body')">💼 Live Portfolio / Filled Positions <span style="font-size:10px;color:var(--muted);font-weight:400;">contracts actually entered on Kalshi</span> <span class="card-toggle" id="mybets-body-toggle">▾</span></div>
+  <div class="card-header" style="border-left:3px solid #f0c000;" onclick="toggleCard('mybets-body')">💰 My Bets — Real P&amp;L <span class="card-toggle" id="mybets-body-toggle">▾</span></div>
   <div id="mybets-body" class="card-body">
     <div id="mybets-stats" style="padding:8px 10px;border-bottom:1px solid var(--border);display:flex;gap:12px;flex-wrap:wrap;align-items:center;">
       <span style="color:var(--muted);font-size:11px;">Add a bet you placed on Kalshi to track real P&amp;L.</span>
@@ -3358,6 +3148,17 @@ HTML = """<!DOCTYPE html>
       <button onclick="addMyBet()" style="background:#21262d;border:1px solid var(--border);border-radius:5px;color:var(--text);font-size:12px;padding:5px 14px;cursor:pointer;height:30px;">+ Track Bet</button>
     </div>
     <div id="mybets-table"><div class="empty">No bets tracked yet — add one above.</div></div>
+  </div>
+</div>
+
+<div id="scanner-history-card" class="card" style="border-color:#2a2a2a;background:#0f1117;opacity:0.88;">
+  <div class="card-header" onclick="toggleCard('scanner-history-body')" style="border-left:3px solid #3d3d3d;color:#6e7681;">
+    📋 Recent Scanner History (Past 24 Hours)
+    <span style="font-size:10px;font-weight:400;color:#4d5461;margin-left:6px;">read-only audit log · sorted newest first</span>
+    <span class="card-toggle" id="scanner-history-body-toggle">▸</span>
+  </div>
+  <div id="scanner-history-body" class="card-body collapsed">
+    <div id="scanner-history-table" style="color:#6e7681;"><div class="empty">Loading history…</div></div>
   </div>
 </div>
 
@@ -3897,13 +3698,13 @@ function updateCountdown() {
 // ── Best 10 — All Edges (MLB + NBA spreads/totals) ───────────────────────────
 function confStars(c, booksUsed) {
   // Visual confidence indicator.
-  // ★★★ = Pinnacle line very tight / high confidence (c ≥ 0.80)
-  // ★★  = Moderate Pinnacle confidence (c ≥ 0.50)
-  // ★   = Lower confidence
+  // ★★★ = Triple-book confirmation: all 3 books (PIN+DK+FD) within ≤2pp (c ≥ 0.80)
+  // ★★  = Dual-book agreement OR tight single-book (c ≥ 0.50)
+  // ★   = High divergence or only 1 book
   if (c == null) return '<span style="color:var(--muted)" title="No confidence data">?</span>';
   const n = (booksUsed && booksUsed.length) ? booksUsed.length : 0;
-  if (c >= 0.80) {
-    return `<span style="color:#3fb950" title="★★★ High Pinnacle confidence">★★★</span>`;
+  if (c >= 0.80 && n >= 3) {
+    return `<span style="color:#3fb950" title="★★★ Triple-book confirmation — PIN+DK+FD all within 2pp">★★★</span>`;
   }
   if (c >= 0.50) {
     const tip = n >= 3 ? `3 books but spread >2pp (${Math.round((1-c)*10)}pp)` : `${n} book(s) — moderate agreement`;
@@ -3929,46 +3730,20 @@ async function fetchTodayEdges() {
 function renderTodayEdges() {
   const el = document.getElementById('today-edges-body');
   if (!el) return;
+  if (!todayEdgesList.length) {
+    el.innerHTML = '<div class="empty">No open positions. Edges will appear here when flagged.</div>';
+    return;
+  }
 
-  // ── Signal TTL: 30-minute window ──────────────────────────────────────
-  // Only show signals flagged within the last 30 minutes.  Older entries
-  // are "zombie" signals — the edge has been resolved (taken, passed, or
-  // collapsed) and should not appear in the actionable queue.
-  const SIGNAL_TTL_MS = 30 * 60 * 1000;
-  const nowMs = Date.now();
-
-  // Build live lookup: ticker|side -> live edge object (≥threshold only)
+  // Build live lookup: ticker|side -> live edge object (≥3% only)
   const liveMap = {};
   for (const e of lastEdges) {
     liveMap[e.ticker + '|' + e.side] = e;
   }
 
-  // Filter to fresh, positive-edge signals only
-  const activeSignals = todayEdgesList.filter(b => {
-    const ageMs = b.flagged_at ? nowMs - new Date(b.flagged_at).getTime() : Infinity;
-    if (ageMs >= SIGNAL_TTL_MS) return false;   // expired — purge from queue
+  const rows = [...todayEdgesList].reverse().map(b => {
     const key  = b.ticker + '|' + b.side;
-    const live = liveMap[key];
-    const snap = marketSnapshot[key];
-    const curEdgePct = live != null ? (live.edge_pct != null ? live.edge_pct : 0)
-                     : snap != null ? snap.edge_pct : null;
-    // Remove if we have a live reading that confirms the edge is gone/negative
-    if (curEdgePct !== null && curEdgePct <= 0) return false;
-    return true;
-  });
-
-  const expiredCount = todayEdgesList.length - activeSignals.length;
-
-  if (!activeSignals.length) {
-    el.innerHTML = '<div class="empty">No active signals.'
-      + (expiredCount > 0 ? ` ${expiredCount} signal${expiredCount > 1 ? 's' : ''} expired or edge collapsed — see portfolio for filled positions.` : ' Edges will appear here when flagged.')
-      + '</div>';
-    return;
-  }
-
-  const rows = [...activeSignals].reverse().map(b => {
-    const key  = b.ticker + '|' + b.side;
-    const live = liveMap[key];           // present only if ≥threshold in last scan
+    const live = liveMap[key];           // present only if ≥3% in last scan
     const snap = marketSnapshot[key];    // present for ANY market scanned this cycle
 
     // ── Resolve current edge from best available source ───────────────────
@@ -3982,26 +3757,26 @@ function renderTodayEdges() {
                      : snap != null ? snap.kalshi : null;
     const inSnapshot = snap != null || live != null;
 
-    // ── Cutoff price: max Kalshi price that preserves ≥2% edge ───────────
+    // ── Cutoff price: max Kalshi price that preserves ≥3% edge ───────────
     // curFair is already expressed from the perspective of the bet side:
-    //   YES bet → curFair = fair_yes     → max YES price = fair_yes - 0.02
-    //   NO  bet → curFair = 1-fair_yes   → max NO  price = (1-fair_yes) - 0.02
+    //   YES bet → curFair = fair_yes     → max YES price = fair_yes - 0.03
+    //   NO  bet → curFair = 1-fair_yes   → max NO  price = (1-fair_yes) - 0.03
     // Using the same formula (curFair - MIN_EDGE) is correct for both sides.
-    // Cutoff label uses CENTS (¢) not American odds — negative American numbers
-    // compare counter-intuitively (e.g. -144 > -232 numerically even though
-    // -144 implies a lower probability, making inequality direction confusing).
-    const MIN_EDGE = 0.020;
+    // Bug: the old code used (1 - curFair - MIN_EDGE) for NO, which substituted
+    // fair_yes back in — causing aboveCutoff to fire even on strong NO edges.
+    const MIN_EDGE = 0.03;
     let cutoffLabel = null;
     let cutoffCents = null;
     if (curFair != null) {
       const maxPrice = curFair - MIN_EDGE;
       if (maxPrice > 0 && maxPrice < 1) {
         cutoffCents = maxPrice;
-        // Display in cents: "YES ≤ 69¢" means buy only if Kalshi asks ≤ 69¢
-        cutoffLabel = `${b.side} ≤ ${Math.round(maxPrice * 100)}¢`;
+        cutoffLabel = `${b.side} ≤ ${kalshiToAmerican(maxPrice)}`;
       }
     }
-    const liveKalshiSide = curKalshi != null ? curKalshi : null;
+    const liveKalshiSide = curKalshi != null
+      ? (b.side === 'YES' ? curKalshi : curKalshi)   // snapshot already stores the bet-side price
+      : null;
     const aboveCutoff = cutoffCents != null && liveKalshiSide != null
       && liveKalshiSide > cutoffCents + 0.005;
 
@@ -4018,7 +3793,7 @@ function renderTodayEdges() {
       recLabel = 'PASS';
       recColor = '#f85149';
       recTip   = aboveCutoff && cutoffLabel
-        ? `Kalshi price above cutoff (${cutoffLabel}) — need ≥2% edge. Current edge: ${curEdgePct != null ? curEdgePct.toFixed(1) : '—'}%. Line has moved — do not enter.`
+        ? `Kalshi price above cutoff for 3% edge (${cutoffLabel}). Current edge: ${curEdgePct != null ? curEdgePct.toFixed(1) : '—'}%. Line has moved — do not bet.`
         : `Edge gone — current edge ${curEdgePct != null ? curEdgePct.toFixed(1) : '—'}% (was +${b.edge_pct}% at flag). Kalshi corrected.`;
     } else if (curEdgePct < 3.0) {
       recLabel = `WEAK +${curEdgePct.toFixed(1)}%`;
@@ -4032,8 +3807,8 @@ function renderTodayEdges() {
       recLabel = cutoffLabel ? `BET if ${cutoffLabel}` : `BET +${curEdgePct.toFixed(1)}%`;
       recColor = '#3fb950';
       recTip   = cutoffLabel
-        ? `Current edge +${curEdgePct.toFixed(1)}%. Scan prices up to 2 min old — edge holds while Kalshi ${cutoffLabel}.`
-        : `Current edge +${curEdgePct.toFixed(1)}%. Verify live Kalshi price before entering.`;
+        ? `Current edge +${curEdgePct.toFixed(1)}%. Scan prices up to 2 min old — edge holds while ${cutoffLabel}.`
+        : `Current edge +${curEdgePct.toFixed(1)}%. Always verify live price on Kalshi before placing.`;
     }
     const recBadge = `<span style="font-weight:700;font-size:12px;color:${recColor};" title="${recTip}">${recLabel}</span>`;
 
@@ -4145,7 +3920,7 @@ function renderLiveEdges() {
     const consReason  = e.consensus_reason || '';
     const confBooks   = consReason.replace('Confirmed by ','').replace('Pinnacle','PIN').replace('DraftKings','DK').replace('FanDuel','FD');
     const sharpBadge  = e.sharp_led
-      ? `<span class="badge-sharp" title="Pinnacle line moved">⚡ SHARP</span>` : '';
+      ? `<span class="badge-sharp" title="PIN moved vs DK/FD">⚡ SHARP</span>` : '';
     const ageMins     = e.age_min != null ? e.age_min : 0;
     const ageBadge    = ageMins < 5 && ageMins > 0
       ? `<span style="font-size:9px;color:#3fb950;margin-left:4px;font-weight:600;">●NEW</span>`
@@ -4251,7 +4026,7 @@ function renderTop10() {
     });
     const tip10 = bLines10.length
       ? `No-vig per book:\\n${bLines10.join('\\n')}\\nFair value: Pinnacle only`
-      : 'Fair value: Pinnacle only';
+      : 'Fair value: Pinnacle only (DK+FD confirm)';
 
     // Fair-value American odds for the exact Kalshi threshold
     const fairAmer10  = e.fair != null ? probToAmerican(e.fair) : '—';
@@ -4309,7 +4084,7 @@ function renderTop10() {
       <th>#</th><th>Matchup / Player</th><th>Prop</th><th>Side</th>
       <th class="num">Adj. EV</th>
       <th class="num" title="Model fair value for this exact Kalshi threshold → Kalshi ask price (both in American odds). Hover for per-book breakdown.">Fair → Kalshi</th>
-      <th class="num" title="Pinnacle line confidence. ★★★ = high confidence.">Confidence</th>
+      <th class="num" title="How closely Pinnacle, DraftKings, and FanDuel agree on fair probability. ★★★ = tight agreement = higher confidence.">Confidence</th>
       <th class="num">Kelly Bet</th>
       <th class="num" title="Re-fetch Kalshi + Pinnacle right now and confirm the edge is still valid before betting">Pre-Bet Check</th>
     </tr></thead>
@@ -4578,7 +4353,7 @@ function renderPerformance(d) {
       : '…';
     // Kelly bet size as % of bankroll (dollar amount in tooltip)
     const kBet   = b.kelly_bet_pct != null
-      ? `<span class="kelly-val" title="$${b.kelly_bet_dollars != null ? b.kelly_bet_dollars.toFixed(0) : '?'} on $${bankroll} bank${b.clv_penalty_mult != null && b.clv_penalty_mult < 1 ? ' — CLV penalty 0.5×' : ''}">${b.kelly_bet_pct.toFixed(2)}%${b.clv_penalty_mult != null && b.clv_penalty_mult < 1 ? ' <span style="color:#e3a53a;font-size:9px;">½</span>' : ''}</span>`
+      ? `<span class="kelly-val" title="$${b.kelly_bet_dollars != null ? b.kelly_bet_dollars.toFixed(0) : '?'} on $${bankroll} bank${b.clv_mult_applied < 1 ? ' — CLV penalty 0.5×' : ''}">${b.kelly_bet_pct.toFixed(2)}%${b.clv_mult_applied < 1 ? ' <span style="color:#e3a53a;font-size:9px;">½</span>' : ''}</span>`
       : '<span class="kelly-na">—</span>';
     // P&L as % of bankroll (dollar amount in tooltip)
     const kPnl   = b.kelly_pnl_pct != null
@@ -4749,9 +4524,9 @@ async function fetchPaper() {
     const settled   = d.won + d.lost;
 
     // Avg Value @ Entry — Pinnacle prob at flag minus Kalshi entry price, averaged over bets with PIN data
-    const valBets = (d.bets || []).filter(b => b.fair != null && b.kalshi_price != null);
+    const valBets = (d.bets || []).filter(b => b.pin_prob_at_flag != null && b.kalshi_price != null);
     const avgVal  = valBets.length
-      ? valBets.reduce((s, b) => s + (b.fair - b.kalshi_price) * 100, 0) / valBets.length
+      ? valBets.reduce((s, b) => s + (b.pin_prob_at_flag - b.kalshi_price * 100), 0) / valBets.length
       : null;
     const valColor = avgVal == null ? 'var(--muted)' : 'var(--green)';  // always positive when bets had edge
     const valTxt   = avgVal == null ? '—' : `+${avgVal.toFixed(1)}pp`;
@@ -4935,6 +4710,65 @@ function renderMyBets(d) {
   </table>`);
 }
 
+// ── Scanner History (Past 24 Hours) ──────────────────────────────────────────
+async function fetchScannerHistory() {
+  try {
+    const r = await fetch('/api/scanner_history');
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    const data = await r.json();
+    renderScannerHistory(data);
+  } catch(e) { console.error('scanner_history fetch failed', e); }
+}
+
+function renderScannerHistory(bets) {
+  const el = document.getElementById('scanner-history-table');
+  if (!el) return;
+  if (!bets || !bets.length) {
+    el.innerHTML = '<div class="empty" style="color:#4d5461;">No edges flagged in the past 24 hours.</div>';
+    return;
+  }
+  const rows = bets.map(b => {
+    const flagTime = b.flagged_at ? fmtDate(b.flagged_at) : '—';
+    const sideClass = b.side === 'YES' ? 'side-yes' : 'side-no';
+    const edgePct   = b.edge_pct != null ? `+${pct(b.edge_pct)}` : '—';
+
+    // Pinnacle fair prob at flag → American odds
+    const pinAmer    = b.pin_prob_at_flag != null ? probToAmerican(b.pin_prob_at_flag / 100) : '—';
+    // Kalshi price at flag (always stored as the side's decimal price)
+    const kalshiAmer = b.kalshi_price != null ? kalshiToAmerican(b.kalshi_price) : '—';
+    const oddsTxt = `<span style="font-size:10px;color:#4d5461;display:block;margin-top:2px;">
+      Kalshi <span style="color:#6e7681;">${kalshiAmer}</span>
+      &nbsp;·&nbsp; Fair <span style="color:#6e7681;">${pinAmer}</span>
+    </span>`;
+
+    // Status badge — never actionable
+    const hs = b.hist_status || 'EXPIRED';
+    const hsColor = hs === 'WON' ? '#3fb950' : hs === 'LOST' ? '#f85149' : '#4d5461';
+    const hsBadge = `<span style="font-weight:700;font-size:11px;color:${hsColor};">${hs}</span>`;
+
+    return `<tr style="opacity:0.75;">
+      <td style="font-size:11px;color:#4d5461;white-space:nowrap;">${flagTime}</td>
+      <td style="font-size:11px;color:#6e7681;">${hesc(b.matchup || '—')}</td>
+      <td style="font-size:11px;color:#6e7681;">${hesc(b.title || b.ticker || '—')}</td>
+      <td class="${sideClass}" style="opacity:0.7;">${b.side}</td>
+      <td class="num" style="color:#6e7681;font-weight:700;">${edgePct}${oddsTxt}</td>
+      <td class="num">${hsBadge}</td>
+    </tr>`;
+  }).join('');
+
+  el.innerHTML = `<table>
+    <thead><tr style="opacity:0.6;">
+      <th style="color:#4d5461;">Flag Time</th>
+      <th style="color:#4d5461;">Matchup</th>
+      <th style="color:#4d5461;">Bet Side</th>
+      <th style="color:#4d5461;">Side</th>
+      <th class="num" style="color:#4d5461;">Edge @ Flag &amp; Odds at Entry</th>
+      <th class="num" style="color:#4d5461;">Status</th>
+    </tr></thead>
+    <tbody>${rows}</tbody>
+  </table>`;
+}
+
 // Resume refresh when tab becomes visible again
 document.addEventListener('visibilitychange', () => {
   if (!document.hidden) { fetchData(); fetchMyBets(); }
@@ -4952,9 +4786,11 @@ fetchHistory();
 fetchPerformance();
 fetchPaper();
 fetchMyBets();
+fetchScannerHistory();
 setInterval(updateCountdown, 1000);
 setInterval(fetchPaper, 60 * 1000);   // refresh paper portfolio every 60s
 setInterval(fetchMyBets, 60 * 1000);   // refresh my bets every 60s (mark-to-market)
+setInterval(fetchScannerHistory, 5 * 60 * 1000);  // refresh history every 5 min
 </script>
 
 <!-- Pre-Bet Validator Modal -->
@@ -5032,18 +4868,9 @@ class Handler(BaseHTTPRequestHandler):
                 state_copy = dict(_state)
             # Serve cached edges if the current scan produced none — prevents
             # status indicators from reading zero during off-peak/sleep windows.
-            # Filter out stale entries whose game date is before today so settled
-            # markets don't resurface from cache (e.g. a prop that lost yesterday).
             if not state_copy.get("edges") and state_copy.get("edges_cache"):
-                _today_str    = datetime.now(timezone.utc).date().isoformat()
-                _min_edge_pct = EDGE_THRESHOLD * 100
-                fresh_cache = [
-                    e for e in state_copy["edges_cache"]
-                    if (_parse_ticker_date(e.get("ticker", "")) or _today_str) >= _today_str
-                    and e.get("edge_pct", 0) >= _min_edge_pct
-                ]
-                state_copy["edges"]            = fresh_cache
-                state_copy["edges_from_cache"] = bool(fresh_cache)
+                state_copy["edges"]           = state_copy["edges_cache"]
+                state_copy["edges_from_cache"] = True
             else:
                 state_copy["edges_from_cache"] = False
             # Augment with watchdog / odds health info for observability
@@ -5093,27 +4920,65 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, "application/json", json.dumps(points).encode())
 
         elif path == "/api/today_edges":
-            # Return open bets at or above the current EV threshold, sorted newest-first.
-            # EV filter applied at read time so legacy sub-threshold bets never resurface
-            # on the UI board after a threshold change.
+            # Return all open bets (game not yet started), sorted newest-first.
+            # Renamed from "today_edges" — shows active positions regardless of when flagged.
             now_iso = datetime.now(timezone.utc).isoformat()
-            _min_edge_pct = EDGE_THRESHOLD * 100   # e.g. 0.015 → 1.5
             with _bets_lock:
                 open_bets = [
-                    {**b, "kelly_bet_pct": b.get("kelly_bet_pct")}
-                    for b in _bets
+                    b for b in _bets
                     if b.get("status") == "open"
                     and b.get("paper_stake") is not None
-                    and b.get("edge_pct", 0) >= _min_edge_pct
                 ]
             open_bets.sort(key=lambda b: b.get("flagged_at", ""), reverse=True)
-            print(f"  /api/today_edges: found {len(open_bets)} open positions ≥{_min_edge_pct:.1f}% adj EV")
+            print(f"  /api/today_edges: found {len(open_bets)} open positions")
             try:
                 payload = json.dumps(open_bets).encode()
             except Exception as _je:
                 print(f"  /api/today_edges JSON error: {_je}")
                 payload = b"[]"
             self._send(200, "application/json", payload)
+
+        elif path == "/api/scanner_history":
+            # Return all bets flagged in the past 24 hours, newest first.
+            # Includes bets regardless of current EV or TTL status — audit log only.
+            cutoff_iso = (datetime.now(timezone.utc).replace(microsecond=0)
+                          - __import__('datetime').timedelta(hours=24)).isoformat()
+            with _bets_lock:
+                hist_bets = [b for b in _bets if b.get("flagged_at", "") >= cutoff_iso]
+            hist_bets.sort(key=lambda b: b.get("flagged_at", ""), reverse=True)
+            now_ts = datetime.now(timezone.utc).timestamp()
+            result = []
+            for b in hist_bets:
+                status = b.get("status", "open")
+                # Compute hist_status: won/lost take precedence, else EXPIRED
+                if status == "won":
+                    hist_status = "WON"
+                elif status == "lost":
+                    hist_status = "LOST"
+                else:
+                    # Check if game has started
+                    game_time = b.get("game_time")
+                    game_started = False
+                    if game_time:
+                        try:
+                            game_started = datetime.fromisoformat(game_time).timestamp() < now_ts
+                        except Exception:
+                            pass
+                    hist_status = "HISTORICAL" if game_started else "EXPIRED"
+                result.append({
+                    "id":               b.get("id"),
+                    "matchup":          b.get("matchup", ""),
+                    "title":            b.get("title", b.get("ticker", "")),
+                    "ticker":           b.get("ticker", ""),
+                    "side":             b.get("side", ""),
+                    "edge_pct":         b.get("edge_pct"),
+                    "kalshi_price":     b.get("kalshi_price"),
+                    "pin_prob_at_flag": b.get("pin_prob_at_flag"),
+                    "flagged_at":       b.get("flagged_at"),
+                    "game_time":        b.get("game_time"),
+                    "hist_status":      hist_status,
+                })
+            self._send(200, "application/json", json.dumps(result).encode())
 
         elif path == "/api/performance":
             # optional ?since=YYYY-MM-DD  (ISO date, inclusive lower bound)
@@ -5290,28 +5155,6 @@ class Handler(BaseHTTPRequestHandler):
                 if len(_bets) < before:
                     _save_bets(_bets)
             self._send(200, "application/json", json.dumps({"ok": True, "removed": before - len(_bets)}).encode())
-
-        elif path == "/api/admin/purge_subthreshold_open":
-            # One-shot: delete all open bets whose edge_pct is below the current
-            # EDGE_THRESHOLD.  Used to erase bets flagged under a looser temporary
-            # threshold (e.g. data-collection mode at 0.5%) that should never have
-            # entered the paper portfolio under normal operating rules.
-            _floor = EDGE_THRESHOLD * 100
-            with _bets_lock:
-                before  = len(_bets)
-                purged  = [b for b in _bets
-                           if b.get("status") == "open"
-                           and isinstance(b.get("edge_pct"), (int, float))
-                           and b["edge_pct"] < _floor]
-                _bets[:] = [b for b in _bets if b not in purged]
-                if purged:
-                    _save_bets(_bets)
-            ids = [b.get("id", "?") for b in purged]
-            print(f"  [admin] purge_subthreshold_open: removed {len(purged)} bet(s) below {_floor:.1f}%: {ids}")
-            self._send(200, "application/json", json.dumps({
-                "ok": True, "purged": len(purged), "threshold_pct": _floor, "ids": ids
-            }).encode())
-
         else:
             self._send(404, "text/plain", b"Not found")
 
@@ -5330,101 +5173,13 @@ def _load_wc_alerted() -> set:
         return set()
 
 def _save_wc_alerted(alerted: set):
-    _io_queue.put({"op": "save_wc_alerted", "data": list(alerted)})
-
-
-def _io_worker_loop():
-    """
-    Daemon I/O worker — runs on a dedicated thread and executes all disk
-    writes for the application.
-
-    Callers snapshot their data and drop a payload into _io_queue; this
-    worker blocks on the queue, then serialises and atomically replaces
-    each target file.  Disk I/O never blocks a scan, CLV-capture, or
-    HTTP-handler thread.
-
-    Supported ops:
-      save_bets          — ev_bets.json        (data: list)
-      save_pin_prices    — ev_pin_prices.json  (data: dict)
-      save_history       — ev_history.json     (data: list)
-      save_my_bets       — my_bets.json        (data: list)
-      save_alerted_keys  — ev_alerted_keys.json (data: {alerted:[…], gone:[…]})
-      save_wc_alerted    — wc_alerted_series.json (data: list)
-    """
-    global _save_bets_alerted
-    while True:
-        try:
-            item = _io_queue.get(block=True, timeout=5)
-        except queue.Empty:
-            continue
-        try:
-            op   = item["op"]
-            data = item["data"]
-
-            if op == "save_bets":
-                fd, tmp = tempfile.mkstemp(dir=DATA_DIR, suffix=".tmp")
-                with os.fdopen(fd, "w") as f:
-                    json.dump(data, f, indent=2)
-                os.replace(tmp, BETS_FILE)
-
-            elif op == "save_pin_prices":
-                fd, tmp = tempfile.mkstemp(dir=DATA_DIR, suffix=".tmp")
-                with os.fdopen(fd, "w") as f:
-                    json.dump(data, f)
-                os.replace(tmp, PIN_PRICES_FILE)
-
-            elif op == "save_history":
-                fd, tmp = tempfile.mkstemp(dir=DATA_DIR, suffix=".tmp")
-                with os.fdopen(fd, "w") as f:
-                    json.dump(data, f)
-                os.replace(tmp, HISTORY_FILE)
-
-            elif op == "save_my_bets":
-                fd, tmp = tempfile.mkstemp(dir=DATA_DIR, suffix=".tmp")
-                with os.fdopen(fd, "w") as f:
-                    json.dump(data, f, indent=2)
-                os.replace(tmp, MY_BETS_FILE)
-
-            elif op == "save_alerted_keys":
-                existing = {}
-                try:
-                    with open(_ALERTED_KEYS_FILE) as f:
-                        existing = json.load(f)
-                except Exception:
-                    pass
-                today = datetime.now(timezone.utc).date().isoformat()
-                for k in data["alerted"]:
-                    existing.setdefault(k, today)
-                for k in data["gone"]:
-                    existing.setdefault(f"gone:{k}", today)
-                fd, tmp = tempfile.mkstemp(dir=DATA_DIR, suffix=".tmp")
-                with os.fdopen(fd, "w") as f:
-                    json.dump(existing, f)
-                os.replace(tmp, _ALERTED_KEYS_FILE)
-
-            elif op == "save_wc_alerted":
-                fd, tmp = tempfile.mkstemp(dir=DATA_DIR, suffix=".tmp")
-                with os.fdopen(fd, "w") as f:
-                    json.dump(data, f)
-                os.replace(tmp, _WC_ALERTED_FILE)
-
-            else:
-                print(f"  [io-worker] unknown op: {op!r}")
-
-        except Exception as exc:
-            print(f"  [io-worker] {item.get('op', '?')} failed: {exc}")
-            if item.get("op") == "save_bets" and not _save_bets_alerted:
-                _save_bets_alerted = True
-                try:
-                    send_discord(None,
-                        f"🚨 **Bet save failure** — `{exc}`\n"
-                        f"Path: `{BETS_FILE}` | DATA_DIR: `{DATA_DIR}`\n"
-                        f"Bets are in memory but NOT persisting. Check Railway volume mount.")
-                except Exception:
-                    pass
-        finally:
-            _io_queue.task_done()
-
+    try:
+        fd, tmp = tempfile.mkstemp(dir=DATA_DIR, suffix=".tmp")
+        with __import__('os').fdopen(fd, "w") as f:
+            json.dump(list(alerted), f)
+        __import__('os').replace(tmp, _WC_ALERTED_FILE)
+    except Exception as exc:
+        print(f"  WC watcher: could not save alerted series: {exc}")
 
 def _background_wc_watcher_loop():
     """
@@ -5519,7 +5274,6 @@ if __name__ == "__main__":
     def _start_bg_threads():
         """Start (or restart) all background threads. Called on launch and by watchdog."""
         specs = [
-            ("io-writer",   _io_worker_loop),
             ("scan",        _background_loop),
             ("odds",        _background_odds_loop),
             ("resolution",  _background_resolution_loop),

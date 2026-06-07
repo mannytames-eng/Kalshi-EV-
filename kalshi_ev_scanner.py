@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """
-Kalshi EV Scanner — MLB
-Compares Kalshi prices against Pinnacle no-vig probabilities to find +EV bets.
+Kalshi EV Scanner — MLB & NBA
+Compares Kalshi prices against a weighted consensus of Pinnacle, DraftKings,
+and FanDuel no-vig probabilities to find +EV bets.
 
 Key design decisions:
-  • Pinnacle-only fair value — sole source of truth, no soft-book confirmation
+  • Pinnacle-only fair value (DK/FD used for confirmation only)
   • 25% EV haircut applied to raw edge (accounts for model uncertainty)
-  • Minimum adjusted EV ≥ 2.5% to flag a bet (logged to paper portfolio)
+  • Minimum adjusted EV ≥ 3% to flag a bet (logged to paper portfolio)
   • Live display (UI cards) shows only ≥5% edges for clean, high-confidence view
   • Hard ceiling of 20% — larger edges are almost certainly data mismatches
   • Top 25 bets per scan cycle (all qualifying edges logged to paper portfolio)
@@ -55,16 +56,14 @@ ODDS_BASE   = "https://api.the-odds-api.com/v4"
 #
 # Kalshi charges ~7% of profits on winning trades (verify at kalshi.com/fees).
 # For a typical 52% fair / 45¢ entry, this costs ~2pp of the apparent edge.
-# A raw gap of ~2% becomes ~0.5% true EV at current threshold and haircut.
+# A raw gap of 3% becomes ~0.9% true EV — still positive but thin.
 KALSHI_FEE_RATE    = 0.07    # Kalshi profit fee (7% of winnings) — update if tier changes
-EDGE_THRESHOLD     = 0.020   # ≥2.0% fee+haircut-adjusted EV to flag
-                             # filters low-value noise while catching sustainable edges
+EDGE_THRESHOLD     = 0.03    # ≥3% fee+haircut-adjusted EV to flag (matches ALERT_MIN_EDGE)
+                             # Equivalent to ~4.5–5% raw gap before fees and haircut.
 MAX_EDGE           = 0.20    # reject edges >20% — almost certainly a stale line
-EV_HAIRCUT         = 0.05    # model-uncertainty discount (5% — reduced from 10%)
-TOP_BETS_PER_CYCLE = 50      # surface up to 50 qualifying bets per scan (data collection mode)
-MAX_BETS_PER_GROUP = 1       # one bet per (matchup, mkt_type) group — prevents
-                             # Gaussian-fallback alternate totals from double-allocating
-                             # Kelly capital to the same game
+EV_HAIRCUT         = 0.10    # model-uncertainty discount (separate from fee)
+TOP_BETS_PER_CYCLE = 25      # surface up to 25 qualifying bets per scan
+MAX_BETS_PER_GROUP = 2       # max bets per (matchup, mkt_type) group
 
 # Minimum Kalshi price for any side we'll consider betting.
 # Data shows 0/18 wins on markets priced below 15¢ — these are almost always
@@ -72,26 +71,26 @@ MAX_BETS_PER_GROUP = 1       # one bet per (matchup, mkt_type) group — prevent
 # ">8.5 runs") or rare-event props where model error is amplified.
 MIN_KALSHI_PRICE   = 0.15
 
-MAX_PROP_EVENTS = 15         # prop scan credit budget — MLB only (15 events × 1 credit each)
+MAX_PROP_EVENTS = 10         # prop scan credit budget — MLB only (10 events × 1 credit each)
 
 # ── Book weights for consensus probability ───────────────────────────────────
-# Pinnacle is the sole source of truth for fair value.
-# DK/FD are not fetched — soft-book confirmation removed.
-# Only books with weight > 0 are included in the Odds API request.
+# Fair value is Pinnacle ONLY — the sharpest closing-line book.
+# DK and FD are still fetched and used as CONFIRMATION signals in
+# _validate_book_consensus() but do NOT influence the fair-value price.
+# Including soft books in fair value adds public-money noise to the model.
 BOOK_WEIGHTS: Dict[str, float] = {
     "pinnacle":   1.00,   # sharp book — sole fair-value anchor
-    "draftkings": 0.00,   # excluded — not fetched
-    "fanduel":    0.00,   # excluded — not fetched
+    "draftkings": 0.00,   # confirmation only — excluded from fair-value calc
+    "fanduel":    0.00,   # confirmation only — excluded from fair-value calc
 }
 
 # ── Normal-distribution standard deviations (empirical) ─────────────────────
-# Used for push correction (integer Pinnacle lines) and Gaussian spread extrapolation.
-# MLB totals use _mlb_adaptive_total_sigma() instead of MLB_TOTAL_STD whenever a
-# Pinnacle line is available — the static constant below is a fallback only.
+# Used for Gaussian extrapolation: given Pinnacle's spread cover prob at their
+# line, compute P(margin > X) at a different threshold (the Kalshi line).
 NBA_SPREAD_STD = 12.0   # points
 NBA_TOTAL_STD  = 15.0   # points
 MLB_SPREAD_STD =  3.2   # runs (margin)
-MLB_TOTAL_STD  =  4.5   # runs — fallback when pin_line is unavailable
+MLB_TOTAL_STD  =  4.5   # runs (total)
 
 
 # ── Ticker date parser ───────────────────────────────────────────────────────
@@ -192,42 +191,6 @@ def _push_correction(no_vig_prob: float, integer_line: float, std: float) -> flo
     )
     push_prob = max(0.0, min(push_prob, 0.15))   # safety cap at 15%
     return 1.0 - push_prob
-
-
-def _mlb_adaptive_total_sigma(pin_line: float) -> float:
-    """
-    Context-aware σ for MLB total run distributions (push correction only).
-
-    Empirical linear fit: σ = 1.5 + 0.33 × total_line
-    Variance scales with the expected run environment:
-      pitcher's duel (7.5 O/U) → σ ≈ 4.0  (tight distribution)
-      average game   (9.0 O/U) → σ ≈ 4.5  (matches historical MLB_TOTAL_STD)
-      high-scoring  (10.5 O/U) → σ ≈ 5.0  (wider distribution)
-    Falls back to MLB_TOTAL_STD when pin_line is zero or unavailable.
-    """
-    if not pin_line or pin_line <= 0:
-        return MLB_TOTAL_STD
-    return 1.5 + 0.33 * pin_line
-
-
-def _gaussian_total_fallback(main_line: float, main_over_prob: float, target_line: float) -> float:
-    """
-    Shift a Pinnacle over-probability from main_line to target_line using a
-    standard-normal approximation with σ = 1.8 runs (MLB totals).
-
-    Only call when abs(target_line - main_line) <= 1.0 (enforced by caller).
-    Returns the adjusted over-probability clamped to [0.01, 0.99].
-
-    Math: z_main   = Φ⁻¹(1 − main_over_prob)         (z-score of main line)
-          z_target  = z_main + (target_line − main_line) / σ
-          P(over target_line) = 1 − Φ(z_target)
-
-    Sign check: higher target_line → larger z_target → smaller 1−Φ(z) ✓
-    """
-    _STD     = 1.8
-    z_main   = _norm_ppf(1.0 - main_over_prob)
-    z_target = z_main + (target_line - main_line) / _STD
-    return max(0.01, min(0.99, 1.0 - _norm_cdf(z_target)))
 
 
 def _gaussian_total_fair(
@@ -407,7 +370,6 @@ def fetch_kalshi_events(series_ticker: str) -> List[dict]:
             data = kalshi_get("/events", params)
         except requests.HTTPError as e:
             if e.response is not None and e.response.status_code == 404:
-                print(f"  [warn] Kalshi series 404: '{series_ticker}' does not exist")
                 return []
             raise
         batch = data.get("events", [])
@@ -465,22 +427,16 @@ def kalshi_prices(mkt: dict) -> Optional[Tuple[float, float]]:
 
 
 # ── The Odds API — multi-book ─────────────────────────────────────────────────
-def fetch_book_odds(sport: str, markets: str = "spreads,totals") -> Tuple[List[dict], str]:
+def fetch_book_odds(sport: str) -> Tuple[List[dict], str]:
     """
-    Fetch book odds from Pinnacle only.
-
-    markets: comma-separated market types to request — pass "spreads" or "totals"
-      to make a single-market call (parametric split pattern).  Default fetches both.
-      Note: alternate_* markets are only available on the per-event endpoint.
-    regions=eu: locks to Pinnacle's home region, preventing multi-region credit
-      multipliers.  Cost = len(markets.split(",")) × 1 region per call.
+    Fetch h2h / spreads / totals from Pinnacle only (1 credit per call).
+    Only sharp-book data is used for fair-value — DK/FanDuel have 0 weight.
     """
     sharp_books = ",".join(k for k, w in BOOK_WEIGHTS.items() if w > 0)
     r = requests.get(f"{ODDS_BASE}/sports/{sport}/odds", params={
         "apiKey":     ODDS_API_KEY,
-        "regions":    "eu",
         "bookmakers": sharp_books,
-        "markets":    markets,
+        "markets":    "spreads,totals",   # h2h removed — not used for fair-value, saves ~1 credit/call
         "oddsFormat": "american",
     }, timeout=15)
     r.raise_for_status()
@@ -600,16 +556,90 @@ def _validate_book_consensus(
     k_side: float,
 ) -> Tuple[bool, str]:
     """
-    Pinnacle-only validation: confirm Pinnacle data is present for this market.
-    Soft-book (DK/FD) confirmation removed — Pinnacle sharp line is the sole
-    source of truth.  Any contract that clears the EV threshold on Pinnacle
-    fair value alone is instantly approved.
+    Validate that Pinnacle AND at least one of DraftKings / FanDuel both
+    indicate value on the same side before we count a bet as +EV.
 
-    Returns (True, "Pinnacle") when Pinnacle data exists, (False, reason) otherwise.
+    books_detail: {book_key: yes_side_no_vig_prob}  (canonical YES probability)
+    side:   "YES" or "NO" — the proposed bet direction
+    k_side: Kalshi ask price for the bet side (tradeable cost)
+
+    A book "indicates value on a side" when its no-vig probability for that
+    side exceeds the Kalshi price you would pay to buy it.
+
+    Returns (is_valid: bool, reason: str).
+      is_valid=True  → reason is ""
+      is_valid=False → reason explains why the bet was rejected
     """
-    if books_detail.get("pinnacle") is None:
-        return False, "Pinnacle odds not available — cannot evaluate edge"
-    return True, "Pinnacle"
+    def _side_prob(book: str) -> Optional[float]:
+        """Return this book's no-vig prob for the bet side."""
+        p_yes = books_detail.get(book)
+        if p_yes is None:
+            return None
+        return p_yes if side == "YES" else 1.0 - p_yes
+
+    pin_p = _side_prob("pinnacle")
+    dk_p  = _side_prob("draftkings")
+    fd_p  = _side_prob("fanduel")
+
+    opp_side = "NO" if side == "YES" else "YES"
+
+    # ── 1. Pinnacle must be present and must confirm the bet side ─────────
+    if pin_p is None:
+        return False, "Pinnacle odds not available — cannot validate direction"
+
+    if pin_p <= k_side:
+        return (
+            False,
+            f"Pinnacle does not confirm {side} "
+            f"(PIN {pin_p:.1%} ≤ Kalshi {k_side:.1%}; "
+            f"Pinnacle implies {opp_side} has value instead)",
+        )
+
+    # ── 2. Classify each retail book as confirming, neutral, or disagreeing ─
+    #   confirm  : book's no-vig prob for bet side > Kalshi price  → sees +EV on our side
+    #   disagree : book's no-vig prob for bet side < Kalshi price  → sees +EV on opposite side
+    #   neutral  : probability ≈ Kalshi price (within 0.5pp rounding)
+    confirm_books:  List[str] = []
+    disagree_books: List[str] = []
+
+    retail = [("draftkings", dk_p, "DraftKings"), ("fanduel", fd_p, "FanDuel")]
+    for bkey, bp, bname in retail:
+        if bp is None:
+            continue
+        if bp > k_side:
+            confirm_books.append(bname)
+        elif bp < k_side:
+            disagree_books.append(bname)
+        # bp == k_side → neutral (skip)
+
+    # ── 3. Reject if retail books actively disagree and none confirm ──────
+    if disagree_books and not confirm_books:
+        parts = []
+        for bkey, bp, bname in retail:
+            if bp is not None:
+                parts.append(f"{bname}={bp:.1%}")
+        return (
+            False,
+            f"Books disagree on direction: Pinnacle confirms {side} "
+            f"but {' and '.join(disagree_books)} indicate {opp_side} "
+            f"({', '.join(parts)}; Kalshi={k_side:.1%})",
+        )
+
+    # ── 4. Retail confirmation (DK/FD) — optional when not fetched ──────────
+    # If retail books are available, at least one must confirm.
+    # If none are available (Pinnacle-only mode), Pinnacle alone is sufficient.
+    available_retail = [(bname, bp) for _, bp, bname in retail if bp is not None]
+    if available_retail and not confirm_books:
+        detail = ", ".join(f"{n}={p:.1%}" for n, p in available_retail)
+        return (
+            False,
+            f"Neither DraftKings nor FanDuel confirms value on {side} "
+            f"({detail} ≤ Kalshi {k_side:.1%})",
+        )
+
+    # ── 5. Valid — build a short confirmation string for the edge payload ─
+    confirmed_by = ["Pinnacle"] + confirm_books
+    return True, f"Confirmed by {' + '.join(confirmed_by)}"
 
 
 def _weighted_consensus(probs_by_book: Dict[str, float]) -> Tuple[float, List[str]]:
@@ -719,18 +749,11 @@ def build_consensus_game_index(
                     # posted as the "favorite" to cover by that margin.
                     if bkey == "pinnacle":
                         for tname, cov_prob, pt in probs:
-                            # ONLY store entries where pt < 0 (team is the FAVORITE).
-                            # P(favorite covers -X) == P(favorite wins by X+) — the exact
-                            # question Kalshi's "wins by over X" market asks.
-                            # P(underdog covers +X) == P(underdog wins OR loses by <X),
-                            # which is semantically different and would produce phantom
-                            # 20-30% edges on underdog "wins by X+" Kalshi markets.
-                            if pt >= 0:
-                                continue  # underdog line — skip to prevent phantom edges
-                            abs_pt = abs(pt)
-                            if tname not in pin_spread_lines:
-                                pin_spread_lines[tname] = {}
-                            pin_spread_lines[tname][abs_pt] = cov_prob
+                            if pt < 0:
+                                abs_pt = abs(pt)
+                                if tname not in pin_spread_lines:
+                                    pin_spread_lines[tname] = {}
+                                pin_spread_lines[tname][abs_pt] = cov_prob
 
                 # ── totals + alternate_totals ──────────────────────────────
                 # alternate_totals returns every Pinnacle line (7.5, 8.5, 9.5,
@@ -880,43 +903,20 @@ def build_game_index(
 def _apply_correlation_control(
     edges: List[dict],
     max_per_group: int = MAX_BETS_PER_GROUP,
-) -> Tuple[List[dict], List[dict]]:
+) -> List[dict]:
     """
-    Limit to max_per_group edges per (matchup, normalized_mkt_type) group.
-    Market types are collapsed into three buckets so all prop types (KS, HIT,
-    TB, RBI, mlb_prop, nba_prop …) count against a single shared quota:
-      "spread" — run lines / point spreads
-      "total"  — game totals (including Gaussian-fallback alternate lines)
-      "prop"   — all player props regardless of stat category
-
-    With MAX_BETS_PER_GROUP=1 each game produces at most:
-      1 spread edge  +  1 total edge  +  1 prop edge
-    Input must be pre-sorted by adj. edge descending so the first edge
-    seen per group is always the highest-EV one.
-
-    Returns (apex_edges, pass_edges).  pass_edges are non-apex competitors
-    tagged correlated_pass=True — they are never logged as bets.
+    Limit to max_per_group bets per (matchup, mkt_type) group.
+    Input should already be sorted by adj. edge descending.
     """
-    def _norm_mkt(mkt_type: str) -> str:
-        m = mkt_type.lower()
-        if m in ("spread", "kxmlbspread", "spread_team"):
-            return "spread"
-        if m in ("total", "kxmlbtotal", "total_over", "total_under"):
-            return "total"
-        return "prop"   # KS, HIT, TB, RBI, mlb_prop, nba_prop, etc.
-
     group_counts: Dict[tuple, int] = {}
-    apex:  List[dict] = []
-    passed: List[dict] = []
+    result = []
     for e in edges:
-        key = (e.get("matchup", ""), _norm_mkt(e.get("mkt_type", "")))
+        key = (e.get("matchup", ""), e.get("mkt_type", ""))
         cnt = group_counts.get(key, 0)
         if cnt < max_per_group:
             group_counts[key] = cnt + 1
-            apex.append(e)
-        else:
-            passed.append({**e, "correlated_pass": True})
-    return apex, passed
+            result.append(e)
+    return result
 
 
 # ── Pre-execution EV recheck ─────────────────────────────────────────────────
@@ -1122,6 +1122,12 @@ def validate_bet(edge: dict, max_age_seconds: int = 600) -> dict:
         result["fair_moved"] = fair_moved_pp
 
         # ── Bad-data guard: reject Pinnacle re-fetch if move > 15pp ──────────
+        # A move larger than 15 percentage points between scans almost certainly
+        # means the index matched the wrong game (same city, different date or
+        # opponent) rather than a genuine market shift.  Example: Rockies fair
+        # was 32.6% at entry; re-fetch returns 53% because a different COL game
+        # was matched.  We discard the bad pull, keep the stored fair value, and
+        # log every rejection so it's visible in Railway logs.
         _PIN_RESCAN_MAX_MOVE_PP = 15.0
         if fair_now != fair_was and abs(fair_moved_pp) > _PIN_RESCAN_MAX_MOVE_PP:
             print(
@@ -1218,55 +1224,6 @@ def poisson_pmf(k: int, lam: float) -> float:
 
 def poisson_cdf(n: int, lam: float) -> float:
     return sum(poisson_pmf(i, lam) for i in range(max(0, int(n)) + 1))
-
-
-def calculate_poisson_probability(
-    expected_mean: float,
-    strike_threshold: float,
-    bet_type: str,
-) -> float:
-    """
-    Cumulative Poisson probability for a discrete player stat.
-
-    OVER  → P(X > floor(strike_threshold)) = 1 − P(X ≤ floor(strike_threshold))
-    UNDER → P(X ≤ floor(strike_threshold))
-
-    Kalshi prop floor_strike=k resolves YES if the stat strictly exceeds k (≥ k+1),
-    so floor() is the correct integer boundary for both half-point and integer lines.
-    Clamps result to [0.0, 1.0] to absorb floating-point rounding at the tails.
-    """
-    if expected_mean <= 0:
-        return 0.0 if bet_type == "OVER" else 1.0
-    if strike_threshold < 0:
-        return 1.0 if bet_type == "OVER" else 0.0
-    k_floor = max(0, int(strike_threshold))
-    cum = min(1.0, max(0.0, poisson_cdf(k_floor, expected_mean)))
-    return round(1.0 - cum, 6) if bet_type == "OVER" else round(cum, 6)
-
-
-def derive_synthetic_prop_fair_value(
-    current_macro_total: float,
-    opening_macro_total: float,
-    baseline_prop_value: float,
-    bet_type: str = "OVER",
-) -> float:
-    """
-    Synthetic prop fair-value probability derived from macro game-total movement.
-
-    Scales the expected prop mean by the ratio of current to opening game total:
-      scale_factor   = current_macro_total / opening_macro_total
-      dynamic_lambda = baseline_prop_value × scale_factor
-
-    When current == opening (no shift), scale_factor = 1.0 and the result is
-    the pure Poisson probability at the contract threshold.  When the game total
-    moves (e.g. 9.0 → 9.5), the prop mean scales proportionally, lifting OVER
-    probabilities and depressing UNDER probabilities.
-    """
-    if opening_macro_total <= 0 or baseline_prop_value <= 0:
-        return 0.0
-    scale_factor   = current_macro_total / opening_macro_total
-    dynamic_lambda = baseline_prop_value * scale_factor
-    return calculate_poisson_probability(dynamic_lambda, baseline_prop_value, bet_type)
 
 
 def poisson_lambda_from_line(line: float, over_prob: float) -> Optional[float]:
@@ -1447,10 +1404,9 @@ def _parse_nba_event(ticker: str, abbr_map: Dict[str, str]) -> Tuple[Optional[st
 
 
 def _parse_mlb_event(ticker: str, abbr_map: Dict[str, str]) -> Tuple[Optional[str], Optional[str]]:
-    base   = re.sub(r"-\d+$", "", ticker)   # strip trailing threshold suffix (-8, -10, etc.)
-    suffix = re.sub(r"^KX\w+?-\d+[A-Z]+\d+\d{4}", "", base)
+    suffix = re.sub(r"^KX\w+?-\d+[A-Z]+\d+\d{4}", "", ticker)
     if not suffix:
-        suffix = re.sub(r"^KX\w+?-\d+[A-Z]+\d+", "", base).lstrip("-")
+        suffix = re.sub(r"^KX\w+?-\d+[A-Z]+\d+", "", ticker).lstrip("-")
     for i in range(2, len(suffix) - 1):
         a, b = suffix[:i], suffix[i:]
         na = _abbr_to_name(a, abbr_map)
@@ -1540,15 +1496,16 @@ def _book_confidence(books_detail: dict) -> float:
     """
     How tightly do the contributing books agree on fair probability?
     Returns 0.0 – 1.0:
-      1.0  single book (Pinnacle-only mode) or all books identical
+      1.0  all books identical (perfect agreement)
       0.0  books spread ≥ 10 pp apart (high disagreement / stale line)
+      0.5  only one book available (unverified)
 
     High confidence + high EV = strongest bet signal.
     Low confidence can mean: line moving, injury news, one book is stale.
     """
     probs = [v for v in books_detail.values() if isinstance(v, (int, float))]
     if len(probs) < 2:
-        return 1.0   # Pinnacle-only — no disagreement possible, full confidence
+        return 0.5
     spread = max(probs) - min(probs)
     return round(max(0.0, 1.0 - spread / 0.10), 3)
 
@@ -1592,7 +1549,7 @@ def scan_sport(
 ) -> List[dict]:
     """
     Scan one sport's Kalshi spread, total, and optionally moneyline markets
-    vs Pinnacle no-vig fair probability (sole source of truth).
+    vs the weighted-consensus fair probability from Pinnacle / DraftKings / FanDuel.
 
     Returns a list of edge dicts, each containing:
       ticker, title, matchup, side, kalshi, fair, raw_edge, edge (adj),
@@ -1725,21 +1682,6 @@ def scan_sport(
             except Exception:
                 continue
 
-            # ── Dynamic target-line parsing ────────────────────────────────
-            # Collect every floor_strike listed in this event's Kalshi markets.
-            # Used below to restrict pin_lines to only lines with an active
-            # Kalshi contract, avoiding work on Pinnacle lines nothing references.
-            # Fallback: empty set → full pin_lines used in the matching step.
-            _event_total_thresholds: Set[float] = set()
-            if mkt_type == "total":
-                for _m in mkts:
-                    _fl = _m.get("floor_strike")
-                    if _fl is not None:
-                        try:
-                            _event_total_thresholds.add(float(_fl))
-                        except (ValueError, TypeError):
-                            pass
-
             for mkt in mkts:
                 prices = kalshi_prices(mkt)
                 if prices is None:
@@ -1847,21 +1789,6 @@ def scan_sport(
                         # in integer-scored sports (e.g. 8.0 == 8.5 in baseball — both
                         # require 9+ runs). Prefer exact/equivalent matches over Gaussian.
                         pin_lines    = total_info.get("pin_lines", {})
-                        # Restrict to Kalshi-listed thresholds; falls back to full
-                        # pin_lines when pre-pass returned empty (parse failure).
-                        if _event_total_thresholds:
-                            _targeted = {
-                                pt: probs for pt, probs in pin_lines.items()
-                                if any(
-                                    abs(pt - thr) <= 0.25 or _lines_equivalent(pt, thr)
-                                    for thr in _event_total_thresholds
-                                )
-                            }
-                            if _targeted:
-                                pin_lines = _targeted
-                            else:
-                                print(f"    [target-lines] fallback — 0 pin_lines matched "
-                                      f"thresholds {sorted(_event_total_thresholds)}")
                         exact_match  = None
                         for pin_pt, pin_probs in pin_lines.items():
                             if abs(pin_pt - threshold) <= 0.25 or _lines_equivalent(pin_pt, threshold):
@@ -1882,43 +1809,26 @@ def scan_sport(
                             # true P(total > line).  Kalshi is binary — a total landing
                             # on the integer is a LOSS, not a push.  Correct before use.
                             if abs(pin_total - round(pin_total)) < 1e-9:
-                                # MLB: sigma scales with the run environment (pitcher's duel vs. high-scoring).
-                                # NBA: use the static total_std constant.
-                                _sigma    = _mlb_adaptive_total_sigma(pin_total) if "baseball" in odds_sport else total_std
-                                corr      = _push_correction(po, pin_total, _sigma)
+                                corr      = _push_correction(po, pin_total, total_std)
                                 push_pct  = (1.0 - corr) * 100
                                 print(f"    [push-corr] integer line {pin_total:.1f}: "
-                                      f"σ={_sigma:.2f}  push≈{push_pct:.1f}%  "
+                                      f"push≈{push_pct:.1f}%  "
                                       f"over {po:.3f}→{po*corr:.3f}  "
                                       f"under {pu:.3f}→{pu*corr:.3f}")
                                 po *= corr
                                 pu *= corr
                         else:
-                            # No exact Pinnacle line — bounded Gaussian fallback.
-                            # Only interpolate within ±1.0 run of the main Pinnacle
-                            # line; beyond that the approximation error exceeds the
-                            # edge signal and we skip.
-                            _main_line   = total_info.get("over_point")
-                            _main_over_p = total_info.get("over_prob")
-                            if (
-                                _main_line is None
-                                or _main_over_p is None
-                                or abs(threshold - _main_line) > 1.0
-                            ):
-                                continue
-                            po             = _gaussian_total_fallback(_main_line, _main_over_p, threshold)
-                            pu             = 1.0 - po
-                            total_fair_src = "gaussian"
-                            _diag_line_matches += 1
-                            print(
-                                f"    [gaussian-fb] {threshold:.1f} from main={_main_line:.1f} "
-                                f"({threshold - _main_line:+.1f}r): over {_main_over_p:.3f}→{po:.3f}"
-                            )
+                            # No exact Pinnacle alternate line — skip entirely.
+                            # Gaussian extrapolation was removed: even a 0.5-run
+                            # step can systematically mis-estimate edge direction
+                            # and was the likely cause of YES/over bias.
+                            continue
 
-                        books_used   = ["pinnacle"]     # alternate lines are Pinnacle-only by construction
-                        books_detail = {"pinnacle": po} # matched alternate-line prob, not main-line
-                        # (mirrors the spreads path at line 1758 — keeps validation
-                        #  oracle consistent with the fair value actually used for EV)
+                        books_used  = total_info.get("books_used", [])
+                        books_detail = {
+                            bk: td["over_prob"]
+                            for bk, td in total_info.get("per_book", {}).items()
+                        }
                         consensus_prob = po
                         # Direct no-vig probability from Pinnacle's matching line
                         fair = po if direction == "total_over" else pu
@@ -1965,14 +1875,14 @@ def scan_sport(
                 no_adj  = no_fee_adj  * (1 - EV_HAIRCUT)
 
                 best_adj = max(yes_adj, no_adj)
-                if best_adj > _diag_best_adj and best_adj <= MAX_EDGE:
+                if best_adj > _diag_best_adj:
                     _diag_best_adj = best_adj
                 if best_adj > 0:
                     _diag_edges_raw += 1   # count positive-EV markets before threshold filter
 
                 # ── Market snapshot: record current edge for BOTH sides ───────
                 # Used by Open Positions to show live value on existing bets even
-                # when below the 2.5% flag threshold.  Zero extra credits — we've
+                # when below the 3% flag threshold.  Zero extra credits — we've
                 # already computed this data, we're just capturing it.
                 _snap_ticker = mkt.get("ticker", "")
                 if _snap_ticker:
@@ -1989,9 +1899,9 @@ def scan_sport(
                         "edge_pct": round(no_adj * 100, 1),
                     }
 
-                # Log near-misses: markets within 1pp below threshold
+                # Log near-misses: markets within 5pp of threshold in either direction
                 _near_miss_gap = best_adj - EDGE_THRESHOLD  # negative = below threshold
-                if -0.01 < _near_miss_gap < 0:
+                if -0.05 < _near_miss_gap < 0:
                     _best_side = "YES" if yes_adj >= no_adj else "NO"
                     _matchup_str = f"{game_info.get('away','?')} @ {game_info.get('home','?')}"
                     print(
@@ -2165,16 +2075,12 @@ def scan_sport(
     )
 
     # ── 3. Sort by confidence × adj_edge, correlation-control, top N ─────
-    # Primary sort: confidence × adj_edge descending (highest EV wins).
-    # Tiebreaker: lower kalshi_line preferred — less extreme threshold, cleaner signal.
-    # _apply_correlation_control then keeps only the top-1 edge per (matchup, mkt_type)
-    # so Gaussian-fallback alternate totals never double-allocate Kelly capital.
-    edges.sort(
-        key=lambda x: (x["confidence"] * x["edge"], -(x.get("kalshi_line") or 0)),
-        reverse=True,
-    )
-    apex_edges, pass_edges = _apply_correlation_control(edges)
-    edges = apex_edges[:TOP_BETS_PER_CYCLE] + pass_edges
+    # Confidence-weighted score: rewards bets where all books agree AND edge is large.
+    # A 10% edge where DK/FD/Pinnacle all agree outranks a 12% edge where only one
+    # book has data or books are far apart.
+    edges.sort(key=lambda x: x["confidence"] * x["edge"], reverse=True)
+    edges = _apply_correlation_control(edges)
+    edges = edges[:TOP_BETS_PER_CYCLE]
 
     # ── 4. Print final table ──────────────────────────────────────────────
     if not edges:
@@ -2364,106 +2270,6 @@ def build_all_player_props(
     return player_lookup
 
 
-def _make_synthetic_prop_edge(
-    kp: dict,
-    mkt_type_label: str,
-    now_utc,
-) -> Optional[dict]:
-    """
-    Shadow-mode synthetic edge for a Kalshi prop with no matching Pinnacle line.
-
-    Derives fair value via derive_synthetic_prop_fair_value() using:
-      current_macro_total = opening_macro_total = kp["threshold"]
-      (scale_factor = 1.0 — no macro-shift data yet)
-      dynamic_lambda = threshold × 1.0 = threshold
-
-    This produces the Poisson P(X > floor(threshold) | λ = threshold) baseline.
-    All synthetic edges are tagged is_synthetic=True so they can be tracked
-    separately from direct-mapped bets; never size positions based on them.
-
-    Returns an edge dict or None if EV falls below EDGE_THRESHOLD or above cap.
-    """
-    threshold = kp["threshold"]
-    yes_bid   = kp["yes_bid"]
-    yes_ask   = kp["yes_ask"]
-
-    # Synthetic fair-value: Poisson(λ = threshold), no macro shift applied yet.
-    # Future: pass real current / opening macro totals to activate scaling.
-    fair_over  = derive_synthetic_prop_fair_value(
-        current_macro_total = threshold,
-        opening_macro_total = threshold,
-        baseline_prop_value = threshold,
-        bet_type            = "OVER",
-    )
-    fair_under = 1.0 - fair_over
-
-    yes_raw  = fair_over  - yes_ask
-    no_raw   = fair_under - (1.0 - yes_bid)
-
-    yes_fee  = KALSHI_FEE_RATE * fair_over  * (1 - yes_ask)
-    no_fee   = KALSHI_FEE_RATE * fair_under * yes_bid
-    yes_adj  = (yes_raw - yes_fee) * (1 - EV_HAIRCUT)
-    no_adj   = (no_raw  - no_fee)  * (1 - EV_HAIRCUT)
-
-    best_adj = max(yes_adj, no_adj)
-    best_raw = max(yes_raw, no_raw)
-    if best_adj < EDGE_THRESHOLD:
-        return None
-    if best_adj >= MAX_EDGE or best_raw >= MAX_EDGE:
-        print(
-            f"  ⚠️ Data Mismatch Detected: Edge over 20% ceiling. "
-            f"Dropping inverted market anomaly.  "
-            f"[{kp['ticker']}  adj={best_adj:.1%}  raw={best_raw:.1%}]"
-        )
-        return None
-    if best_adj > PROP_MAX_EDGE:
-        return None
-
-    if yes_adj >= no_adj:
-        side, k_side, f_side, raw_edge, adj_edge = "YES", yes_ask,     fair_over,  yes_raw, yes_adj
-    else:
-        side, k_side, f_side, raw_edge, adj_edge = "NO",  1 - yes_bid, fair_under, no_raw,  no_adj
-
-    if k_side < MIN_KALSHI_PRICE:
-        return None
-
-    matchup = (kp["mkt_title"] or kp["ev_title"] or kp["ticker"]).split(":")[0].strip()
-
-    print(
-        f"  ◈ synth {kp['prop_type']:<20} {matchup:<30} {side}  "
-        f"kalshi={k_side:.1%}  synth_fair={f_side:.1%}  adj={adj_edge:+.1%}  "
-        f"[Poisson λ={threshold:.1f}]  [SHADOW MODE — no Pinnacle line]"
-    )
-
-    return {
-        "ticker":               kp["ticker"],
-        "title":                f"{kp['mkt_title']} [SYNTHETIC λ={threshold:.1f}]",
-        "kalshi_line":          threshold,
-        "matchup":              matchup,
-        "side":                 side,
-        "kalshi":               round(k_side, 4),
-        "fair":                 round(f_side, 4),
-        "raw_edge":             round(raw_edge, 4),
-        "edge":                 round(adj_edge, 4),
-        "confidence":           0.5,    # unknown — single Poisson model, no book validation
-        "mkt_type":             mkt_type_label,
-        "pin_line":             None,   # no direct Pinnacle line
-        "prop_type":            kp["prop_type"],
-        "books_used":           [],
-        "books_detail":         {},
-        "per_book_novig":       {},
-        "consensus_yes":        round(fair_over, 4),
-        "consensus_no":         round(fair_under, 4),
-        "consensus_yes_american": prob_to_american(fair_over),
-        "consensus_no_american":  prob_to_american(fair_under),
-        "consensus_prob":       round(fair_over, 4),
-        "is_valid_consensus":   False,
-        "consensus_reason":     f"Poisson synthetic (λ={threshold:.1f}) — no Pinnacle line",
-        "is_synthetic":         True,
-        "kalshi_price_ts":      now_utc.isoformat(),
-    }
-
-
 def scan_player_props(
     odds_sport: str = "baseball_mlb",
     abbr_map: Optional[Dict[str, str]] = None,
@@ -2612,15 +2418,6 @@ def scan_player_props(
 
         matched = _find_player_in_title(search_title, prop_sublookup)
         if matched is None:
-            # ── Shadow mode: no direct Pinnacle line — attempt Poisson synthetic ──
-            # Triggers when Pinnacle has the prop type but not this specific player.
-            # is_synthetic=True tags the edge for separate performance tracking.
-            synth = _make_synthetic_prop_edge(kp, mkt_type_label, now_utc)
-            if synth is not None:
-                dedup_key = (kp["ticker"], synth["side"])
-                if dedup_key not in seen_edges:
-                    seen_edges.add(dedup_key)
-                    edges.append(synth)
             continue
 
         # ── Ghost-edge safeguard: integer boundary check ─────────────────────
@@ -2673,15 +2470,7 @@ def scan_player_props(
         no_adj   = (no_raw  - no_fee)  * (1 - EV_HAIRCUT)
 
         best_adj = max(yes_adj, no_adj)
-        best_raw = max(yes_raw, no_raw)
         if best_adj < EDGE_THRESHOLD:
-            continue
-        if best_adj >= MAX_EDGE or best_raw >= MAX_EDGE:
-            print(
-                f"  ⚠️ Data Mismatch Detected: Edge over 20% ceiling. "
-                f"Dropping inverted market anomaly.  "
-                f"[{matched.get('player','?')}  adj={best_adj:.1%}  raw={best_raw:.1%}]"
-            )
             continue
         if best_adj > PROP_MAX_EDGE:   # 15% cap — tighter than game-line MAX_EDGE (20%); very large prop edges are almost always a mismatch
             print(
@@ -2761,8 +2550,8 @@ def scan_player_props(
 
     # Sort by confidence × adj_edge, correlation-control, top N
     edges.sort(key=lambda x: x["confidence"] * x["edge"], reverse=True)
-    apex_edges, pass_edges = _apply_correlation_control(edges)
-    edges = apex_edges[:TOP_BETS_PER_CYCLE] + pass_edges
+    edges = _apply_correlation_control(edges)
+    edges = edges[:TOP_BETS_PER_CYCLE]
 
     if not edges:
         print(f"  No player-prop edges ≥ {EDGE_THRESHOLD:.0%} (adj.) found.")
@@ -2798,14 +2587,21 @@ def run_once() -> int:
         label         = "MLB — Run Line & Totals",
         spread_series = "KXMLBSPREAD",
         total_series  = "KXMLBTOTAL",
-        # ml_series omitted — KXMLBML returns 0 events (series unverified on Kalshi)
         odds_sport    = "baseball_mlb",
         abbr_map      = MLB_ABBR,
         spread_std    = MLB_SPREAD_STD,
         total_std     = MLB_TOTAL_STD,
     )
-    # NBA faded permanently — credits reallocated to MLB
-    total = len(mlb_edges)
+    nba_edges, _ = scan_sport(
+        label         = "NBA — Spread & Totals",
+        spread_series = "KXNBASPREAD",
+        total_series  = "KXNBATOTAL",
+        odds_sport    = "basketball_nba",
+        abbr_map      = NBA_ABBR,
+        spread_std    = NBA_SPREAD_STD,
+        total_std     = NBA_TOTAL_STD,
+    )
+    total = len(mlb_edges) + len(nba_edges)
     print(f"\n  Total edges flagged (adj. ≥{EDGE_THRESHOLD*100:.0f}%): {total}")
     return total
 
@@ -2820,10 +2616,10 @@ def main():
 
     print("╔══════════════════════════════════════════════════════════════════╗")
     print("║          Kalshi EV Scanner  —  MLB & NBA  (v2)                  ║")
-    print("║  Sources : Pinnacle (100%) — sole sharp-line source of truth     ║")
-    print(f"║  EV      : raw edge × {1-EV_HAIRCUT:.0%} haircut ≥ {EDGE_THRESHOLD*100:.1f}% to flag            ║")
+    print("║  Sources : Pinnacle (70%) + DraftKings (20%) + FanDuel (10%)    ║")
+    print(f"║  EV      : raw edge × {1-EV_HAIRCUT:.0%} haircut ≥ {EDGE_THRESHOLD*100:.0f}% to flag              ║")
     print(f"║  Output  : Top {TOP_BETS_PER_CYCLE} bets, max {MAX_BETS_PER_GROUP} per game group                      ║")
-    print("║  Markets : KXMLBSPREAD, KXMLBTOTAL (MLB only)                  ║")
+    print("║  Markets : KXMLBSPREAD, KXMLBTOTAL, KXNBASPREAD, KXNBATOTAL    ║")
     print("╚══════════════════════════════════════════════════════════════════╝")
 
     if args.loop <= 0:

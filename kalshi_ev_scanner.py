@@ -1891,12 +1891,16 @@ def scan_sport(
                         "kalshi":   round(yes_ask, 4),
                         "fair":     round(fair, 4),
                         "edge_pct": round(yes_adj * 100, 1),
+                        "pin_line": pin_line,       # Pinnacle's current line (e.g. 8.0)
+                        "kalshi_line": threshold,   # Kalshi's current threshold (e.g. 8.5)
                     }
                     market_snapshot[f"{_snap_ticker}|NO"] = {
                         "adj_edge": round(no_adj, 4),
                         "kalshi":   round(1 - yes_bid, 4),
                         "fair":     round(1 - fair, 4),
                         "edge_pct": round(no_adj * 100, 1),
+                        "pin_line": pin_line,
+                        "kalshi_line": threshold,
                     }
 
                 # Log near-misses: markets within 5pp of threshold in either direction

@@ -756,6 +756,8 @@ def _add_new_bets(edges: list) -> list:
                 # ─────────────────────────────────────────────────────────────
                 "kalshi_price":       e["kalshi"],
                 "kalshi_yes_at_flag": kalshi_yes_at_flag,
+                "pin_line_at_flag":   e.get("pin_line"),      # Pinnacle line at detection (e.g. 8.0)
+                "kalshi_line_at_flag": e.get("kalshi_line"),  # Kalshi threshold at detection (e.g. 8.5)
                 "flagged_at":         datetime.now(timezone.utc).isoformat(),
                 "game_time":          _parse_ticker_start_time(e["ticker"]).isoformat()
                                       if _parse_ticker_start_time(e["ticker"]) else None,
@@ -2382,10 +2384,12 @@ def _run_scan():
                     _kalshi   = _pe.get("kalshi", 0.0)
                     _fair     = _pe.get("fair", 0.0)
                     _last_prop_snapshot[f"{_ticker}|{_side}"] = {
-                        "adj_edge": round(_adj_edge, 4),
-                        "kalshi":   round(_kalshi, 4),
-                        "fair":     round(_fair, 4),
-                        "edge_pct": round(_adj_edge * 100, 1),
+                        "adj_edge":   round(_adj_edge, 4),
+                        "kalshi":     round(_kalshi, 4),
+                        "fair":       round(_fair, 4),
+                        "edge_pct":   round(_adj_edge * 100, 1),
+                        "pin_line":   _pe.get("pin_line"),
+                        "kalshi_line": _pe.get("kalshi_line"),
                     }
 
             # Merge: game-line snapshot + last known prop snapshot.
@@ -3956,12 +3960,37 @@ function renderTodayEdges() {
     const stake    = b.paper_stake != null ? `$${b.paper_stake.toFixed(0)}` : '—';
     const sideClass = b.side === 'YES' ? 'side-yes' : 'side-no';
     const tickerTxt = `<span style="display:block;font-size:8px;color:var(--muted);font-family:monospace;margin-top:2px;">${b.ticker}</span>`;
+
+    // ── Line movement: entry line vs current live line ──────────────────────
+    // entry: pin_line_at_flag (Pinnacle) or kalshi_line_at_flag (Kalshi threshold)
+    // live:  snap.pin_line (from latest market_snapshot, updated every scan cycle)
+    // Show as "8.0 ➔ 8.5" — blank if neither side has data.
+    const entryLine = b.pin_line_at_flag != null ? b.pin_line_at_flag
+                    : b.kalshi_line_at_flag != null ? b.kalshi_line_at_flag
+                    : null;
+    const liveLine  = snap != null && snap.pin_line != null ? snap.pin_line
+                    : snap != null && snap.kalshi_line != null ? snap.kalshi_line
+                    : null;
+    let lineMoveTxt = '—';
+    if (entryLine != null) {
+      const entryFmt = Number.isInteger(entryLine) ? entryLine + '.0' : entryLine;
+      if (liveLine != null && liveLine !== entryLine) {
+        const liveFmt  = Number.isInteger(liveLine)  ? liveLine  + '.0' : liveLine;
+        const moved    = liveLine !== entryLine;
+        const color    = moved ? '#e3a53a' : 'var(--muted)';
+        lineMoveTxt = `<span style="font-weight:600;color:${color};white-space:nowrap;">${entryFmt} ➔ ${liveFmt}</span>`;
+      } else {
+        lineMoveTxt = `<span style="color:var(--muted);white-space:nowrap;">${entryFmt}</span>`;
+      }
+    }
+
     return `<tr>
       <td style="font-size:11px;color:var(--muted);white-space:nowrap;">${flagTime}</td>
       <td>${matchupHtml(b.matchup)}${gameTimeBadge}</td>
       <td class="prop-col" style="font-size:12px;">${b.title}${kalshiLineBadge(b)}${driftTxt}${tickerTxt}${kalshiLink}</td>
       <td class="${sideClass}">${b.side}</td>
       <td class="num" style="color:${edgeColor(b.edge_pct)};font-weight:700;">+${pct(b.edge_pct)}${flagOddsTxt}</td>
+      <td class="num">${lineMoveTxt}</td>
       <td class="num">${lastScanEdge}</td>
       <td class="num">${recBadge}</td>
       <td class="num">${stake}</td>
@@ -3972,6 +4001,7 @@ function renderTodayEdges() {
     <thead><tr>
       <th>Flagged</th><th>Matchup</th><th>Bet</th><th>Side</th>
       <th class="num">Edge @ Flag</th>
+      <th class="num" style="white-space:nowrap;">Line (Entry ➔ Live)</th>
       <th class="num">Last Scan <span style="font-size:9px;font-weight:400;color:var(--muted);">(≤2 min)</span></th>
       <th class="num">Status</th>
       <th class="num">Stake</th>

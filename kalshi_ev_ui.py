@@ -1680,6 +1680,7 @@ print(f"  Loaded {len(_alerted_keys)} previously alerted edge key(s) from disk")
 # period during game hours — indicates a silent data pipeline failure.
 _zero_edge_streak      = 0          # consecutive scans with no qualifying edges
 _last_props_scan: float = 0.0       # epoch seconds of last props scan
+_last_prop_snapshot: dict = {}      # persists between prop scan cycles so UI stays populated
 # Props refresh interval is now dynamic — see _props_refresh_interval() above.
 _zero_edge_alerted     = False      # suppresses duplicate alerts per drought
 _ZERO_EDGE_ALERT_SCANS = 60         # 60 × 2-min scan = 2 hours of silence
@@ -2356,30 +2357,40 @@ def _run_scan():
             _state["scanning"]        = False
             _state["last_scan_stats"] = mlb_stats   # diagnostic counters for /api/scan
 
-            # ── Merge prop edges into market_snapshot ─────────────────────────
-            # scan_player_props() returns a flat edge list, not a snapshot dict,
-            # so we build snapshot entries here using the same schema as scan_sport().
-            # Zero extra credits — this data is already in memory from the props scan.
-            # Without this, renderTodayEdges() finds no key for prop tickers and
-            # shows a blank "Last Scan" column for all prop bets.
-            prop_snapshot: dict = {}
-            for _pe in mlb_props:
-                _ticker = _pe.get("ticker", "")
-                _side   = _pe.get("side", "")
-                if not _ticker or not _side:
-                    continue
-                _adj_edge = _pe.get("edge", 0.0)      # decimal adj edge for this side
-                _kalshi   = _pe.get("kalshi", 0.0)    # bet-side Kalshi price (decimal)
-                _fair     = _pe.get("fair", 0.0)      # bet-side fair prob (decimal)
-                prop_snapshot[f"{_ticker}|{_side}"] = {
-                    "adj_edge": round(_adj_edge, 4),
-                    "kalshi":   round(_kalshi, 4),
-                    "fair":     round(_fair, 4),
-                    "edge_pct": round(_adj_edge * 100, 1),
-                }
-            combined_snapshot = {**mlb_snapshot, **prop_snapshot}
+            # ── Build full market snapshot: game lines + props ────────────────
+            # scan_sport() already populates mlb_snapshot for game lines.
+            # Props come from scan_player_props() which runs on its own slower
+            # interval — mlb_props is [] on non-prop cycles.  We persist the
+            # last prop snapshot in _last_prop_snapshot so the UI stays populated
+            # between prop scan cycles (every 8–10 min) rather than blanking out
+            # every 30 s when mlb_props is empty.
+            #
+            # Source: all_edges (the merged, deduped list) rather than mlb_props
+            # directly, so any future edge source added to all_edges is
+            # automatically included here with no extra changes needed.
+            global _last_prop_snapshot
+            if mlb_props:   # fresh prop scan this cycle — rebuild prop snapshot
+                _last_prop_snapshot = {}
+                for _pe in all_edges:
+                    if _pe.get("mkt_type") != "prop":
+                        continue
+                    _ticker = _pe.get("ticker", "")
+                    _side   = _pe.get("side", "")
+                    if not _ticker or not _side:
+                        continue
+                    _adj_edge = _pe.get("edge", 0.0)
+                    _kalshi   = _pe.get("kalshi", 0.0)
+                    _fair     = _pe.get("fair", 0.0)
+                    _last_prop_snapshot[f"{_ticker}|{_side}"] = {
+                        "adj_edge": round(_adj_edge, 4),
+                        "kalshi":   round(_kalshi, 4),
+                        "fair":     round(_fair, 4),
+                        "edge_pct": round(_adj_edge * 100, 1),
+                    }
 
-            _state["market_snapshot"] = combined_snapshot  # game lines + props
+            # Merge: game-line snapshot + last known prop snapshot.
+            # Game lines take precedence on key collision (shouldn't happen).
+            _state["market_snapshot"] = {**_last_prop_snapshot, **mlb_snapshot}
 
         # Log new bets and capture what was just added for the alert
         newly_logged = _add_new_bets(edges)

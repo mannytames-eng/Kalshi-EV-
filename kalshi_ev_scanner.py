@@ -1886,20 +1886,22 @@ def scan_sport(
                 # already computed this data, we're just capturing it.
                 _snap_ticker = mkt.get("ticker", "")
                 if _snap_ticker:
+                    # Note: pin_line is not yet computed at this point in the loop
+                    # (it's set below, only for edges that clear EDGE_THRESHOLD).
+                    # We store kalshi_line (threshold) which IS available — the UI
+                    # falls back to snap.kalshi_line when snap.pin_line is null.
                     market_snapshot[f"{_snap_ticker}|YES"] = {
-                        "adj_edge": round(yes_adj, 4),
-                        "kalshi":   round(yes_ask, 4),
-                        "fair":     round(fair, 4),
-                        "edge_pct": round(yes_adj * 100, 1),
-                        "pin_line": pin_line,       # Pinnacle's current line (e.g. 8.0)
-                        "kalshi_line": threshold,   # Kalshi's current threshold (e.g. 8.5)
+                        "adj_edge":   round(yes_adj, 4),
+                        "kalshi":     round(yes_ask, 4),
+                        "fair":       round(fair, 4),
+                        "edge_pct":   round(yes_adj * 100, 1),
+                        "kalshi_line": threshold,   # Kalshi threshold (e.g. 8.0)
                     }
                     market_snapshot[f"{_snap_ticker}|NO"] = {
-                        "adj_edge": round(no_adj, 4),
-                        "kalshi":   round(1 - yes_bid, 4),
-                        "fair":     round(1 - fair, 4),
-                        "edge_pct": round(no_adj * 100, 1),
-                        "pin_line": pin_line,
+                        "adj_edge":   round(no_adj, 4),
+                        "kalshi":     round(1 - yes_bid, 4),
+                        "fair":       round(1 - fair, 4),
+                        "edge_pct":   round(no_adj * 100, 1),
                         "kalshi_line": threshold,
                     }
 

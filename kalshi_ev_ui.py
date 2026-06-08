@@ -1957,7 +1957,9 @@ def _alert_top10(newly_logged: list = None):
                 (h for k2, h in _edge_price_history.items() if k2.startswith(f"{matchup}|")),
                 None,
             )
-        pin_shift = hist.get("last_pin_pct", 0) - hist.get("first_pin_pct", 0) if hist else None
+        _last_pin  = hist.get("last_pin_pct")  if hist else None
+        _first_pin = hist.get("first_pin_pct") if hist else None
+        pin_shift  = (_last_pin - _first_pin) if (_last_pin is not None and _first_pin is not None) else None
         if pin_shift is not None and hist.get("first_pin_pct") is not None:
             reason = f"Pinnacle shifted {pin_shift:+.1f}pp" if abs(pin_shift) >= 1 else "Kalshi price corrected"
         else:

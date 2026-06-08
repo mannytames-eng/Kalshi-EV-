@@ -183,7 +183,7 @@ PERF_BANKROLL        = 1000.0    # bankroll for ROI % display
 
 # ── Paper trading portfolio ────────────────────────────────────────────────────
 PAPER_START_BALANCE  = 1000.0    # starting virtual bankroll
-PAPER_START_DATE     = "2026-06-07"  # V2.0 reset — pre-throttle history archived
+PAPER_START_DATE     = "2026-06-08"  # V2.0 reset — pre-throttle + Jun 7 bad-pipeline bets archived
 PAPER_KELLY_FRACTION = 0.25     # quarter-Kelly base fraction
 PAPER_KELLY_CAP      = 0.03     # max 3% of current balance per bet (validation-phase cap)
 
@@ -4816,7 +4816,7 @@ async function fetchPaper() {
       </div>
     </div>
     <div style="padding:6px 12px;border-bottom:1px solid var(--border);background:#0d1117;">
-      <span style="font-size:11px;color:var(--muted);">📊 V2.0 reset Jun 7 2026 · <strong style="color:var(--text);">props ≥2.5% · games ≥3%</strong> · 0.5 Kelly (time-throttled: ×0.25 / ×0.50 / ×1.0) · 3% max stake · compounding from $${d.start_balance.toFixed(0)} since ${d.start_date} · CLV captured every 2 min until game start</span>
+      <span style="font-size:11px;color:var(--muted);">📊 V2.0 reset Jun 8 2026 ·<strong style="color:var(--text);">props ≥2.5% · games ≥3%</strong> · 0.5 Kelly (time-throttled: ×0.25 / ×0.50 / ×1.0) · 3% max stake · compounding from $${d.start_balance.toFixed(0)} since ${d.start_date} · CLV captured every 2 min until game start</span>
     </div>`;
 
     // ── Bet table ──────────────────────────────────────────────────────────

@@ -705,8 +705,8 @@ def _add_new_bets(edges: list) -> list:
             # on a prop carries far more variance than 3% on a total or spread,
             # so we require a 7% minimum before logging or staking.
             # Game lines (total, spread) remain at the global 3% floor.
-            if e.get("mkt_type") == "prop" and e.get("edge_pct", 0) < 7.0:
-                print(f"  PASS (prop <7%): {e.get('title','')} "
+            if e.get("mkt_type") == "prop" and e.get("edge_pct", 0) < 2.5:
+                print(f"  PASS (prop <2.5%): {e.get('title','')} "
                       f"{e.get('side','')} edge={e.get('edge_pct',0):.1f}% — skipped")
                 continue
 
@@ -3275,7 +3275,7 @@ HTML = """<!DOCTYPE html>
 
 
 <div id="paper-card" class="card">
-  <div class="card-header" onclick="toggleCard('paper-body')" style="border-left:3px solid #3fb950;">📊 PAPER PORTFOLIO (V2.0 - POST-THROTTLE) — 0.5 Kelly · Props 7%+ · Games 3%+ · $1,000 Starting Balance <span class="card-toggle" id="paper-body-toggle">▾</span></div>
+  <div class="card-header" onclick="toggleCard('paper-body')" style="border-left:3px solid #3fb950;">📊 PAPER PORTFOLIO (V2.0 - POST-THROTTLE) — 0.5 Kelly · Props 2.5%+ · Games 3%+ · $1,000 Starting Balance <span class="card-toggle" id="paper-body-toggle">▾</span></div>
   <div id="paper-body" class="card-body"><div class="empty"><span class="spinner"></span>Loading portfolio…</div></div>
 </div>
 
@@ -4816,7 +4816,7 @@ async function fetchPaper() {
       </div>
     </div>
     <div style="padding:6px 12px;border-bottom:1px solid var(--border);background:#0d1117;">
-      <span style="font-size:11px;color:var(--muted);">📊 V2.0 reset Jun 7 2026 · <strong style="color:var(--text);">props ≥7% · games ≥3%</strong> · 0.5 Kelly (time-throttled: ×0.25 / ×0.50 / ×1.0) · 3% max stake · compounding from $${d.start_balance.toFixed(0)} since ${d.start_date} · CLV captured every 2 min until game start</span>
+      <span style="font-size:11px;color:var(--muted);">📊 V2.0 reset Jun 7 2026 · <strong style="color:var(--text);">props ≥2.5% · games ≥3%</strong> · 0.5 Kelly (time-throttled: ×0.25 / ×0.50 / ×1.0) · 3% max stake · compounding from $${d.start_balance.toFixed(0)} since ${d.start_date} · CLV captured every 2 min until game start</span>
     </div>`;
 
     // ── Bet table ──────────────────────────────────────────────────────────

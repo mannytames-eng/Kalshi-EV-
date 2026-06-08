@@ -1221,6 +1221,21 @@ def _get_performance(since: Optional[str] = None) -> dict:
     ]
     avg_clv  = round(sum(b["clv"] for b in clv_bets) / len(clv_bets), 1) if clv_bets else None
 
+    # ── CLV source breakdown — exposes how much of avg_clv is real vs proxy ──
+    # "pin"       = true closing line: pre-close Pinnacle fetch fired and got a fresh
+    #               probability for the exact entry threshold. Most trustworthy.
+    # "pin_entry" = Pinnacle prob at detection time (not at close). CLV ≈ original
+    #               entry edge — not a real closing-line measurement. Inflates avg_clv.
+    # "kalshi"    = Kalshi bid/ask drift only (no Pinnacle reference). Noisier signal.
+    clv_by_source: dict = {}
+    for src in ("pin", "pin_entry", "kalshi"):
+        src_bets = [b for b in clv_bets if b.get("clv_source") == src]
+        if src_bets:
+            clv_by_source[src] = {
+                "count":   len(src_bets),
+                "avg_clv": round(sum(b["clv"] for b in src_bets) / len(src_bets), 1),
+            }
+
     # Average line movement — settled game lines only (open bets have no real closing line yet)
     line_moves = []
     for b in gl_bets:
@@ -1432,6 +1447,7 @@ def _get_performance(since: Optional[str] = None) -> dict:
         "days_since_last_bet":  days_since_last_bet,
         "source_audit":         source_audit,      # win-rate by (mkt_type, clv_source) — warns if <38%
         "corrupted_excluded":   corrupted_count,   # bets excluded from stats (data-quality)
+        "clv_by_source":        clv_by_source,     # {pin/pin_entry/kalshi: {count, avg_clv}}
     }
 
 
@@ -4369,6 +4385,41 @@ function renderPerformance(d) {
        </p>`
     : '';
 
+  // CLV source breakdown — shows how much of avg_clv is real vs proxy measurement
+  const clvSrc = d.clv_by_source || {};
+  const clvSrcRows = [
+    { key: 'pin',       label: 'True Close (PIN)',  tip: 'Pre-close Pinnacle fetch fired — probability measured at the actual closing line. Most accurate.' },
+    { key: 'pin_entry', label: 'Entry Snap (PIN)',  tip: 'Pinnacle probability captured at flag time, not close. CLV ≈ original detected edge — inflates the blended average.' },
+    { key: 'kalshi',    label: 'Kalshi Drift',      tip: 'No Pinnacle reference — CLV measured from Kalshi bid/ask movement only. Noisier signal.' },
+  ].filter(r => clvSrc[r.key]).map(r => {
+    const s   = clvSrc[r.key];
+    const cls = s.avg_clv > 0 ? 'pnl-pos' : s.avg_clv < 0 ? 'pnl-neg' : '';
+    const isPinEntry = r.key === 'pin_entry';
+    return `<tr>
+      <td style="font-size:11px;padding:4px 10px;" title="${r.tip}">
+        ${r.label}${isPinEntry ? ' <span style="color:#e3a53a;font-size:9px;">≈ entry edge, not CLV</span>' : ''}
+      </td>
+      <td class="num" style="font-size:11px;padding:4px 10px;color:var(--muted);">${s.count} bets</td>
+      <td class="num" style="font-size:11px;padding:4px 10px;">
+        <span class="${cls}">${s.avg_clv > 0 ? '+' : ''}${s.avg_clv}%</span>
+      </td>
+    </tr>`;
+  }).join('');
+  const clvBreakdown = clvSrcRows ? `
+    <div style="margin:0 0 10px;border:1px solid var(--border);border-radius:6px;overflow:hidden;">
+      <div style="padding:6px 10px;background:#161b22;font-size:10px;font-weight:600;color:var(--muted);text-transform:uppercase;letter-spacing:.05em;border-bottom:1px solid var(--border);">
+        CLV Source Breakdown — what's behind the Avg CLV number
+      </div>
+      <table style="width:100%;border-collapse:collapse;">
+        <thead><tr>
+          <th style="font-size:10px;color:var(--muted);text-transform:uppercase;padding:4px 10px;text-align:left;">Source</th>
+          <th class="num" style="font-size:10px;color:var(--muted);text-transform:uppercase;padding:4px 10px;">Sample</th>
+          <th class="num" style="font-size:10px;color:var(--muted);text-transform:uppercase;padding:4px 10px;">Avg CLV</th>
+        </tr></thead>
+        <tbody>${clvSrcRows}</tbody>
+      </table>
+    </div>` : '';
+
   // Edge health: color based on absolute value vs the 3% betting threshold,
   // not relative to all-time avg. Red = genuinely bad (below threshold or no data).
   const recentEdge    = d.recent_avg_edge;
@@ -4404,10 +4455,11 @@ function renderPerformance(d) {
       ${pill('Edge (14d)', recentEdgeVal)}
       ${pill('Last Bet', lastBetVal)}
       ${pill('Kelly P&amp;L (% bank)', d.total_kelly_pct != null ? `<span class="${kellyPctClass}">${sign(d.total_kelly_pct)}${d.total_kelly_pct.toFixed(2)}%</span>` : '—')}
-      ${pill('Avg CLV', d.avg_clv != null ? `<span class="${d.avg_clv >= 0 ? 'pnl-pos' : 'pnl-neg'}">${d.avg_clv > 0 ? '+' : ''}${d.avg_clv}%</span>` : '—')}
+      ${pill('Avg CLV', d.avg_clv != null ? `<span class="${d.avg_clv >= 0 ? 'pnl-pos' : 'pnl-neg'}" title="Blended across all CLV sources — see breakdown below">${d.avg_clv > 0 ? '+' : ''}${d.avg_clv}%</span>` : '—')}
       ${pill('Avg Line Move', d.avg_line_move != null ? `<span class="${d.avg_line_move >= 0 ? 'pnl-pos' : 'pnl-neg'}">${d.avg_line_move > 0 ? '+' : ''}${d.avg_line_move}¢</span>` : '—')}
       <div class="stat-pill"><div class="label">Model vs Market</div><div class="value">${modelCallout}</div></div>
     </div>
+    ${clvBreakdown}
     ${penaltyNote}
     <p style="font-size:11px;color:var(--muted);padding-bottom:10px;">
       P&amp;L sized by <strong>0.25 Fractional Kelly</strong>, capped at 5% per bet.

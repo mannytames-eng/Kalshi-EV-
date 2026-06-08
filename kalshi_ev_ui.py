@@ -2484,9 +2484,17 @@ def _background_loop():
 
 RESOLUTION_POLL_SECONDS  = 5 * 60   # check for settled games every 5 minutes
 CLV_CAPTURE_SECONDS      = 60       # refresh closing prices for open bets every 60 sec
-PRE_CLOSE_WINDOW_MINUTES = 20       # fetch fresh Pinnacle within this many minutes of gametime
+PRE_CLOSE_WINDOW_MINUTES = 45       # outer window: start capturing Pinnacle within 45 min of gametime
+PRE_CLOSE_FINAL_MINUTES  = 10       # inner window: re-capture within 10 min for the true closing line
 
-_pre_close_refresh_done: set = set()   # bet IDs that had a pre-close Pinnacle fetch this session
+# Two-stage pre-close capture:
+#   Stage 1 (early)  — fires when 10 < mins_to_start ≤ 45. Gets a baseline.
+#   Stage 2 (final)  — fires when mins_to_start ≤ 10. Overwrites with the
+#                       truest available closing line, closest to first pitch.
+# Tracking sets are session-only; Railway restarts reset them (acceptable —
+# the CLV loop will pick up last_pin_pct from edge history as a fallback).
+_pre_close_early_done: set = set()    # bet IDs that completed stage-1 capture
+_pre_close_final_done: set = set()    # bet IDs that completed stage-2 (final) capture
 _odds_refresh_lock = threading.Lock()  # prevents concurrent Pinnacle fetches across threads
 
 
@@ -2612,7 +2620,7 @@ def _maybe_fetch_pre_close_pinnacle():
     Costs 1 Odds API credit per sport needed (max 2). Thread-safe — skips if the
     regular odds loop is already fetching (data will be fresh enough).
     """
-    global _pre_close_refresh_done, _cached_mlb_index, _cached_nba_index
+    global _pre_close_early_done, _pre_close_final_done, _cached_mlb_index, _cached_nba_index
 
     now_utc = datetime.now(timezone.utc)
     with _bets_lock:
@@ -2621,14 +2629,14 @@ def _maybe_fetch_pre_close_pinnacle():
     if not open_bets:
         return
 
-    # Identify which bets need a pre-close fetch and which sports are needed
+    # Identify which bets need a pre-close fetch and which sports are needed.
+    # Two-stage: early capture (10–45 min out) then final capture (≤10 min out).
+    # A bet gets a second fetch when it crosses into the final window, overwriting
+    # the early snapshot with the truest available closing line.
     bets_to_refresh: List[dict] = []
     sports_needed:   set        = set()
 
     for bet in open_bets:
-        if bet["id"] in _pre_close_refresh_done:
-            continue
-
         game_start = _parse_ticker_start_time(bet.get("ticker", ""))
         if game_start is None:
             gt = bet.get("game_time")
@@ -2641,12 +2649,27 @@ def _maybe_fetch_pre_close_pinnacle():
             continue
 
         mins_to_start = (game_start - now_utc).total_seconds() / 60
-        # Window: -5 to +PRE_CLOSE_WINDOW_MINUTES (negative = already started but not frozen yet)
-        if -5.0 <= mins_to_start <= PRE_CLOSE_WINDOW_MINUTES:
-            ticker = bet.get("ticker", "").upper()
-            sport  = "basketball_nba" if ticker.startswith("KXNBA") else "baseball_mlb"
-            sports_needed.add(sport)
-            bets_to_refresh.append(bet)
+
+        # Outside capture window entirely — skip
+        if mins_to_start > PRE_CLOSE_WINDOW_MINUTES or mins_to_start < -5.0:
+            continue
+
+        in_final_window = mins_to_start <= PRE_CLOSE_FINAL_MINUTES
+        bid = bet["id"]
+
+        if in_final_window:
+            # Stage 2: final capture — skip only if already done the final fetch
+            if bid in _pre_close_final_done:
+                continue
+        else:
+            # Stage 1: early capture — skip if either stage already done
+            if bid in _pre_close_early_done or bid in _pre_close_final_done:
+                continue
+
+        ticker = bet.get("ticker", "").upper()
+        sport  = "basketball_nba" if ticker.startswith("KXNBA") else "baseball_mlb"
+        sports_needed.add(sport)
+        bets_to_refresh.append(bet)
 
     if not bets_to_refresh:
         return
@@ -2711,10 +2734,25 @@ def _maybe_fetch_pre_close_pinnacle():
                                 b["clv"] = round(pin_prob - entry_k, 1)
                         break
 
-            _pre_close_refresh_done.add(bet["id"])
+            # Mark which stage completed so the two-stage logic advances correctly
+            game_start_chk = _parse_ticker_start_time(bet.get("ticker", ""))
+            if game_start_chk is None:
+                gt = bet.get("game_time")
+                if gt:
+                    try:
+                        game_start_chk = datetime.fromisoformat(gt.replace("Z", "+00:00"))
+                    except (ValueError, AttributeError):
+                        pass
+            mins_chk = (game_start_chk - now_utc).total_seconds() / 60 if game_start_chk else 999
+            if mins_chk <= PRE_CLOSE_FINAL_MINUTES:
+                _pre_close_final_done.add(bet["id"])
+                stage_label = "FINAL"
+            else:
+                _pre_close_early_done.add(bet["id"])
+                stage_label = "EARLY"
             bets_updated += 1
-            print(f"  Pre-close CLV locked: {bet.get('matchup','')} | "
-                  f"{bet.get('side','')} | PIN close={pin_prob}%")
+            print(f"  Pre-close CLV [{stage_label}] {bet.get('matchup','')} | "
+                  f"{bet.get('side','')} | PIN close={pin_prob}% | {mins_chk:.0f} min to game")
 
         if bets_updated:
             with _bets_lock:

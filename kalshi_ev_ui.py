@@ -4371,17 +4371,18 @@ function closeValidateModal() {
 // ── Performance ───────────────────────────────────────────────────────────────
 async function fetchPerformance() {
   try {
-    const since = (document.getElementById('perf-since') || {}).value || '';
-    const url   = since ? `/api/performance?since=${encodeURIComponent(since)}` : '/api/performance';
+    const V2_START = '2026-06-08';
+    const since = (document.getElementById('perf-since') || {}).value || V2_START;
+    const url   = `/api/performance?since=${encodeURIComponent(since)}`;
     const r = await fetch(url);
     const d = await r.json();
     // update filter label
     const lbl = document.getElementById('perf-filter-label');
     if (lbl) {
       if (since) {
-        const isDefault = since === '2026-04-07';
+        const isDefault = since === V2_START;
         lbl.textContent = isDefault
-          ? `Post-fix only (from ${since}) — clear to see all bets`
+          ? `V2.0 data only (from ${since}) — clear to see all bets`
           : `Showing bets from ${since} onward`;
         lbl.style.color = isDefault ? 'var(--muted)' : 'var(--yellow, #ffe082)';
       } else {
@@ -5236,9 +5237,11 @@ class Handler(BaseHTTPRequestHandler):
 
         elif path == "/api/performance":
             # optional ?since=YYYY-MM-DD  (ISO date, inclusive lower bound)
+            # Defaults to PAPER_START_DATE so pre-V2.0 bets are excluded from
+            # all CLV / line-move aggregations unless the caller overrides.
             from urllib.parse import urlparse, parse_qs
             qs    = parse_qs(urlparse(self.path).query)
-            since = qs.get("since", [None])[0]
+            since = qs.get("since", [PAPER_START_DATE])[0]
             payload = json.dumps(_get_performance(since=since)).encode()
             self._send(200, "application/json", payload)
 

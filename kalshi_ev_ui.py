@@ -2482,10 +2482,26 @@ def _lookup_pin_prob_for_bet(bet: dict, game_idx: dict) -> Optional[float]:
     """
     Extract Pinnacle's current no-vig probability for a bet's side from a game index.
     Returns the probability as a percentage (e.g. 47.8), or None if not found.
-    Uses pin_lines for exact threshold matching on totals; falls back to main line.
+
+    Line-matching priority for totals (prevents stale-line CLV mismatch):
+      1. pin_line_at_flag — the exact Pinnacle line active when the edge was detected.
+         If Pinnacle still posts odds for that specific hook (e.g. 7.5 even after the
+         main line moved to 8.5), we use those odds so CLV measures the same threshold
+         we entered at.  This is the fix for the "line moved from 7.5→8.5" audit finding.
+      2. Kalshi-threshold-derived line — parse ticker suffix (e.g. -8 → 8.0, implies
+         Pinnacle 7.5) as a secondary target when pin_line_at_flag is absent (bets
+         flagged before today's deploy won't have it stored).
+      3. Pinnacle main line — current posted line regardless of what we entered at.
+         Only used when neither #1 nor #2 finds a match in pin_lines.
+      4. Consensus probability — last resort when Pinnacle per_book is absent.
+
+    Logs a warning when the entry line is no longer in Pinnacle's alternate array
+    so we can audit cases where the closing reference had to fall back.
     """
     if not game_idx:
         return None
+
+    import re as _re2
 
     mkt_type = bet.get("mkt_type", "total")
     side     = bet.get("side", "YES")
@@ -2509,32 +2525,62 @@ def _lookup_pin_prob_for_bet(bet: dict, game_idx: dict) -> Optional[float]:
         if not total_info:
             return None
 
-        # Parse Kalshi floor threshold from ticker suffix (e.g. KXMLBTOTAL-...-8 → 8)
+        pin_lines = total_info.get("pin_lines", {})  # {float_pt: {over_prob, under_prob}}
+
+        def _prob_from_pin_lines(target_line: float) -> Optional[float]:
+            """Look up over/under prob for target_line in pin_lines (tolerance ±0.26)."""
+            for pt, probs in pin_lines.items():
+                if abs(float(pt) - target_line) <= 0.26:
+                    prob = probs.get("over_prob") if side == "YES" else probs.get("under_prob")
+                    if prob is not None:
+                        return round(prob * 100, 1)
+            return None
+
+        # ── Priority 1: pin_line_at_flag (exact entry-time Pinnacle line) ──────
+        # This is the critical fix — ensures CLV is always measured at the hook
+        # we actually entered, even if Pinnacle's main line has since moved.
+        pin_line_at_flag = bet.get("pin_line_at_flag")
+        if pin_line_at_flag is not None and pin_lines:
+            result = _prob_from_pin_lines(float(pin_line_at_flag))
+            if result is not None:
+                return result
+            # Entry line no longer in Pinnacle's alternate array — log and fall through
+            print(f"  CLV lookup: entry line {pin_line_at_flag} not in PIN alternates "
+                  f"for {matchup} ({side}) — falling back to Kalshi-threshold method. "
+                  f"Available PIN lines: {sorted(pin_lines.keys())}")
+
+        # ── Priority 2: Kalshi-threshold-derived Pinnacle line ─────────────────
+        # Parse ticker suffix (e.g. KXMLBTOTAL-...-8 → threshold=8.0).
+        # Kalshi floor N maps to Pinnacle line N-0.5 (both require >N-0.5 runs).
+        # Try both the direct value and the N-0.5 convention.
         threshold = None
-        import re as _re2
         m = _re2.search(r"-(\d+(?:\.\d+)?)$", ticker)
         if m:
             threshold = float(m.group(1))
 
-        # Try exact / near-exact match in pin_lines first
-        pin_lines = total_info.get("pin_lines", {})
         if threshold is not None and pin_lines:
-            for pt, probs in pin_lines.items():
-                # Kalshi floor N matches Pinnacle line N-0.5 (both need N+ runs)
-                if abs(float(pt) - (threshold - 0.5)) <= 0.26 or abs(float(pt) - threshold) <= 0.26:
-                    prob = probs.get("over_prob") if side == "YES" else probs.get("under_prob")
-                    if prob is not None:
-                        return round(prob * 100, 1)
+            # Try Kalshi-floor convention (N → Pinnacle N-0.5) first, then direct
+            for target in (threshold - 0.5, threshold):
+                result = _prob_from_pin_lines(target)
+                if result is not None:
+                    return result
 
-        # Fall back to Pinnacle's per_book main line
+        # ── Priority 3: Pinnacle per_book main line ────────────────────────────
+        # Current posted main line — may differ from entry line if market moved.
+        # Only reached when neither entry line nor Kalshi threshold found in alternates.
         per_book = total_info.get("per_book", {})
         pin_book = per_book.get("pinnacle", {})
         if pin_book:
             prob = pin_book.get("over_prob") if side == "YES" else pin_book.get("under_prob")
             if prob is not None:
+                if pin_line_at_flag is not None:
+                    main_pt = pin_book.get("over_point", "?")
+                    print(f"  CLV lookup: using PIN main line {main_pt} (entry was "
+                          f"{pin_line_at_flag}) for {matchup} {side} — line moved, "
+                          f"CLV will be approximate")
                 return round(prob * 100, 1)
 
-        # Last resort: consensus
+        # ── Priority 4: Consensus (last resort) ────────────────────────────────
         prob = total_info.get("over_prob") if side == "YES" else total_info.get("under_prob")
         return round(prob * 100, 1) if prob is not None else None
 

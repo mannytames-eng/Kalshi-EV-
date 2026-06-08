@@ -8,6 +8,7 @@ Open: http://localhost:8000
 import json
 import os
 import sys
+import traceback
 import threading
 import time
 from datetime import datetime, timezone
@@ -2478,6 +2479,7 @@ def _background_loop():
             _run_scan()
         except Exception as exc:
             print(f"  Scan loop error: {exc}")
+            traceback.print_exc()
         time.sleep(REFRESH_SECONDS)
 
 

@@ -5034,7 +5034,7 @@ document.addEventListener('visibilitychange', () => {
 // Clear the date field and click Refresh to see all historical bets.
 (function() {
   const inp = document.getElementById('perf-since');
-  if (inp && !inp.value) inp.value = '2026-04-07';
+  if (inp && !inp.value) inp.value = '2026-06-08';  // V2.0 baseline — pre-throttle data excluded
 })();
 fetchData();
 fetchHistory();

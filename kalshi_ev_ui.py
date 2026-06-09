@@ -4405,6 +4405,7 @@ async function fetchPerformance() {
 }
 
 function renderPerformance(d) {
+  let perfBodyHtml = '';   // accumulate all perf-body sections; written once at the end
   function pill(label, value, cls) {
     return `<div class="stat-pill"><div class="label">${label}</div><div class="value ${cls||''}">${value}</div></div>`;
   }
@@ -4550,7 +4551,7 @@ function renderPerformance(d) {
         <td class="num">${clvCell}</td>
       </tr>`;
     }).join('');
-    _setHTML('perf-body', `
+    perfBodyHtml += `
       <table style="margin-bottom:8px;">
         <thead><tr>
           <th>Market Type</th><th class="num">Won</th><th class="num">Lost</th>
@@ -4559,7 +4560,7 @@ function renderPerformance(d) {
           <th class="num" title="Avg CLV — how much the market moved in your favour after entry (pp = percentage points). Positive = beating the closing line.">Avg CLV</th>
         </tr></thead>
         <tbody>${typeRows}</tbody>
-      </table>`);
+      </table>`;
   }
 
   // ── Data-quality audit table ─────────────────────────────────────────────
@@ -4575,7 +4576,7 @@ function renderPerformance(d) {
       </tr>`;
     }).join('');
     const headerCls = hasWarn ? 'pnl-neg' : '';
-    document.getElementById('perf-body').innerHTML += `
+    perfBodyHtml += `
       <details style="margin-bottom:12px;">
         <summary style="cursor:pointer;font-size:12px;color:var(--muted);user-select:none;">
           <span class="${headerCls}">Data-quality audit${hasWarn ? ' ⚠ — one or more buckets below 38% win rate' : ''}</span>
@@ -4595,14 +4596,16 @@ function renderPerformance(d) {
   }
 
   if (!d.bets.length) {
-    document.getElementById('perf-body').innerHTML +=
-      '<div class="empty">No bets tracked yet — edges appear after the next scan.</div>';
+    perfBodyHtml += '<div class="empty">No bets tracked yet — edges appear after the next scan.</div>';
+    _setHTML('perf-body', perfBodyHtml);
     return;
   }
 
   const PERF_PREVIEW = 15;
-  const allPerfBets  = d.bets.filter(b => b.clv_source !== 'corrupted_utc');
-  const corruptBets  = d.bets.filter(b => b.clv_source === 'corrupted_utc');
+  // Sort newest-first so most recent action is immediately visible
+  const sortedBets   = [...d.bets].sort((a, b) => (b.flagged_at || '').localeCompare(a.flagged_at || ''));
+  const allPerfBets  = sortedBets.filter(b => b.clv_source !== 'corrupted_utc');
+  const corruptBets  = sortedBets.filter(b => b.clv_source === 'corrupted_utc');
   const showAllPerf  = window._perfShowAll || false;
   const visiblePerf  = showAllPerf ? allPerfBets : allPerfBets.slice(0, PERF_PREVIEW);
 
@@ -4729,7 +4732,8 @@ function renderPerformance(d) {
       </details>`;
   }
 
-  document.getElementById('perf-body').innerHTML += perfTableHtml;
+  perfBodyHtml += perfTableHtml;
+  _setHTML('perf-body', perfBodyHtml);
 
 }
 

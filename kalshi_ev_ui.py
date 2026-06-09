@@ -119,22 +119,26 @@ def _odds_refresh_interval() -> int:
       MLB odds call: 4 credits (spreads+totals+alternate_spreads+alternate_totals)
 
     Operating windows (PDT = UTC-7):
-      Discovery    09:00–13:00 PDT (4h):  3min — morning line-setting, lower cadence
-      Peak Trading 13:00–22:00 PDT (9h): 75s  — live game hours, fast line capture
-      Sleep        22:00–09:00 PDT (11h): 15min — overnight, minimal market movement
+      Early Morning 06:00–09:00 PDT (3h): 90s  — overnight line gaps, Kalshi slow to reprice
+      Discovery     09:00–13:00 PDT (4h):  3min — morning line-setting, lower cadence
+      Peak Trading  13:00–22:00 PDT (9h): 75s  — live game hours, fast line capture
+      Sleep         22:00–06:00 PDT (8h): 15min — overnight, minimal market movement
 
-    Game-slate short-circuit (Task 2): if all MLB games have commenced during
+    Game-slate short-circuit: if all MLB games have commenced during
     Peak Trading, automatically drops to Sleep rates to conserve credits.
 
     Odds credit budget:
-      Discovery    (20/hr ×  4h × 4):   320/day
-      Peak Trading (48/hr ×  9h × 4): 1,728/day
-      Sleep         (4/hr × 11h × 4):   176/day
-      Total odds: ~2,224/day
+      Early Morning (40/hr ×  3h × 4):   480/day
+      Discovery     (20/hr ×  4h × 4):   320/day
+      Peak Trading  (48/hr ×  9h × 4): 1,728/day
+      Sleep          (4/hr ×  8h × 4):   128/day
+      Total odds: ~2,656/day
     """
     h = _pdt_hour()
     if 13 <= h < 22 and _all_games_commenced():
         return 15 * 60       # Slate over — drop to Sleep rates early
+    if 6  <= h <  9:
+        return 90            # Early Morning: 90s — best window for overnight line gaps
     if 9  <= h < 13:
         return  3 * 60       # Discovery: 3min
     if 13 <= h < 22:
@@ -146,7 +150,8 @@ def _props_refresh_interval() -> int:
 
     Discovery    09:00–13:00 PDT: 10min — pre-game lines forming
     Peak Trading 13:00–22:00 PDT:  8min — lineups locked, scratches happen here
-    Sleep        22:00–09:00 PDT:  OFF  — no upcoming games, save credits
+    Early Morning 06:00–09:00 PDT: 15min — pitcher scratches + overnight line gaps
+    Sleep         22:00–06:00 PDT:  OFF  — no upcoming games, save credits
 
     Game-slate short-circuit: mirrors odds logic — props off when slate over.
 
@@ -155,14 +160,17 @@ def _props_refresh_interval() -> int:
     pitcher scratch.  Scanning 3× more often catches those windows.
 
     Props credit budget (~21 credits/scan: 1 event list + 10 games × 2 markets):
-      Discovery    (7.5/hr ×  4h × 21):  630/day
-      Peak Trading (  6/hr ×  9h × 21): 1,134/day
+      Early Morning (4/hr  ×  3h × 21):  252/day
+      Discovery     (6/hr  ×  4h × 21):  504/day  (was 7.5/hr at 10min)
+      Peak Trading  (7.5/hr × 9h × 21): 1,418/day
       Sleep:                                0/day
-      Total props: ~1,764/day  (well within 100k credit budget)
+      Total props: ~2,174/day
     """
     h = _pdt_hour()
     if 13 <= h < 22 and _all_games_commenced():
         return 10 ** 9       # Slate over — props off
+    if 6  <= h <  9:
+        return 15 * 60       # Early Morning: 15min — starter scratches post overnight
     if 9  <= h < 13:
         return 10 * 60       # Discovery: 10min
     if 13 <= h < 22:

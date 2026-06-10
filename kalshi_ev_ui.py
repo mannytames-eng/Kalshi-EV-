@@ -714,8 +714,8 @@ def _add_new_bets(edges: list) -> list:
             # on a prop carries far more variance than 3% on a total or spread,
             # so we require a 7% minimum before logging or staking.
             # Game lines (total, spread) remain at the global 3% floor.
-            if e.get("mkt_type") == "prop" and e.get("edge_pct", 0) < 2.5:
-                print(f"  PASS (prop <2.5%): {e.get('title','')} "
+            if e.get("mkt_type") == "prop" and e.get("edge_pct", 0) < 1.5:
+                print(f"  PASS (prop <1.5%): {e.get('title','')} "
                       f"{e.get('side','')} edge={e.get('edge_pct',0):.1f}% — skipped")
                 continue
 
@@ -1630,7 +1630,7 @@ def _settle_my_bets():
 
 
 # ── Twilio SMS alerts ─────────────────────────────────────────────────────────
-_ALERT_MIN    = float(os.getenv("ALERT_MIN_EDGE", "0.03"))  # Discord alerts at ≥3% edge (matches .env default)
+_ALERT_MIN    = float(os.getenv("ALERT_MIN_EDGE", "0.015"))  # Discord alerts at ≥1.5% edge (matches EDGE_THRESHOLD)
 _BET_SIZE     = float(os.getenv("ALERT_BET_SIZE", "20"))
 
 # ── Discord webhook alert config ───────────────────────────────────────────────

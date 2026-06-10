@@ -58,11 +58,10 @@ ODDS_BASE   = "https://api.the-odds-api.com/v4"
 # For a typical 52% fair / 45¢ entry, this costs ~2pp of the apparent edge.
 # A raw gap of 3% becomes ~0.9% true EV — still positive but thin.
 KALSHI_FEE_RATE    = 0.07    # Kalshi profit fee (7% of winnings) — update if tier changes
-EDGE_THRESHOLD     = 0.03    # ≥3% fee+haircut-adjusted EV to flag (matches ALERT_MIN_EDGE)
-                             # Equivalent to ~4.5–5% raw gap before fees and haircut.
+EDGE_THRESHOLD     = 0.015   # ≥1.5% fee+haircut-adjusted EV to flag
 MAX_EDGE           = 0.20    # reject edges >20% — almost certainly a stale line
-EV_HAIRCUT         = 0.10    # model-uncertainty discount (separate from fee)
-TOP_BETS_PER_CYCLE = 25      # surface up to 25 qualifying bets per scan
+EV_HAIRCUT         = 0.05    # model-uncertainty discount (5%)
+TOP_BETS_PER_CYCLE = 50      # surface up to 50 qualifying bets per scan
 MAX_BETS_PER_GROUP = 2       # max bets per (matchup, mkt_type) group
 
 # Minimum Kalshi price for any side we'll consider betting.
@@ -71,7 +70,7 @@ MAX_BETS_PER_GROUP = 2       # max bets per (matchup, mkt_type) group
 # ">8.5 runs") or rare-event props where model error is amplified.
 MIN_KALSHI_PRICE   = 0.15
 
-MAX_PROP_EVENTS = 10         # prop scan credit budget — MLB only (10 events × 1 credit each)
+MAX_PROP_EVENTS = 15         # prop scan credit budget — MLB only (15 events × 1 credit each)
 
 # ── Book weights for consensus probability ───────────────────────────────────
 # Fair value is Pinnacle ONLY — the sharpest closing-line book.

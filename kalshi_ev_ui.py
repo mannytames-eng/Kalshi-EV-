@@ -775,7 +775,8 @@ def _add_new_bets(edges: list) -> list:
                 "pnl":                None,
                 "closing_yes_pct":    kalshi_yes_at_flag,   # init to entry; CLV loop overwrites
                 "closing_pin_pct":    None,                 # Pinnacle side-prob at close; CLV loop fills
-                "clv":                0.0,                  # init to 0; CLV loop overwrites
+                "clv":                0.0,                  # pp form: closing_pin - entry_k
+                "clv_pct":            None,                 # ROI form: (clv / entry_k) * 100
                 "paper_stake":        paper_stake,           # Kelly-sized virtual wager
                 "paper_pnl":          None,                  # set on resolution
                 "correlated":         is_correlated,         # excluded from win-rate/Kelly stats
@@ -930,6 +931,18 @@ def _resolve_from_score(bet: dict, score_index: dict) -> Optional[bool]:
     return None
 
 
+def _clv_pct(clv_pp: float, entry_k: float) -> Optional[float]:
+    """ROI form of CLV: how much the entry price appreciated vs fair value at close.
+    clv_pp  — raw pp difference (closing_pin - entry_k), already computed
+    entry_k — Kalshi entry price in cents (e.g. 42.0)
+    Returns percentage ROI rounded to 2dp, or None if inputs are invalid.
+    Example: clv_pp=5.3, entry_k=42.0 → (5.3/42.0)*100 = +12.62%
+    """
+    if not entry_k or clv_pp is None:
+        return None
+    return round((clv_pp / entry_k) * 100, 2)
+
+
 def _check_resolutions():
     """
     Settle open bets via two methods:
@@ -994,15 +1007,19 @@ def _check_resolutions():
                     closing_pin = b.get("closing_pin_pct")
                     entry_k     = b.get("kalshi_price", 0) * 100
                     if closing_pin is not None and entry_k:
-                        b["clv"] = round(closing_pin - entry_k, 1)
+                        _clv = round(closing_pin - entry_k, 1)
+                        b["clv"]     = _clv
+                        b["clv_pct"] = _clv_pct(_clv, entry_k)
                     else:
                         closing_yes = b.get("closing_yes_pct")
                         entry_yes   = b.get("kalshi_yes_at_flag")
                         if closing_yes is not None and entry_yes is not None:
-                            b["clv"] = round(
+                            _clv = round(
                                 closing_yes - entry_yes if b["side"] == "YES"
                                 else entry_yes - closing_yes, 1
                             )
+                            b["clv"]     = _clv
+                            b["clv_pct"] = _clv_pct(_clv, entry_yes)
                     break
         score_resolved_ids.add(bet["id"])
         resolved += 1
@@ -1046,14 +1063,17 @@ def _check_resolutions():
             entry_k   = bet.get("kalshi_price", 0) * 100
             entry_yes = bet.get("kalshi_yes_at_flag")
             clv = None
+            clv_pct_val = None
             if bet_pin_close is not None and entry_k:
                 # True CLV: Pinnacle side-prob at close minus Kalshi entry price.
                 # Positive = sharp market agreed your edge was real at close.
                 clv = round(bet_pin_close - entry_k, 1)
+                clv_pct_val = _clv_pct(clv, entry_k)
             elif bet_closing is not None and entry_yes is not None:
                 # Fallback: Kalshi drift (side-appropriate ask/bid prices)
                 clv = round(bet_closing - entry_yes if bet["side"] == "YES"
                             else entry_yes - bet_closing, 1)
+                clv_pct_val = _clv_pct(clv, entry_yes)
             closing_yes = bet_closing
             with _bets_lock:
                 for b in _bets:
@@ -1064,6 +1084,7 @@ def _check_resolutions():
                         b["closing_yes_pct"] = closing_yes
                         b["closing_pin_pct"] = bet_pin_close
                         b["clv"]             = clv
+                        b["clv_pct"]         = clv_pct_val
                         # Kelly P&L — unified: pnl IS paper_pnl
                         ps = b.get("paper_stake") or 0.0
                         kelly_pnl = round(ps * (1 - k) / k, 2) if side_won else round(-ps, 2)
@@ -2743,7 +2764,9 @@ def _maybe_fetch_pre_close_pinnacle():
                             b["closing_pin_pct"] = pin_prob
                             b["clv_source"]      = "pin"
                             if entry_k:
-                                b["clv"] = round(pin_prob - entry_k, 1)
+                                _clv = round(pin_prob - entry_k, 1)
+                                b["clv"]     = _clv
+                                b["clv_pct"] = _clv_pct(_clv, entry_k)
                         break
 
             # Mark which stage completed so the two-stage logic advances correctly
@@ -2904,17 +2927,21 @@ def _capture_clv_prices():
                         entry_k = b.get("kalshi_price", 0) * 100   # effective bet-side entry price
                         if closing_pin is not None and entry_k:
                             # Primary: true CLV vs Pinnacle closing line.
-                            b["clv"]        = round(closing_pin - entry_k, 1)
+                            _clv = round(closing_pin - entry_k, 1)
+                            b["clv"]        = _clv
+                            b["clv_pct"]    = _clv_pct(_clv, entry_k)
                             b["clv_source"] = "pin"
                         else:
                             # Fallback: Kalshi drift using matched ask/bid prices
                             entry_yes = b.get("kalshi_yes_at_flag")
                             if entry_yes is not None:
-                                b["clv"] = round(
+                                _clv = round(
                                     yes_close_pct - entry_yes if side == "YES"
                                     else entry_yes - yes_close_pct,
                                     1,
                                 )
+                                b["clv"]        = _clv
+                                b["clv_pct"]    = _clv_pct(_clv, entry_yes)
                                 b["clv_source"] = "kalshi"
                             else:
                                 b["clv_source"] = "none"
@@ -4657,14 +4684,28 @@ function renderPerformance(d) {
         closeTxt = `<span style="color:var(--muted);">→ open</span>`;
       } else {
         const pinDelta = parseFloat(pinClose) - parseFloat(entryK);
-        const favorable = pinDelta > 0; // closing_pin_pct is already side-adjusted for YES and NO
+        const favorable = pinDelta > 0;
         const closeColor = pinDelta === 0 ? 'var(--fg)' : favorable ? 'var(--green)' : 'var(--red)';
         closeTxt = `<span style="color:${closeColor};font-weight:600;">→ ${pinClose}¢</span><span style="font-size:9px;color:var(--muted);"> Pin</span>`;
       }
       const pinLine = pinEntry != null
         ? `<div style="font-size:10px;color:var(--muted);margin-top:1px;">Pin at entry: ${pinEntry}¢</div>`
         : '';
-      lineMoveCell = `<div style="white-space:nowrap;"><span style="color:var(--fg);">${entryK}¢</span> ${closeTxt}</div>${pinLine}`;
+      // CLV dual display: "+5.3pp (+12.62%)" — pp form for model accuracy, ROI form for intuition
+      let clvLine = '';
+      if (b.clv != null && b.clv !== 0 && b.status !== 'open') {
+        const clvPp  = b.clv;
+        const clvPct = b.clv_pct != null ? b.clv_pct : null;
+        const clvColor = clvPp > 0 ? 'var(--green)' : 'var(--red)';
+        const clvSign  = clvPp > 0 ? '+' : '';
+        const roiTxt   = clvPct != null
+          ? ` <span style="color:${clvColor};font-size:10px;">(${clvPct > 0 ? '+' : ''}${clvPct}%)</span>`
+          : '';
+        clvLine = `<div style="font-size:11px;margin-top:2px;" title="CLV: ${clvSign}${clvPp}pp (percentage points) | ROI on stake: ${clvPct != null ? (clvPct > 0 ? '+' : '') + clvPct + '%' : '—'}">
+          <span style="color:${clvColor};font-weight:700;">${clvSign}${clvPp}pp</span>${roiTxt}
+        </div>`;
+      }
+      lineMoveCell = `<div style="white-space:nowrap;"><span style="color:var(--fg);">${entryK}¢</span> ${closeTxt}</div>${pinLine}${clvLine}`;
     }
     const corrBadge = b.correlated
       ? `<span title="Correlated — same game/type/side already open. Logged for record; excluded from win rate &amp; Kelly stats." style="font-size:9px;font-weight:700;color:#e3a53a;background:rgba(227,165,58,0.12);border:1px solid rgba(227,165,58,0.3);border-radius:3px;padding:1px 4px;margin-left:5px;vertical-align:middle;">CORR</span>`

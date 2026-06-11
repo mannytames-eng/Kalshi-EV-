@@ -1220,6 +1220,15 @@ def _get_performance(since: Optional[str] = None) -> dict:
     gl_settled = gl_won + gl_lost
     corrupted_count = sum(1 for b in bets if _is_corrupted(b))
 
+    # ── All-market summary (props + game lines) for top-level pills ───────────
+    # Props are now a core market type; game-line-only pills were hiding the
+    # majority of our edges.  Keep gl_* for the by_type breakdown only.
+    all_won     = [b for b in won   if not _is_correlated(b) and not _is_corrupted(b)]
+    all_lost    = [b for b in lost  if not _is_correlated(b) and not _is_corrupted(b)]
+    all_open    = [b for b in open_ if not _is_corrupted(b)]
+    all_settled = all_won + all_lost
+    all_clean   = [b for b in bets  if not _is_corrupted(b)]
+
     # ── Kelly sizing helper ────────────────────────────────────────────────────
     # Mirrors _paper_kelly_stake() exactly so dashboard metrics stay in sync
     # with real-time portfolio tracking.
@@ -1257,13 +1266,13 @@ def _get_performance(since: Optional[str] = None) -> dict:
             return f * (1.0 - k) / k   # profit = stake × net_odds
         return -f                        # loss = −stake (fraction of bankroll)
 
-    # CLV stats — game lines only, settled bets only.
+    # CLV stats — all market types, settled bets only.
     # Open bets have a live-updating clv (current Pinnacle drift) that is NOT a
     # locked closing line.  Including them inflates avg_clv while those bets are
     # showing favourable drift and deflates it when they aren't — phantom signal
     # that has nothing to do with historical model accuracy.
     clv_bets = [
-        b for b in gl_bets
+        b for b in all_clean
         if b.get("clv_source") in ("pin", "pin_entry", "kalshi")
         and b.get("status") in ("won", "lost")   # Restricts the metric to settled history
     ]
@@ -1284,9 +1293,9 @@ def _get_performance(since: Optional[str] = None) -> dict:
                 "avg_clv": round(sum(b["clv"] for b in src_bets) / len(src_bets), 1),
             }
 
-    # Average line movement — settled game lines only (open bets have no real closing line yet)
+    # Average line movement — all settled bets (open bets have no real closing line yet)
     line_moves = []
-    for b in gl_bets:
+    for b in all_clean:
         if b.get("status") not in ("won", "lost"):
             continue
         entry = (b.get("kalshi_price") or 0) * 100
@@ -1296,25 +1305,25 @@ def _get_performance(since: Optional[str] = None) -> dict:
         line_moves.append(close - entry)
     avg_line_move = round(sum(line_moves) / len(line_moves), 1) if line_moves else None
 
-    # Win rate — game lines only
-    win_rate = round(len(gl_won) / len(gl_settled) * 100, 1) if gl_settled else None
+    # Win rate — all market types (props + game lines), non-correlated
+    win_rate = round(len(all_won) / len(all_settled) * 100, 1) if all_settled else None
 
-    # Average entry edge — settled game lines only.
+    # Average entry edge — all settled bets, non-correlated.
     # Intentionally excludes open bets so a freshly-flagged high-edge bet
     # cannot inflate this before it has been proven by outcome.
-    avg_edge = round(sum(b["edge_pct"] for b in gl_settled) / len(gl_settled), 1) if gl_settled else None
+    avg_edge = round(sum(b["edge_pct"] for b in all_settled) / len(all_settled), 1) if all_settled else None
 
-    # Recent edge health — settled game lines flagged in the last 14 days.
+    # Recent edge health — all settled bets flagged in the last 14 days.
     # Used to surface edge compression even when the all-time avg looks fine.
     from datetime import datetime, timezone, timedelta as _td
     _now = datetime.now(timezone.utc)
     _cutoff_14d = (_now - _td(days=14)).isoformat()
     _cutoff_7d  = (_now - _td(days=7)).isoformat()
-    gl_settled_14d = [b for b in gl_settled if b.get("flagged_at", "") >= _cutoff_14d]
-    gl_settled_7d  = [b for b in gl_settled if b.get("flagged_at", "") >= _cutoff_7d]
-    recent_avg_edge    = round(sum(b["edge_pct"] for b in gl_settled_14d) / len(gl_settled_14d), 1) if gl_settled_14d else None
-    recent_bet_count   = len(gl_settled_14d)
-    recent_7d_count    = len(gl_settled_7d)
+    all_settled_14d = [b for b in all_settled if b.get("flagged_at", "") >= _cutoff_14d]
+    all_settled_7d  = [b for b in all_settled if b.get("flagged_at", "") >= _cutoff_7d]
+    recent_avg_edge    = round(sum(b["edge_pct"] for b in all_settled_14d) / len(all_settled_14d), 1) if all_settled_14d else None
+    recent_bet_count   = len(all_settled_14d)
+    recent_7d_count    = len(all_settled_7d)
 
     # Days since the most recent flagged bet (any status, any market type)
     all_flagged = sorted(
@@ -1327,27 +1336,27 @@ def _get_performance(since: Optional[str] = None) -> dict:
     else:
         days_since_last_bet = None
 
-    # ── Flat unit P&L — game lines only ──────────────────────────────────────
+    # ── Flat unit P&L — all market types ─────────────────────────────────────
     unit_pnls = []
-    for b in gl_settled:
+    for b in all_settled:
         k = b["kalshi_price"]
         unit_pnls.append((1 - k) / k if b["status"] == "won" else -1.0)
 
     total_units = round(sum(unit_pnls), 3) if unit_pnls else None
     avg_units   = round(sum(unit_pnls) / len(unit_pnls), 3) if unit_pnls else None
 
-    # ── Kelly-weighted P&L — game lines only ─────────────────────────────────
-    kelly_pnls = [_kelly_pnl(b) for b in gl_settled]
+    # ── Kelly-weighted P&L — all market types ────────────────────────────────
+    kelly_pnls = [_kelly_pnl(b) for b in all_settled]
     kelly_pnls = [x for x in kelly_pnls if x is not None]
 
     total_kelly_units   = round(sum(kelly_pnls), 4)         if kelly_pnls else None
     total_kelly_dollars = round(sum(kelly_pnls) * PERF_BANKROLL, 2) if kelly_pnls else None
     avg_kelly_units     = round(sum(kelly_pnls) / len(kelly_pnls), 4) if kelly_pnls else None
 
-    # Model accuracy — game lines only
-    if gl_settled:
+    # Model accuracy — all market types
+    if all_settled:
         avg_kalshi_implied = round(
-            sum(b["kalshi_price"] * 100 for b in gl_settled) / len(gl_settled), 1
+            sum(b["kalshi_price"] * 100 for b in all_settled) / len(all_settled), 1
         )
     else:
         avg_kalshi_implied = None
@@ -1470,10 +1479,10 @@ def _get_performance(since: Optional[str] = None) -> dict:
         })
 
     return {
-        "total_bets":           len(gl_bets),
-        "won":                  len(gl_won),
-        "lost":                 len(gl_lost),
-        "open":                 len(gl_open),
+        "total_bets":           len(all_clean),
+        "won":                  len(all_won),
+        "lost":                 len(all_lost),
+        "open":                 len(all_open),
         "win_rate":             win_rate,
         "avg_edge":             avg_edge,
         "total_units":          total_units,

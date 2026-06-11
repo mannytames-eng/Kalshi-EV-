@@ -607,11 +607,16 @@ def _bet_id(ticker: str, side: str) -> str:
 
 def _best_edge_per_game(edges: list) -> list:
     """
-    Keep only the single best edge per (matchup, mkt_type, side) group.
-    This eliminates correlated bets on the same game — e.g. if a game has
-    edges at >7.5, >8.5, and >9.5 total runs YES, only the highest-edge one
-    is kept.  YES and NO on the same market are treated as distinct slots so
-    both can surface if both are genuinely +EV.
+    Keep only the single best edge per slot.
+
+    Slot keys:
+      • Props:       (matchup,)               — one bet per player, best edge wins
+                                                regardless of line or side. Prevents
+                                                logging YES on 6+ AND NO on 5+ for
+                                                the same pitcher.
+      • Game lines:  (matchup, mkt_type, side) — YES and NO are independent markets
+                                                (over/under, spread cover/not) so both
+                                                can surface if genuinely +EV.
 
     NOTE: uses the raw 'edge' field (0–1 decimal) so this function is safe to
     call before 'edge_pct' is computed.
@@ -619,15 +624,20 @@ def _best_edge_per_game(edges: list) -> list:
     def _score(e: dict) -> float:
         return e.get("edge_pct", e.get("edge", 0) * 100)
 
+    def _key(e: dict) -> tuple:
+        if e.get("mkt_type") == "prop":
+            return ("prop", e.get("matchup", ""))          # one slot per player
+        return (e.get("matchup", ""), e.get("mkt_type", ""), e.get("side", ""))
+
     best: dict = {}
     for e in edges:
-        key = (e.get("matchup", ""), e.get("mkt_type", ""), e.get("side", ""))
+        key = _key(e)
         if key not in best or _score(e) > _score(best[key]):
             best[key] = e
     seen = set()
     result = []
     for e in edges:
-        key = (e.get("matchup", ""), e.get("mkt_type", ""), e.get("side", ""))
+        key = _key(e)
         if key not in seen and best[key] is e:
             seen.add(key)
             result.append(e)
@@ -692,11 +702,16 @@ def _add_new_bets(edges: list) -> list:
     with _bets_lock:
         existing_ids = {b["id"] for b in _bets}
         # Track slots already occupied by open bets to detect correlated entries.
-        # Include game date so same matchup on consecutive days is NOT correlated.
-        open_slots = {
-            (b["matchup"], b.get("mkt_type", ""), b["side"], _parse_ticker_date(b.get("ticker", "")))
-            for b in _bets if b["status"] == "open"
-        }
+        # Props: slot is (matchup, game_date) only — one bet per player per day,
+        #        regardless of line or side (prevents YES on 6+ AND NO on 5+).
+        # Game lines: slot includes side — YES/NO are independent markets.
+        def _open_slot(b: dict) -> tuple:
+            gd = _parse_ticker_date(b.get("ticker", ""))
+            if b.get("mkt_type") == "prop":
+                return ("prop", b["matchup"], gd)
+            return (b["matchup"], b.get("mkt_type", ""), b["side"], gd)
+
+        open_slots = {_open_slot(b) for b in _bets if b["status"] == "open"}
         added = 0
         for e in edges:
             # Skip edges already invalidated by Pinnacle line movement
@@ -722,7 +737,10 @@ def _add_new_bets(edges: list) -> list:
             existing_ids.add(bid)   # prevent same ticker appearing twice in one cycle
 
             game_date = _parse_ticker_date(e.get("ticker", ""))
-            slot = (e.get("matchup", ""), e.get("mkt_type", ""), e.get("side", ""), game_date)
+            if e.get("mkt_type") == "prop":
+                slot = ("prop", e.get("matchup", ""), game_date)
+            else:
+                slot = (e.get("matchup", ""), e.get("mkt_type", ""), e.get("side", ""), game_date)
             is_correlated = slot in open_slots
 
             # entry_yes_pct = Kalshi YES ask % when flagged (for CLV calculation)

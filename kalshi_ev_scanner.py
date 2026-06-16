@@ -2119,13 +2119,13 @@ def scan_sport(
 
 
 # ── Player-props helpers ──────────────────────────────────────────────────────
-PLAYER_PROP_MARKETS = "pitcher_strikeouts,batter_hits"
+PLAYER_PROP_MARKETS = "pitcher_strikeouts,batter_hits,batter_home_runs,batter_total_bases,batter_rbis"
 NBA_PLAYER_PROP_MARKETS = "player_points,player_assists,player_threes"
 
 MLB_PROP_SERIES: Dict[str, str] = {
     "KXMLBKS":  "pitcher_strikeouts",
     "KXMLBHIT": "batter_hits",
-    # "KXMLBHR":  "batter_home_runs",   # disabled — too rare (~8-12%/game) to model reliably
+    "KXMLBHR":  "batter_home_runs",
     "KXMLBTB":  "batter_total_bases",
     "KXMLBRBI": "batter_rbis",
 }

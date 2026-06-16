@@ -1391,12 +1391,23 @@ def _get_performance(since: Optional[str] = None) -> dict:
         mtype = _infer_mkt_type(b)
         b["clv_mult_applied"]  = clv_mults.get(mtype, 1.0)
 
+    _PROP_SERIES_LABELS = {
+        "KXMLBKS":  "Strikeouts (K)",
+        "KXMLBHR":  "Home Runs",
+        "KXMLBHIT": "Hits",
+        "KXMLBTB":  "Total Bases",
+        "KXMLBRBI": "RBIs",
+    }
+
     def _perf_label(b: dict) -> str:
         ticker = b.get("ticker", "").upper()
         mtype  = _infer_mkt_type(b)
         if mtype == "nba_prop":
             return "NBA Props"
         if mtype == "prop":
+            for prefix, label in _PROP_SERIES_LABELS.items():
+                if ticker.startswith(prefix):
+                    return label
             return "MLB Props"
         if ticker.startswith("KXNBA"):
             sport = "NBA"
@@ -4576,10 +4587,16 @@ function renderPerformance(d) {
     </p>`;
 
   // By-type breakdown table
+  const PROP_LABELS = new Set(['Strikeouts (K)', 'Home Runs', 'Hits', 'Total Bases', 'RBIs', 'MLB Props', 'NBA Props']);
+  const TYPE_ORDER  = ['MLB Total', 'MLB Spread', 'Strikeouts (K)', 'Home Runs', 'Hits', 'Total Bases', 'RBIs', 'MLB Props', 'NBA Props'];
   if (d.by_type && d.by_type.length) {
-    const typeRows = d.by_type.map(t => {
+    const sorted = [...d.by_type].sort((a, b) => {
+      const ai = TYPE_ORDER.indexOf(a.label); const bi = TYPE_ORDER.indexOf(b.label);
+      return (ai === -1 ? 99 : ai) - (bi === -1 ? 99 : bi);
+    });
+    const typeRows = sorted.map(t => {
       const insuf  = t.insufficient_data;
-      const isProp = t.label === 'Props';
+      const isProp = PROP_LABELS.has(t.label);
       const wrCls  = insuf || t.win_rate == null ? '' : 'pnl-pos';
       const kpct   = t.kelly_pct;
       const kcls   = kpct == null ? '' : kpct > 0 ? 'pnl-pos' : 'pnl-neg';

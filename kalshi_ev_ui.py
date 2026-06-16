@@ -4850,55 +4850,77 @@ async function deleteMyBet(id) {
 // ── Paper Portfolio ───────────────────────────────────────────────────────────
 async function fetchPaper() {
   try {
-    const r = await fetch('/api/paper');
-    const d = await r.json();
-    const pnlPos    = d.total_pnl >= 0;
-    const pnlColor  = pnlPos ? 'var(--green)' : 'var(--red)';
-    const pnlSign   = pnlPos ? '+' : '';
-    const roiSign   = d.roi_pct >= 0 ? '+' : '';
-    const roiColor  = d.roi_pct >= 0 ? 'var(--green)' : 'var(--red)';
-    const settled   = d.won + d.lost;
+    const [paperResp, perfResp] = await Promise.all([
+      fetch('/api/paper'),
+      fetch('/api/performance?since=2026-06-08')
+    ]);
+    const d    = await paperResp.json();
+    const perf = await perfResp.json();
 
-    // Avg Value @ Entry — Pinnacle prob at flag minus Kalshi entry price, averaged over bets with PIN data
-    const valBets = (d.bets || []).filter(b => b.pin_prob_at_flag != null && b.kalshi_price != null);
-    const avgVal  = valBets.length
-      ? valBets.reduce((s, b) => s + (b.pin_prob_at_flag - b.kalshi_price * 100), 0) / valBets.length
-      : null;
-    const valColor = avgVal == null ? 'var(--muted)' : 'var(--green)';  // always positive when bets had edge
-    const valTxt   = avgVal == null ? '—' : `+${avgVal.toFixed(1)}pp`;
-    const valLabel = valBets.length ? `Avg Value @ Entry (${valBets.length})` : 'Value @ Entry (pending)';
+    const settled  = d.won + d.lost;
+    const pnlColor = d.total_pnl >= 0 ? 'var(--green)' : 'var(--red)';
+    const pnlSign  = d.total_pnl >= 0 ? '+' : '';
+
+    // Flat units from performance API (stake-agnostic pick quality)
+    const flatUnits   = perf.total_units;
+    const avgUnits    = perf.avg_units;
+    const unitsColor  = flatUnits == null ? 'var(--muted)' : flatUnits >= 0 ? 'var(--green)' : 'var(--red)';
+    const unitsTxt    = flatUnits == null ? '—'
+      : `${flatUnits >= 0 ? '+' : ''}${flatUnits.toFixed(2)}u`;
+    const unitsSubTxt = avgUnits == null ? '' : `${avgUnits >= 0 ? '+' : ''}${avgUnits.toFixed(3)}/bet`;
+
+    // Win rate vs implied (model vs market)
+    const winRate      = perf.win_rate;
+    const impliedAvg   = perf.avg_kalshi_implied;  // market-implied win %
+    const vsMarket     = (winRate != null && impliedAvg != null)
+      ? (winRate - impliedAvg).toFixed(1) : null;
+    const vsMarketTxt  = vsMarket == null ? '—'
+      : `${vsMarket >= 0 ? '+' : ''}${vsMarket}%`;
+    const vsMarketColor = vsMarket == null ? 'var(--muted)' : vsMarket >= 0 ? 'var(--green)' : 'var(--red)';
+
+    // Avg CLV — PIN source only for honest number
+    const clvSrc    = perf.clv_by_source || {};
+    const pinData   = clvSrc['pin'];
+    const clvTxt    = pinData ? `${pinData.avg_clv >= 0 ? '+' : ''}${pinData.avg_clv}pp` : '—';
+    const clvColor  = pinData ? (pinData.avg_clv >= 0 ? 'var(--green)' : 'var(--red)') : 'var(--muted)';
+    const clvLabel  = pinData ? `Avg CLV — PIN (${pinData.count} bets)` : 'Avg CLV — PIN';
+
+    // Kelly P&L as secondary context
+    const kellyPct  = perf.total_kelly_pct;
+    const kellyColor = kellyPct == null ? 'var(--muted)' : kellyPct >= 0 ? 'var(--green)' : 'var(--red)';
+    const kellyTxt  = kellyPct == null ? '—' : `${kellyPct >= 0 ? '+' : ''}${kellyPct.toFixed(2)}%`;
 
     // ── Primary KPI bar ────────────────────────────────────────────────────
     let html = `
-    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(110px,1fr));gap:1px;background:var(--border);border-bottom:1px solid var(--border);">
+    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:1px;background:var(--border);border-bottom:1px solid var(--border);">
       <div style="background:var(--surface);padding:14px 16px;text-align:center;">
-        <div style="font-size:26px;font-weight:800;color:${pnlColor};letter-spacing:-0.5px;">$${d.balance.toFixed(2)}</div>
-        <div style="font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:0.06em;margin-top:3px;">Current Bankroll</div>
+        <div style="font-size:24px;font-weight:800;color:${unitsColor};letter-spacing:-0.5px;">${unitsTxt}</div>
+        <div style="font-size:11px;color:${unitsColor};opacity:0.7;margin-top:1px;">${unitsSubTxt}</div>
+        <div style="font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:0.06em;margin-top:3px;" title="$1 flat stake on every bet — removes all Kelly sizing noise. Best single measure of pick quality.">Flat Units (${settled} settled)</div>
       </div>
       <div style="background:var(--surface);padding:14px 16px;text-align:center;">
-        <div style="font-size:22px;font-weight:700;color:${pnlColor};">${pnlSign}$${d.total_pnl.toFixed(2)}</div>
-        <div style="font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:0.06em;margin-top:3px;">Total P&amp;L</div>
+        <div style="font-size:24px;font-weight:800;color:${vsMarketColor};">${vsMarketTxt}</div>
+        <div style="font-size:11px;color:var(--muted);margin-top:1px;">${winRate != null ? winRate + '%' : '—'} actual vs ${impliedAvg != null ? impliedAvg.toFixed(1) + '%' : '—'} implied</div>
+        <div style="font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:0.06em;margin-top:3px;" title="Actual win rate minus Kalshi-implied win probability. Positive = beating the market.">Win Rate vs Implied</div>
       </div>
       <div style="background:var(--surface);padding:14px 16px;text-align:center;">
-        <div style="font-size:22px;font-weight:700;color:${roiColor};">${roiSign}${d.roi_pct.toFixed(2)}%</div>
-        <div style="font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:0.06em;margin-top:3px;">ROI on $${d.start_balance.toFixed(0)}</div>
+        <div style="font-size:24px;font-weight:800;color:${clvColor};">${clvTxt}</div>
+        <div style="font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:0.06em;margin-top:3px;" title="Closing Line Value using Pinnacle's closing price. Positive = we bought below fair value. Most reliable edge signal.">${clvLabel}</div>
       </div>
       <div style="background:var(--surface);padding:14px 16px;text-align:center;">
-        <div style="font-size:22px;font-weight:700;color:${d.win_rate != null ? 'var(--green)' : 'var(--muted)'};">${d.win_rate != null ? d.win_rate + '%' : '—'}</div>
-        <div style="font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:0.06em;margin-top:3px;">Win Rate (${settled} settled)</div>
-      </div>
-      <div style="background:var(--surface);padding:14px 16px;text-align:center;">
-        <div style="font-size:20px;font-weight:700;color:${valColor};" title="Average value locked at entry = Pinnacle prob − Kalshi price. Always positive when bets had real edge. This is what you captured, regardless of how the line moved after.">${valTxt}</div>
-        <div style="font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:0.06em;margin-top:3px;">${valLabel}</div>
-      </div>
-      <div style="background:var(--surface);padding:14px 16px;text-align:center;">
-        <div style="font-size:18px;font-weight:600;color:var(--green);">${d.won}W</div>
-        <div style="font-size:11px;color:var(--red);">${d.lost}L &nbsp; <span style="color:var(--muted);">${d.open} open</span></div>
+        <div style="font-size:22px;font-weight:700;color:var(--green);">${d.won}W <span style="color:var(--red);">${d.lost}L</span></div>
+        <div style="font-size:11px;color:var(--muted);margin-top:1px;">${d.open} open · ${winRate != null ? winRate + '%' : '—'} win rate</div>
         <div style="font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:0.06em;margin-top:2px;">Record</div>
       </div>
       <div style="background:var(--surface);padding:14px 16px;text-align:center;">
-        <div style="font-size:18px;font-weight:600;color:var(--text);">$${d.open_exposure.toFixed(2)}</div>
-        <div style="font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:0.06em;margin-top:3px;">Exposure (open)</div>
+        <div style="font-size:22px;font-weight:700;color:${kellyColor};">${kellyTxt}</div>
+        <div style="font-size:11px;color:var(--muted);margin-top:1px;">${pnlSign}$${d.total_pnl.toFixed(2)} on $${d.start_balance.toFixed(0)}</div>
+        <div style="font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:0.06em;margin-top:3px;" title="Kelly-sized P&L as % of bankroll. Secondary metric — reflects staking decisions, not model quality.">Kelly P&amp;L (% bank)</div>
+      </div>
+      <div style="background:var(--surface);padding:14px 16px;text-align:center;">
+        <div style="font-size:22px;font-weight:700;color:${pnlColor};letter-spacing:-0.5px;">$${d.balance.toFixed(2)}</div>
+        <div style="font-size:11px;color:var(--muted);margin-top:1px;">$${d.open_exposure.toFixed(2)} at risk</div>
+        <div style="font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:0.06em;margin-top:3px;">Bankroll</div>
       </div>
     </div>
     <div style="padding:6px 12px;border-bottom:1px solid var(--border);background:#0d1117;">

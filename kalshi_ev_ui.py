@@ -4561,6 +4561,7 @@ function renderPerformance(d) {
       ${pill('Edge (14d)', recentEdgeVal)}
       ${pill('Last Bet', lastBetVal)}
       ${pill('Kelly P&amp;L (% bank)', d.total_kelly_pct != null ? `<span class="${kellyPctClass}">${sign(d.total_kelly_pct)}${d.total_kelly_pct.toFixed(2)}%</span>` : '—')}
+      ${pill('Flat Units', d.total_units != null ? `<span class="${d.total_units >= 0 ? 'pnl-pos' : 'pnl-neg'}" title="$1 flat stake on every bet regardless of sizing. Total: ${sign(d.total_units)}${d.total_units}u | Avg: ${sign(d.avg_units)}${d.avg_units}u/bet">${sign(d.total_units)}${d.total_units}u <span style="font-size:10px;opacity:0.7;">(${sign(d.avg_units)}${d.avg_units}/bet)</span></span>` : '—')}
       ${pill('Avg CLV', d.avg_clv != null ? `<span class="${d.avg_clv >= 0 ? 'pnl-pos' : 'pnl-neg'}" title="Blended across all CLV sources — see breakdown below">${d.avg_clv > 0 ? '+' : ''}${d.avg_clv}%</span>` : '—')}
       ${pill('Avg Line Move', d.avg_line_move != null ? `<span class="${d.avg_line_move >= 0 ? 'pnl-pos' : 'pnl-neg'}">${d.avg_line_move > 0 ? '+' : ''}${d.avg_line_move}¢</span>` : '—')}
       <div class="stat-pill"><div class="label">Model vs Market</div><div class="value">${modelCallout}</div></div>

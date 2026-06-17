@@ -607,6 +607,17 @@ for _b in _bets:
         _b["correlated"] = False
         _data_fixed = True
 
+# Fix: Retroactively mark all KXMLBHR bets logged before shadow mode was added
+# (2026-06-17) as shadow and zero their stakes/pnl so they don't drag Kelly P&L.
+for _b in _bets:
+    if _b.get("ticker", "").upper().startswith("KXMLBHR") and not _b.get("shadow"):
+        _b["shadow"]      = True
+        _b["paper_stake"] = 0.0
+        if _b.get("status") in ("won", "lost"):
+            _b["paper_pnl"] = 0.0
+        _data_fixed = True
+        print(f"  Shadow-backfill: zeroed stake/pnl on {_b.get('id','?')}")
+
 if _data_fixed:
     _save_bets(_bets)
     print("  Applied one-time data corrections (CLV/pin_entry upgrades)")

@@ -1139,10 +1139,15 @@ def _check_resolutions():
                         b["status"]          = "won" if side_won else "lost"
                         b["resolved_at"]     = datetime.now(timezone.utc).isoformat()
                         b["resolved_by"]     = "kalshi"
-                        b["closing_yes_pct"] = closing_yes
-                        b["closing_pin_pct"] = bet_pin_close
-                        b["clv"]             = clv
-                        b["clv_pct"]         = clv_pct_val
+                        if closing_yes is not None:
+                            b["closing_yes_pct"] = closing_yes
+                        if bet_pin_close is not None:
+                            b["closing_pin_pct"] = bet_pin_close
+                        # Only overwrite CLV if we actually computed one —
+                        # never clobber a previously captured CLV with None.
+                        if clv is not None:
+                            b["clv"]     = clv
+                            b["clv_pct"] = clv_pct_val
                         # Kelly P&L — unified: pnl IS paper_pnl
                         ps = b.get("paper_stake") or 0.0
                         kelly_pnl = round(ps * (1 - k) / k, 2) if side_won else round(-ps, 2)

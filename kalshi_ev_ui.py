@@ -196,6 +196,17 @@ PAPER_START_DATE     = "2026-06-08"  # V2.0 reset — pre-throttle + Jun 7 bad-p
 PAPER_KELLY_FRACTION = 0.25     # quarter-Kelly base fraction
 PAPER_KELLY_CAP      = 0.03     # max 3% of current balance per bet (validation-phase cap)
 
+# ── Shadow markets ─────────────────────────────────────────────────────────────
+# Markets listed here are fully tracked (logged, CLV captured, win/loss recorded)
+# but staked at $0 and excluded from paper balance, Kelly P&L, and summary pills.
+# Move a ticker prefix here to validate a new market before committing real stakes.
+SHADOW_MARKETS: list[str] = [
+    "KXMLBHR",   # Home runs — new market, accumulating CLV data before going live
+]
+
+def _is_shadow(ticker: str) -> bool:
+    return any(ticker.upper().startswith(s) for s in SHADOW_MARKETS)
+
 # ── Time-to-matchup Kelly multipliers ────────────────────────────────────────
 # Lines are softest and liquidity thinnest far from first pitch; scale down
 # early entries and trust the full edge only when the market has settled.
@@ -654,6 +665,7 @@ def _compute_paper_balance() -> float:
         paper_bets = [b for b in _bets if b.get("flagged_at", "") >= PAPER_START_DATE
                       and b.get("paper_stake") is not None
                       and not b.get("correlated", False)
+                      and not b.get("shadow", False)
                       and b.get("clv_source") != "corrupted_utc"]
     bal = PAPER_START_BALANCE
     for b in paper_bets:
@@ -748,7 +760,8 @@ def _add_new_bets(edges: list) -> list:
             # Resolve game_time for the time-adaptive Kelly multiplier
             _gt_dt = _parse_ticker_start_time(e["ticker"])
             _game_time_iso = _gt_dt.isoformat() if _gt_dt else None
-            paper_stake = _paper_kelly_stake(e["edge_pct"], e["kalshi"], _game_time_iso)
+            shadow      = _is_shadow(e.get("ticker", ""))
+            paper_stake = 0.0 if shadow else _paper_kelly_stake(e["edge_pct"], e["kalshi"], _game_time_iso)
 
             # Pinnacle probability at flag time — the baseline for line-shift detection
             bd = e.get("books_detail", {})
@@ -795,9 +808,10 @@ def _add_new_bets(edges: list) -> list:
                 "closing_pin_pct":    None,                 # Pinnacle side-prob at close; CLV loop fills
                 "clv":                0.0,                  # pp form: closing_pin - entry_k
                 "clv_pct":            None,                 # ROI form: (clv / entry_k) * 100
-                "paper_stake":        paper_stake,           # Kelly-sized virtual wager
+                "paper_stake":        paper_stake,           # Kelly-sized virtual wager ($0 for shadow)
                 "paper_pnl":          None,                  # set on resolution
                 "correlated":         is_correlated,         # excluded from win-rate/Kelly stats
+                "shadow":             shadow,                 # True = tracked but $0 stake, excluded from balance
             }
 
             _bets.append(new_bet)
@@ -1213,6 +1227,11 @@ def _get_performance(since: Optional[str] = None) -> dict:
     def _is_corrupted(b: dict) -> bool:
         return b.get("clv_source") == "corrupted_utc"
 
+    def _is_shadow_bet(b: dict) -> bool:
+        return b.get("shadow", False) or any(
+            b.get("ticker", "").upper().startswith(s) for s in SHADOW_MARKETS
+        )
+
     gl_bets    = [b for b in bets  if not _is_prop(b) and not _is_corrupted(b)]
     gl_won     = [b for b in won   if not _is_prop(b) and not _is_correlated(b) and not _is_corrupted(b)]
     gl_lost    = [b for b in lost  if not _is_prop(b) and not _is_correlated(b) and not _is_corrupted(b)]
@@ -1223,11 +1242,11 @@ def _get_performance(since: Optional[str] = None) -> dict:
     # ── All-market summary (props + game lines) for top-level pills ───────────
     # Props are now a core market type; game-line-only pills were hiding the
     # majority of our edges.  Keep gl_* for the by_type breakdown only.
-    all_won     = [b for b in won   if not _is_correlated(b) and not _is_corrupted(b)]
-    all_lost    = [b for b in lost  if not _is_correlated(b) and not _is_corrupted(b)]
-    all_open    = [b for b in open_ if not _is_corrupted(b)]
+    all_won     = [b for b in won   if not _is_correlated(b) and not _is_corrupted(b) and not _is_shadow_bet(b)]
+    all_lost    = [b for b in lost  if not _is_correlated(b) and not _is_corrupted(b) and not _is_shadow_bet(b)]
+    all_open    = [b for b in open_ if not _is_corrupted(b) and not _is_shadow_bet(b)]
     all_settled = all_won + all_lost
-    all_clean   = [b for b in bets  if not _is_corrupted(b)]
+    all_clean   = [b for b in bets  if not _is_corrupted(b) and not _is_shadow_bet(b)]
 
     # ── Kelly sizing helper ────────────────────────────────────────────────────
     # Mirrors _paper_kelly_stake() exactly so dashboard metrics stay in sync
@@ -1418,8 +1437,15 @@ def _get_performance(since: Optional[str] = None) -> dict:
     by_type = {}
     for b in clean_settled:
         label = _perf_label(b)
+        is_shad = _is_shadow_bet(b)
         if label not in by_type:
-            by_type[label] = {"won": 0, "lost": 0, "units": [], "kelly": [], "clv": []}
+            by_type[label] = {"won": 0, "lost": 0, "units": [], "kelly": [], "clv": [], "shadow": is_shad}
+        # shadow bets: track CLV only — exclude from won/lost/units/kelly counts
+        if is_shad:
+            clv_val = b.get("clv")
+            if clv_val is not None:
+                by_type[label]["clv"].append(clv_val)
+            continue
         kp = _kelly_pnl(b)
         if b["status"] == "won":
             by_type[label]["won"] += 1
@@ -1456,6 +1482,7 @@ def _get_performance(since: Optional[str] = None) -> dict:
             "avg_clv":           avg_clv_t,      # pp — positive = beating closing line
             "insufficient_data": total_t < MIN_SAMPLE,
             "sample_size":       total_t,
+            "shadow":            d.get("shadow", False),
         })
     type_breakdown.sort(key=lambda x: -(x["won"] + x["lost"]))
 
@@ -4597,15 +4624,21 @@ function renderPerformance(d) {
     const typeRows = sorted.map(t => {
       const insuf  = t.insufficient_data;
       const isProp = PROP_LABELS.has(t.label);
+      const isShadowRow = t.shadow === true;
       const wrCls  = insuf || t.win_rate == null ? '' : 'pnl-pos';
       const kpct   = t.kelly_pct;
       const kcls   = kpct == null ? '' : kpct > 0 ? 'pnl-pos' : 'pnl-neg';
-      const wrCell = insuf
-        ? `<span class="insufficient-data" title="Need 20+ settled bets for reliable stats">Insufficient data (${t.sample_size})</span>`
-        : t.win_rate != null ? `<span class="${wrCls}">${t.win_rate}%</span>` : '—';
-      const labelCell = isProp
-        ? `<span style="font-weight:600;">${t.label}</span> <span class="badge-unvalidated">⚠ UNVALIDATED</span>`
-        : `<span style="font-weight:600;">${t.label}</span>`;
+      const wrCell = isShadowRow
+        ? `<span style="color:var(--muted);font-size:10px;">CLV only</span>`
+        : insuf
+          ? `<span class="insufficient-data" title="Need 20+ settled bets for reliable stats">Insufficient data (${t.sample_size})</span>`
+          : t.win_rate != null ? `<span class="${wrCls}">${t.win_rate}%</span>` : '—';
+      const shadowRowBadge = isShadowRow
+        ? ` <span style="font-size:9px;font-weight:700;color:#58a6ff;background:rgba(88,166,255,0.10);border:1px solid rgba(88,166,255,0.3);border-radius:3px;padding:1px 4px;vertical-align:middle;">SHADOW</span>`
+        : '';
+      const labelCell = isProp && !isShadowRow
+        ? `<span style="font-weight:600;">${t.label}</span>${shadowRowBadge} <span class="badge-unvalidated">⚠ UNVALIDATED</span>`
+        : `<span style="font-weight:600;">${t.label}</span>${shadowRowBadge}`;
       const kellyCell = kpct != null
         ? `<span class="${kcls}" title="$${t.kelly_dollars != null ? Math.abs(t.kelly_dollars).toFixed(0) : '?'} on $${bankroll} bank">${sign(kpct)}${kpct.toFixed(2)}%</span>`
         : '—';
@@ -4614,12 +4647,12 @@ function renderPerformance(d) {
       const clvCell = clv != null
         ? `<span class="${clvCls}" title="Average closing-line value — positive means Kalshi moved in your favour after entry">${sign(clv)}${clv.toFixed(2)} pp</span>`
         : '—';
-      return `<tr>
+      return `<tr style="${isShadowRow ? 'opacity:0.75;' : ''}">
         <td>${labelCell}</td>
-        <td class="num pnl-pos">${t.won}</td>
-        <td class="num pnl-neg">${t.lost}</td>
+        <td class="num pnl-pos">${isShadowRow ? '<span style="color:var(--muted)">—</span>' : t.won}</td>
+        <td class="num pnl-neg">${isShadowRow ? '<span style="color:var(--muted)">—</span>' : t.lost}</td>
         <td class="num">${wrCell}</td>
-        <td class="num">${kellyCell}</td>
+        <td class="num">${isShadowRow ? '<span style="color:var(--muted);font-size:10px;">$0 stake</span>' : kellyCell}</td>
         <td class="num">${clvCell}</td>
       </tr>`;
     }).join('');
@@ -4690,9 +4723,11 @@ function renderPerformance(d) {
       : isLive ? '<span style="color:#ff4444;font-weight:600;animation:pulse 1.5s infinite;">● LIVE</span>'
       : '…';
     // Kelly bet size as % of bankroll (dollar amount in tooltip)
-    const kBet   = b.kelly_bet_pct != null
-      ? `<span class="kelly-val" title="$${b.kelly_bet_dollars != null ? b.kelly_bet_dollars.toFixed(0) : '?'} on $${bankroll} bank${b.clv_mult_applied < 1 ? ' — CLV penalty 0.5×' : ''}">${b.kelly_bet_pct.toFixed(2)}%${b.clv_mult_applied < 1 ? ' <span style="color:#e3a53a;font-size:9px;">½</span>' : ''}</span>`
-      : '<span class="kelly-na">—</span>';
+    const kBet   = isShadow
+      ? `<span style="color:var(--muted);font-size:11px;" title="Shadow market — no real stake">$0</span>`
+      : b.kelly_bet_pct != null
+        ? `<span class="kelly-val" title="$${b.kelly_bet_dollars != null ? b.kelly_bet_dollars.toFixed(0) : '?'} on $${bankroll} bank${b.clv_mult_applied < 1 ? ' — CLV penalty 0.5×' : ''}">${b.kelly_bet_pct.toFixed(2)}%${b.clv_mult_applied < 1 ? ' <span style="color:#e3a53a;font-size:9px;">½</span>' : ''}</span>`
+        : '<span class="kelly-na">—</span>';
     // P&L as % of bankroll (dollar amount in tooltip)
     const kPnl   = b.kelly_pnl_pct != null
       ? `<span class="${uClass(b.kelly_pnl_pct)}" title="${fmt$(b.kelly_pnl_dollars || 0)} on $${bankroll} bank">${sign(b.kelly_pnl_pct)}${b.kelly_pnl_pct.toFixed(2)}%</span>`
@@ -4758,10 +4793,14 @@ function renderPerformance(d) {
     const corruptBadge = b.clv_source === 'corrupted_utc'
       ? `<span title="Excluded from all stats — Pinnacle reference was from the wrong game (UTC/ET date collision, now fixed)." style="font-size:9px;font-weight:700;color:#8b949e;background:rgba(139,148,158,0.12);border:1px solid rgba(139,148,158,0.3);border-radius:3px;padding:1px 4px;margin-left:5px;vertical-align:middle;">BAD REF</span>`
       : '';
-    return `<tr style="${b.correlated || b.clv_source === 'corrupted_utc' ? 'opacity:0.55;' : ''}">
+    const isShadow   = b.shadow === true;
+    const shadowBadge = isShadow
+      ? `<span title="Shadow market — tracked for CLV data only. $0 stake, excluded from portfolio balance and summary stats." style="font-size:9px;font-weight:700;color:#58a6ff;background:rgba(88,166,255,0.10);border:1px solid rgba(88,166,255,0.3);border-radius:3px;padding:1px 4px;margin-left:5px;vertical-align:middle;">SHADOW</span>`
+      : '';
+    return `<tr style="${b.correlated || b.clv_source === 'corrupted_utc' ? 'opacity:0.55;' : isShadow ? 'opacity:0.75;border-left:2px solid #58a6ff22;' : ''}">
       <td>${ts}</td>
       <td>${gameTimeCell}</td>
-      <td>${b.matchup}${corrBadge}${corruptBadge}</td>
+      <td>${b.matchup}${corrBadge}${corruptBadge}${shadowBadge}</td>
       <td class="prop-col">${b.title}</td>
       <td class="side-${b.side.toLowerCase()}">${b.side}</td>
       <td class="num">${edgeCell}</td>

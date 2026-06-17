@@ -746,6 +746,21 @@ def _add_new_bets(edges: list) -> list:
                       f"{e.get('side','')} edge={e.get('edge_pct',0):.1f}% — skipped")
                 continue
 
+            # ── Peak-hour persistence gate ────────────────────────────────────
+            # Data shows Peak Trading (1–10pm PDT) has 8W/17L at -7.12 flat units
+            # vs Early AM 14W/11L at +10.96 units.  Root cause: phantom edges from
+            # API sync delays get logged before they stabilise during busy hours.
+            # Require edge to have persisted ≥2.5 min (2 scan cycles at 75s) before
+            # logging during peak hours.  Early AM / Morning exempt — those edges
+            # are genuinely mispriced and win when logged immediately.
+            _now_h_pdt = (datetime.now(timezone.utc).hour - 7) % 24
+            _is_peak   = 13 <= _now_h_pdt < 22
+            _age_min   = e.get("age_min", 0) or 0
+            if _is_peak and _age_min < 2.5:
+                print(f"  GATE (peak <2.5min): {e.get('title','')} "
+                      f"{e.get('side','')} age={_age_min:.1f}min — waiting for confirmation")
+                continue
+
             existing_ids.add(bid)   # prevent same ticker appearing twice in one cycle
 
             game_date = _parse_ticker_date(e.get("ticker", ""))

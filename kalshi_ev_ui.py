@@ -4767,7 +4767,7 @@ function renderPerformance(d) {
       : isLive ? '<span style="color:#ff4444;font-weight:600;animation:pulse 1.5s infinite;">● LIVE</span>'
       : '…';
     // Kelly bet size as % of bankroll (dollar amount in tooltip)
-    const kBet   = isShadow
+    const kBet   = b.shadow
       ? `<span style="color:var(--muted);font-size:11px;" title="Shadow market — no real stake">$0</span>`
       : b.kelly_bet_pct != null
         ? `<span class="kelly-val" title="$${b.kelly_bet_dollars != null ? b.kelly_bet_dollars.toFixed(0) : '?'} on $${bankroll} bank${b.clv_mult_applied < 1 ? ' — CLV penalty 0.5×' : ''}">${b.kelly_bet_pct.toFixed(2)}%${b.clv_mult_applied < 1 ? ' <span style="color:#e3a53a;font-size:9px;">½</span>' : ''}</span>`

@@ -1454,9 +1454,12 @@ def _get_performance(since: Optional[str] = None) -> dict:
         label = _perf_label(b)
         is_shad = _is_shadow_bet(b)
         if label not in by_type:
-            by_type[label] = {"won": 0, "lost": 0, "units": [], "kelly": [], "clv": [], "shadow": is_shad}
-        # shadow bets: track CLV only — exclude from won/lost/units/kelly counts
+            by_type[label] = {"won": 0, "lost": 0, "shadow_won": 0, "shadow_lost": 0,
+                               "units": [], "kelly": [], "clv": [], "shadow": is_shad}
+        # shadow bets: track CLV + shadow won/lost for monitoring — exclude from live counts
         if is_shad:
+            if b["status"] == "won":   by_type[label]["shadow_won"]  += 1
+            elif b["status"] == "lost": by_type[label]["shadow_lost"] += 1
             clv_val = b.get("clv")
             if clv_val is not None:
                 by_type[label]["clv"].append(clv_val)
@@ -1491,10 +1494,12 @@ def _get_performance(since: Optional[str] = None) -> dict:
             "label":             label,
             "won":               d["won"],
             "lost":              d["lost"],
+            "shadow_won":        d.get("shadow_won", 0),
+            "shadow_lost":       d.get("shadow_lost", 0),
             "win_rate":          wr_t,
-            "kelly_pct":         kelly_pct_t,    # % of bankroll P&L
+            "kelly_pct":         kelly_pct_t,
             "kelly_dollars":     kelly_t,
-            "avg_clv":           avg_clv_t,      # pp — positive = beating closing line
+            "avg_clv":           avg_clv_t,
             "insufficient_data": total_t < MIN_SAMPLE,
             "sample_size":       total_t,
             "shadow":            d.get("shadow", False),
@@ -4662,11 +4667,19 @@ function renderPerformance(d) {
       const clvCell = clv != null
         ? `<span class="${clvCls}" title="Average closing-line value — positive means Kalshi moved in your favour after entry">${sign(clv)}${clv.toFixed(2)} pp</span>`
         : '—';
+      const shadowTotal = (t.shadow_won || 0) + (t.shadow_lost || 0);
+      const shadowWr    = shadowTotal > 0 ? Math.round(100 * (t.shadow_won || 0) / shadowTotal) : null;
+      const wonCell  = isShadowRow
+        ? `<span style="color:var(--green);opacity:0.7;" title="Shadow — excluded from live stats">${t.shadow_won || 0}</span>`
+        : t.won;
+      const lostCell = isShadowRow
+        ? `<span style="color:var(--red);opacity:0.7;" title="Shadow — excluded from live stats">${t.shadow_lost || 0}</span>`
+        : t.lost;
       return `<tr style="${isShadowRow ? 'opacity:0.75;' : ''}">
         <td>${labelCell}</td>
-        <td class="num pnl-pos">${isShadowRow ? '<span style="color:var(--muted)">—</span>' : t.won}</td>
-        <td class="num pnl-neg">${isShadowRow ? '<span style="color:var(--muted)">—</span>' : t.lost}</td>
-        <td class="num">${wrCell}</td>
+        <td class="num pnl-pos">${wonCell}</td>
+        <td class="num pnl-neg">${lostCell}</td>
+        <td class="num">${isShadowRow && shadowTotal > 0 ? `<span style="color:var(--muted);font-size:10px;" title="Shadow win rate — not counted in live stats">${shadowWr}% (${shadowTotal})</span>` : wrCell}</td>
         <td class="num">${isShadowRow ? '<span style="color:var(--muted);font-size:10px;">$0 stake</span>' : kellyCell}</td>
         <td class="num">${clvCell}</td>
       </tr>`;

@@ -1440,6 +1440,13 @@ def _get_performance(since: Optional[str] = None) -> dict:
         # Flag which multiplier was applied so the UI can show a note
         mtype = _infer_mkt_type(b)
         b["clv_mult_applied"]  = clv_mults.get(mtype, 1.0)
+        # True CLV (pin drift) = Pinnacle close - Pinnacle at entry
+        _paf = b.get("pin_prob_at_flag")
+        _cpin = b.get("closing_pin_pct")
+        b["pin_drift"] = round(_cpin - _paf, 1) if (_paf is not None and _cpin is not None) else None
+        # Entry discount = Pinnacle at entry - Kalshi entry price (the mispricing we exploited)
+        _ek = (b.get("kalshi_price") or 0) * 100
+        b["entry_discount"] = round(_paf - _ek, 1) if (_paf is not None and _ek) else None
 
     _PROP_SERIES_LABELS = {
         "KXMLBKS":  "Strikeouts (K)",
@@ -1471,11 +1478,17 @@ def _get_performance(since: Optional[str] = None) -> dict:
         is_shad = _is_shadow_bet(b)
         if label not in by_type:
             by_type[label] = {"won": 0, "lost": 0, "shadow_won": 0, "shadow_lost": 0,
-                               "units": [], "kelly": [], "clv": [], "shadow": is_shad}
+                               "units": [], "kelly": [], "clv": [], "pin_drifts": [], "shadow": is_shad}
+        # pin drift per bet = closing_pin_pct - pin_prob_at_flag (true CLV)
+        _pin_at_flag  = b.get("pin_prob_at_flag")
+        _closing_pin  = b.get("closing_pin_pct")
+        _pin_drift_v  = round(_closing_pin - _pin_at_flag, 1) if (_pin_at_flag is not None and _closing_pin is not None) else None
         # shadow bets: track CLV + shadow won/lost for monitoring — exclude from live counts
         if is_shad:
             if b["status"] == "won":   by_type[label]["shadow_won"]  += 1
             elif b["status"] == "lost": by_type[label]["shadow_lost"] += 1
+            if _pin_drift_v is not None:
+                by_type[label]["pin_drifts"].append(_pin_drift_v)
             clv_val = b.get("clv")
             if clv_val is not None:
                 by_type[label]["clv"].append(clv_val)
@@ -1490,6 +1503,8 @@ def _get_performance(since: Optional[str] = None) -> dict:
             by_type[label]["units"].append(-1.0)
         if kp is not None:
             by_type[label]["kelly"].append(kp)
+        if _pin_drift_v is not None:
+            by_type[label]["pin_drifts"].append(_pin_drift_v)
         clv_val = b.get("clv")
         if clv_val is not None:
             by_type[label]["clv"].append(clv_val)
@@ -1505,7 +1520,8 @@ def _get_performance(since: Optional[str] = None) -> dict:
         # Dollar amount for display alongside %, derived from pct × bankroll
         kelly_t    = round(sum(d["kelly"]) * PERF_BANKROLL, 2) if d["kelly"] else None
         # Average CLV across all settled bets in this market type
-        avg_clv_t  = round(sum(d["clv"]) / len(d["clv"]), 2) if d["clv"] else None
+        avg_clv_t       = round(sum(d["clv"]) / len(d["clv"]), 2) if d["clv"] else None
+        avg_pin_drift_t = round(sum(d["pin_drifts"]) / len(d["pin_drifts"]), 2) if d["pin_drifts"] else None
         type_breakdown.append({
             "label":             label,
             "won":               d["won"],
@@ -1516,6 +1532,7 @@ def _get_performance(since: Optional[str] = None) -> dict:
             "kelly_pct":         kelly_pct_t,
             "kelly_dollars":     kelly_t,
             "avg_clv":           avg_clv_t,
+            "avg_pin_drift":     avg_pin_drift_t,
             "insufficient_data": total_t < MIN_SAMPLE,
             "sample_size":       total_t,
             "shadow":            d.get("shadow", False),
@@ -1524,6 +1541,40 @@ def _get_performance(since: Optional[str] = None) -> dict:
 
     # Total Kelly P&L as % of bankroll
     total_kelly_pct = round(sum(kelly_pnls) * 100, 3) if kelly_pnls else None
+
+    # ── Alpha metrics ─────────────────────────────────────────────────────────
+    # Entry discount = pin_at_flag - entry_kalshi: the Kalshi mispricing you captured
+    # Pin drift = closing_pin - pin_at_flag: did the sharp market agree after you bet?
+    _entry_discounts: list = []
+    _pin_drifts_agg:  list = []
+    for b in all_settled:
+        _paf = b.get("pin_prob_at_flag")
+        _ek  = (b.get("kalshi_price") or 0) * 100
+        _cp  = b.get("closing_pin_pct")
+        if _paf is not None and _ek:
+            _entry_discounts.append(_paf - _ek)
+        if _paf is not None and _cp is not None:
+            _pin_drifts_agg.append(_cp - _paf)
+
+    avg_entry_discount = round(sum(_entry_discounts) / len(_entry_discounts), 1) if _entry_discounts else None
+    avg_pin_drift      = round(sum(_pin_drifts_agg)  / len(_pin_drifts_agg),  1) if _pin_drifts_agg  else None
+
+    # Edge bucket breakdown: do higher-edge bets win more?
+    _ALPHA_BUCKETS = [("2–4%", 2.0, 4.0), ("4–6%", 4.0, 6.0), ("6–8%", 6.0, 8.0), ("8%+", 8.0, 999.0)]
+    alpha_buckets: list = []
+    for _blabel, _bmin, _bmax in _ALPHA_BUCKETS:
+        _bb = [b for b in all_settled if _bmin <= b.get("edge_pct", 0) < _bmax]
+        if not _bb:
+            continue
+        _bw = sum(1 for b in _bb if b["status"] == "won")
+        _avg_k = sum(b["kalshi_price"] for b in _bb) / len(_bb)
+        alpha_buckets.append({
+            "label":    _blabel,
+            "n":        len(_bb),
+            "win_rate": round(_bw / len(_bb) * 100, 1),
+            "expected": round(_avg_k * 100, 1),
+            "delta":    round(_bw / len(_bb) * 100 - _avg_k * 100, 1),
+        })
 
     # ── Win-rate audit by (market type, CLV source) ───────────────────────────
     # Detects data-quality bugs: a CLV source with <38% win rate (N≥10) signals
@@ -1579,6 +1630,9 @@ def _get_performance(since: Optional[str] = None) -> dict:
         "source_audit":         source_audit,      # win-rate by (mkt_type, clv_source) — warns if <38%
         "corrupted_excluded":   corrupted_count,   # bets excluded from stats (data-quality)
         "clv_by_source":        clv_by_source,     # {pin/pin_entry/kalshi: {count, avg_clv}}
+        "avg_entry_discount":   avg_entry_discount, # avg (pin_at_flag - entry_kalshi) — the actual mispricing captured
+        "avg_pin_drift":        avg_pin_drift,      # avg (closing_pin - pin_at_flag) — true CLV: did Pin agree?
+        "alpha_buckets":        alpha_buckets,      # win rate vs expected by edge bucket
     }
 
 
@@ -4636,8 +4690,8 @@ function renderPerformance(d) {
       ${pill('Last Bet', lastBetVal)}
       ${pill('Kelly P&amp;L (% bank)', d.total_kelly_pct != null ? `<span class="${kellyPctClass}">${sign(d.total_kelly_pct)}${d.total_kelly_pct.toFixed(2)}%</span>` : '—')}
       ${pill('Flat Units', d.total_units != null ? `<span class="${d.total_units >= 0 ? 'pnl-pos' : 'pnl-neg'}" title="$1 flat stake on every bet regardless of sizing. Total: ${sign(d.total_units)}${d.total_units}u | Avg: ${sign(d.avg_units)}${d.avg_units}u/bet">${sign(d.total_units)}${d.total_units}u <span style="font-size:10px;opacity:0.7;">(${sign(d.avg_units)}${d.avg_units}/bet)</span></span>` : '—')}
-      ${pill('Avg CLV', d.avg_clv != null ? `<span class="${d.avg_clv >= 0 ? 'pnl-pos' : 'pnl-neg'}" title="Blended across all CLV sources — see breakdown below">${d.avg_clv > 0 ? '+' : ''}${d.avg_clv}%</span>` : '—')}
-      ${pill('Avg Line Move', d.avg_line_move != null ? `<span class="${d.avg_line_move >= 0 ? 'pnl-pos' : 'pnl-neg'}">${d.avg_line_move > 0 ? '+' : ''}${d.avg_line_move}¢</span>` : '—')}
+      ${pill('Entry Discount', d.avg_entry_discount != null ? `<span class="${d.avg_entry_discount >= 0 ? 'pnl-pos' : 'pnl-neg'}" title="Avg (Pinnacle fair value − Kalshi entry) at time of bet. This is your actual alpha — the mispricing you captured. NOT affected by what happened after.">${d.avg_entry_discount > 0 ? '+' : ''}${d.avg_entry_discount}pp</span>` : '—')}
+      ${pill('Pin Drift (True CLV)', d.avg_pin_drift != null ? `<span class="${d.avg_pin_drift >= 0 ? 'pnl-pos' : 'pnl-neg'}" title="Avg (Pinnacle close − Pinnacle at entry). Did the sharp market move in your favor AFTER you bet? Positive = Pin confirmed your edge. Zero = you got a good price but Pin didn't move. This is true closing line value.">${d.avg_pin_drift > 0 ? '+' : ''}${d.avg_pin_drift}pp</span>` : '—')}
       <div class="stat-pill"><div class="label">Model vs Market</div><div class="value">${modelCallout}</div></div>
     </div>
     ${clvBreakdown}
@@ -4678,10 +4732,11 @@ function renderPerformance(d) {
       const kellyCell = kpct != null
         ? `<span class="${kcls}" title="$${t.kelly_dollars != null ? Math.abs(t.kelly_dollars).toFixed(0) : '?'} on $${bankroll} bank">${sign(kpct)}${kpct.toFixed(2)}%</span>`
         : '—';
-      const clv = t.avg_clv;
-      const clvCls = clv == null ? '' : clv > 0 ? 'pnl-pos' : clv < 0 ? 'pnl-neg' : '';
-      const clvCell = clv != null
-        ? `<span class="${clvCls}" title="Average closing-line value — positive means Kalshi moved in your favour after entry">${sign(clv)}${clv.toFixed(2)} pp</span>`
+      // Prefer avg_pin_drift (true CLV: closing_pin − pin_at_entry) over old avg_clv (inflated by entry discount)
+      const pd    = t.avg_pin_drift != null ? t.avg_pin_drift : null;
+      const pdCls = pd == null ? '' : pd > 0 ? 'pnl-pos' : pd < 0 ? 'pnl-neg' : '';
+      const clvCell = pd != null
+        ? `<span class="${pdCls}" title="Avg Pin Drift for this market type: Pinnacle close minus Pinnacle at entry. True closing line value — positive = Pin confirmed your edge after you bet.">${sign(pd)}${pd.toFixed(2)}pp</span>`
         : '—';
       const shadowTotal = (t.shadow_won || 0) + (t.shadow_lost || 0);
       const shadowWr    = shadowTotal > 0 ? Math.round(100 * (t.shadow_won || 0) / shadowTotal) : null;
@@ -4706,10 +4761,57 @@ function renderPerformance(d) {
           <th>Market Type</th><th class="num">Won</th><th class="num">Lost</th>
           <th class="num">Win Rate</th>
           <th class="num" title="Kelly P&amp;L as % of bankroll (hover for dollar amount)">Kelly P&amp;L (% bank)</th>
-          <th class="num" title="Avg CLV — how much the market moved in your favour after entry (pp = percentage points). Positive = beating the closing line.">Avg CLV</th>
+          <th class="num" title="Avg Pin Drift: Pinnacle close minus Pinnacle at entry. True CLV — did the sharp market confirm your edge after you bet?">Avg Pin Drift</th>
         </tr></thead>
         <tbody>${typeRows}</tbody>
       </table>`;
+  }
+
+  // ── Alpha section ────────────────────────────────────────────────────────
+  if (d.alpha_buckets && d.alpha_buckets.length) {
+    const entryDisc = d.avg_entry_discount;
+    const pinDrift  = d.avg_pin_drift;
+    const edSign    = entryDisc != null && entryDisc > 0 ? '+' : '';
+    const pdSign    = pinDrift  != null && pinDrift  > 0 ? '+' : '';
+    const edCls     = entryDisc != null ? (entryDisc >= 0 ? 'pnl-pos' : 'pnl-neg') : '';
+    const pdCls     = pinDrift  != null ? (pinDrift  >= 0 ? 'pnl-pos' : 'pnl-neg') : '';
+    const alphaRows = d.alpha_buckets.map(b => {
+      const dCls  = b.delta > 0 ? 'pnl-pos' : b.delta < 0 ? 'pnl-neg' : '';
+      const dSign = b.delta > 0 ? '+' : '';
+      const insuf = b.n < 10;
+      return `<tr>
+        <td style="font-weight:600;">${b.label}</td>
+        <td class="num">${b.n}</td>
+        <td class="num">${insuf ? `<span style="color:var(--muted);font-size:10px;">${b.win_rate}% <em>(small n)</em></span>` : `<span class="${dCls}">${b.win_rate}%</span>`}</td>
+        <td class="num" style="color:var(--muted);">${b.expected}%</td>
+        <td class="num"><span class="${insuf ? '' : dCls}" title="Actual win rate minus expected win rate (Kalshi implied prob). Positive = outperforming market.">${dSign}${b.delta}pp ${insuf ? '<span style="font-size:9px;opacity:0.6;">(n<10)</span>' : ''}</span></td>
+      </tr>`;
+    }).join('');
+    perfBodyHtml += `
+      <details style="margin-bottom:12px;" open>
+        <summary style="cursor:pointer;font-size:13px;font-weight:600;color:var(--fg);user-select:none;padding:6px 0;list-style:none;display:flex;align-items:center;gap:8px;">
+          <span style="font-size:10px;color:var(--muted);">▶</span> Model Alpha
+          <span style="font-size:11px;font-weight:400;color:var(--muted);margin-left:4px;">
+            Entry Discount <span class="${edCls}">${entryDisc != null ? edSign + entryDisc + 'pp' : '—'}</span>
+            &nbsp;·&nbsp; Pin Drift <span class="${pdCls}">${pinDrift != null ? pdSign + pinDrift + 'pp' : '—'}</span>
+          </span>
+        </summary>
+        <div style="font-size:11px;color:var(--muted);margin:4px 0 8px;line-height:1.5;">
+          <strong style="color:var(--fg);">Entry Discount</strong> = Pinnacle fair value − Kalshi entry price. This is your actual alpha — the mispricing you exploited at the moment of the bet.<br>
+          <strong style="color:var(--fg);">Pin Drift</strong> = Pinnacle close − Pinnacle at entry. Did the sharp market confirm your read after you bet? Positive = Pinnacle agreed. Zero = you got a good price but Pin held flat.<br>
+          <strong style="color:var(--fg);">Delta</strong> = actual win rate minus Kalshi's implied probability. Positive = outperforming market expectations.
+        </div>
+        <table style="font-size:12px;">
+          <thead><tr>
+            <th>Edge Bucket</th>
+            <th class="num">N</th>
+            <th class="num">Win Rate</th>
+            <th class="num" title="What Kalshi implied your win probability was at entry">Expected</th>
+            <th class="num" title="Actual minus expected — are higher edges winning proportionally more?">Delta</th>
+          </tr></thead>
+          <tbody>${alphaRows}</tbody>
+        </table>
+      </details>`;
   }
 
   // ── Data-quality audit table ─────────────────────────────────────────────
@@ -4788,48 +4890,53 @@ function renderPerformance(d) {
     const edgeCell = b.raw_edge_pct != null && b.raw_edge_pct !== b.edge_pct
       ? `<span title="raw ${b.raw_edge_pct}% → adj ${b.edge_pct}%">${b.edge_pct}%<span style="color:var(--muted);font-size:10px;"> (raw ${b.raw_edge_pct}%)</span></span>`
       : `${b.edge_pct}%`;
-    // Line Move: Kalshi entry → Pinnacle close (side-adjusted arrow), Pin at entry sub-line
-    const entryK   = b.kalshi_price != null ? (b.kalshi_price * 100).toFixed(0) : null;
-    const pinEntry = b.pin_prob_at_flag != null ? b.pin_prob_at_flag.toFixed(1) : null;
+    // Line Move: shows entry discount (alpha captured) and pin drift (true CLV)
+    const entryK      = b.kalshi_price    != null ? (b.kalshi_price * 100).toFixed(0) : null;
+    const pinAtEntry  = b.pin_prob_at_flag != null ? b.pin_prob_at_flag.toFixed(1)    : null;
+    const pinAtClose  = b.closing_pin_pct  != null && b.status !== 'open' ? b.closing_pin_pct.toFixed(1) : null;
+    const kalshiClose = b.closing_yes_pct  != null && b.status !== 'open' ? (b.closing_yes_pct).toFixed(0) : null;
 
-    // Pinnacle close — already side-adjusted
-    let pinClose = null;
-    if (b.closing_pin_pct != null && b.status !== 'open') {
-      pinClose = b.closing_pin_pct.toFixed(0);
-    }
-
-    // Side-adjusted delta: did Pinnacle close move IN FAVOR of the bet?
-    // YES bet: higher close = good (Pin agreed you were right)
-    // NO  bet: lower close = good (Pin moved toward NO side)
     let lineMoveCell = '—';
     if (entryK != null) {
-      let closeTxt;
-      if (pinClose == null) {
-        closeTxt = `<span style="color:var(--muted);">→ open</span>`;
-      } else {
-        const pinDelta = parseFloat(pinClose) - parseFloat(entryK);
-        const favorable = pinDelta > 0;
-        const closeColor = pinDelta === 0 ? 'var(--fg)' : favorable ? 'var(--green)' : 'var(--red)';
-        closeTxt = `<span style="color:${closeColor};font-weight:600;">→ ${pinClose}¢</span><span style="font-size:9px;color:var(--muted);"> Pin</span>`;
+      // Row 1 — Entry Discount: how mispriced was Kalshi vs Pin at the moment we bet?
+      let discountLine = '';
+      if (b.entry_discount != null) {
+        const dColor = b.entry_discount > 0 ? 'var(--green)' : 'var(--red)';
+        const dSign  = b.entry_discount > 0 ? '+' : '';
+        discountLine = `<div style="font-size:11px;" title="Entry Discount: Pinnacle fair value (${pinAtEntry}%) minus Kalshi entry (${entryK}¢). This is the alpha you captured — the actual market mispricing.">
+          <span style="color:var(--muted);font-size:10px;">Discount </span><span style="color:${dColor};font-weight:700;">${dSign}${b.entry_discount}pp</span>
+          <span style="color:var(--muted);font-size:10px;"> (Pin ${pinAtEntry}% vs K ${entryK}¢)</span>
+        </div>`;
+      } else if (pinAtEntry != null) {
+        discountLine = `<div style="font-size:10px;color:var(--muted);">Pin at entry: ${pinAtEntry}%</div>`;
       }
-      const pinLine = pinEntry != null
-        ? `<div style="font-size:10px;color:var(--muted);margin-top:1px;">Pin at entry: ${pinEntry}¢</div>`
-        : '';
-      // CLV dual display: "+5.3pp (+12.62%)" — pp form for model accuracy, ROI form for intuition
-      let clvLine = '';
-      if (b.clv != null && b.clv !== 0 && b.status !== 'open') {
-        const clvPp  = b.clv;
-        const clvPct = b.clv_pct != null ? b.clv_pct : null;
-        const clvColor = clvPp > 0 ? 'var(--green)' : 'var(--red)';
-        const clvSign  = clvPp > 0 ? '+' : '';
-        const roiTxt   = clvPct != null
-          ? ` <span style="color:${clvColor};font-size:10px;">(${clvPct > 0 ? '+' : ''}${clvPct}%)</span>`
-          : '';
-        clvLine = `<div style="font-size:11px;margin-top:2px;" title="CLV: ${clvSign}${clvPp}pp (percentage points) | ROI on stake: ${clvPct != null ? (clvPct > 0 ? '+' : '') + clvPct + '%' : '—'}">
-          <span style="color:${clvColor};font-weight:700;">${clvSign}${clvPp}pp</span>${roiTxt}
+
+      // Row 2 — Pin Drift: did the sharp market agree with us after we bet?
+      let driftLine = '';
+      if (b.pin_drift != null && b.status !== 'open') {
+        const drColor = b.pin_drift > 0 ? 'var(--green)' : b.pin_drift < 0 ? 'var(--red)' : 'var(--fg)';
+        const drSign  = b.pin_drift > 0 ? '+' : '';
+        const driftTitle = `Pin Drift: Pinnacle moved ${drSign}${b.pin_drift}pp after entry (${pinAtEntry}% → ${pinAtClose}%). Positive = Pin agreed with your read.`;
+        driftLine = `<div style="font-size:11px;margin-top:2px;" title="${driftTitle}">
+          <span style="color:var(--muted);font-size:10px;">Pin Drift </span><span style="color:${drColor};font-weight:700;">${drSign}${b.pin_drift}pp</span>
+          <span style="color:var(--muted);font-size:10px;"> (→ ${pinAtClose ?? 'open'}%)</span>
+        </div>`;
+      } else if (b.status === 'open') {
+        driftLine = `<span style="color:var(--muted);font-size:10px;">→ open</span>`;
+      }
+
+      // Row 3 — Kalshi repricing: did the market rerate our contract?
+      let kalshiLine = '';
+      if (kalshiClose != null) {
+        const kDelta = parseFloat(kalshiClose) - parseFloat(entryK);
+        const kColor = kDelta > 0 ? 'var(--green)' : kDelta < 0 ? 'var(--red)' : 'var(--fg)';
+        const kSign  = kDelta > 0 ? '+' : '';
+        kalshiLine = `<div style="font-size:10px;margin-top:2px;color:var(--muted);" title="Kalshi repricing: market moved from ${entryK}¢ to ${kalshiClose}¢ by game start">
+          K: ${entryK}¢ <span style="color:${kColor};">→ ${kalshiClose}¢ (${kSign}${kDelta.toFixed(0)}¢)</span>
         </div>`;
       }
-      lineMoveCell = `<div style="white-space:nowrap;"><span style="color:var(--fg);">${entryK}¢</span> ${closeTxt}</div>${pinLine}${clvLine}`;
+
+      lineMoveCell = `${discountLine}${driftLine}${kalshiLine}`;
     }
     const corrBadge = b.correlated
       ? `<span title="Correlated — same game/type/side already open. Logged for record; excluded from win rate &amp; Kelly stats." style="font-size:9px;font-weight:700;color:#e3a53a;background:rgba(227,165,58,0.12);border:1px solid rgba(227,165,58,0.3);border-radius:3px;padding:1px 4px;margin-left:5px;vertical-align:middle;">CORR</span>`

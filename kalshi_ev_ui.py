@@ -214,19 +214,28 @@ def _is_shadow(ticker: str) -> bool:
 #   4–12 h  →  0.50× (mid-day discovery window)
 #   < 4 h   →  1.00× (peak liquidity — full edge)
 def _time_kelly_mult(game_time_iso: str | None) -> float:
-    """Return the time-to-matchup Kelly multiplier for a given game_time ISO string."""
+    """Return the time-to-matchup Kelly multiplier for a given game_time ISO string.
+
+    Calibrated from 71 settled bets (Jun 2026):
+      4-12h window: +15.3pp delta, +9.34 flat units → full Kelly
+      12-24h window: +1.7pp delta, +0.52 flat units → mild discount
+      <4h window:  -4.8pp delta, -2.78 flat units → penalise (peak-hour noise)
+      24h+: too few bets to trust → conservative
+    """
     if not game_time_iso:
-        return 0.50   # unknown game time — treat as mid-range
+        return 0.75   # unknown game time — treat as mid-range
     try:
         gt = datetime.fromisoformat(game_time_iso.replace("Z", "+00:00"))
         hours_until = (gt - datetime.now(timezone.utc)).total_seconds() / 3600
     except (ValueError, AttributeError):
-        return 0.50
+        return 0.75
+    if hours_until > 24:
+        return 0.25   # too far out — very few data points
     if hours_until > 12:
-        return 0.25
+        return 0.75   # 12-24h — neutral performance, mild discount
     if hours_until >= 4:
-        return 0.50
-    return 1.00
+        return 1.00   # 4-12h — best performing window, full Kelly
+    return 0.50       # <4h — worst performers (peak-hour noise), penalise
 
 # ── Shared state (updated by background thread) ───────────────────────────────
 _lock    = threading.Lock()

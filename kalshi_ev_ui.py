@@ -1425,17 +1425,18 @@ def _get_performance(since: Optional[str] = None) -> dict:
     )
     table_bets = _clean_table + _corrupt_table
     for b in table_bets:
-        kf = _kelly_frac(b)
-        kp = _kelly_pnl(b)
-        b["kelly_bet_pct"]     = round(kf * 100, 3)           # e.g. 1.5 = 1.5% of bankroll
+        is_shadow_b = _is_shadow_bet(b)
+        kf = 0.0 if is_shadow_b else _kelly_frac(b)
+        kp = None if is_shadow_b else _kelly_pnl(b)
+        b["kelly_bet_pct"]     = round(kf * 100, 3)
         b["kelly_bet_dollars"] = round(kf * PERF_BANKROLL, 2)
-        if b["status"] == "open":
-            b["kelly_pnl"]        = None
-            b["kelly_pnl_pct"]    = None
+        if b["status"] == "open" or is_shadow_b:
+            b["kelly_pnl"]         = None
+            b["kelly_pnl_pct"]     = None
             b["kelly_pnl_dollars"] = None
         else:
             b["kelly_pnl"]         = round(kp, 5) if kp is not None else None
-            b["kelly_pnl_pct"]     = round(kp * 100, 3) if kp is not None else None  # % of bankroll
+            b["kelly_pnl_pct"]     = round(kp * 100, 3) if kp is not None else None
             b["kelly_pnl_dollars"] = round(kp * PERF_BANKROLL, 2) if kp is not None else None
         # Flag which multiplier was applied so the UI can show a note
         mtype = _infer_mkt_type(b)

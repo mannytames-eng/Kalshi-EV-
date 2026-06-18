@@ -58,7 +58,7 @@ ODDS_BASE   = "https://api.the-odds-api.com/v4"
 # For a typical 52% fair / 45¢ entry, this costs ~2pp of the apparent edge.
 # A raw gap of 3% becomes ~0.9% true EV — still positive but thin.
 KALSHI_FEE_RATE    = 0.07    # Kalshi profit fee (7% of winnings) — update if tier changes
-EDGE_THRESHOLD     = 0.015   # ≥1.5% fee+haircut-adjusted EV to flag
+EDGE_THRESHOLD     = 0.020   # ≥2.0% fee+haircut-adjusted EV to flag
 MAX_EDGE           = 0.20    # reject edges >20% — almost certainly a stale line
 EV_HAIRCUT         = 0.05    # model-uncertainty discount (5%)
 TOP_BETS_PER_CYCLE = 50      # surface up to 50 qualifying bets per scan

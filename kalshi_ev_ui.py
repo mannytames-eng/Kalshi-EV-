@@ -1806,7 +1806,7 @@ def _settle_my_bets():
 
 
 # ── Twilio SMS alerts ─────────────────────────────────────────────────────────
-_ALERT_MIN    = float(os.getenv("ALERT_MIN_EDGE", "0.015"))  # Discord alerts at ≥1.5% edge (matches EDGE_THRESHOLD)
+_ALERT_MIN    = float(os.getenv("ALERT_MIN_EDGE", "0.020"))  # Discord alerts at ≥2.0% edge (matches EDGE_THRESHOLD)
 _BET_SIZE     = float(os.getenv("ALERT_BET_SIZE", "20"))
 
 # ── Discord webhook alert config ───────────────────────────────────────────────

@@ -2505,13 +2505,13 @@ def _run_scan():
         now_ts = time.time()
         if now_ts - _last_props_scan >= _props_refresh_interval():
             try:
-                mlb_props = scan_player_props(odds_sport="baseball_mlb", abbr_map=MLB_ABBR)
+                mlb_props, _fresh_prop_snap = scan_player_props(odds_sport="baseball_mlb", abbr_map=MLB_ABBR)
             except Exception as _prop_exc:
                 print(f"  Props scan error: {_prop_exc}")
-                mlb_props = []
+                mlb_props, _fresh_prop_snap = [], {}
             _last_props_scan = now_ts
         else:
-            mlb_props = []
+            mlb_props, _fresh_prop_snap = [], {}
 
         all_edges = sorted(mlb + nba + mlb_props, key=lambda x: x["edge"], reverse=True)
 
@@ -2665,26 +2665,8 @@ def _run_scan():
             # directly, so any future edge source added to all_edges is
             # automatically included here with no extra changes needed.
             global _last_prop_snapshot
-            if mlb_props:   # fresh prop scan this cycle — rebuild prop snapshot
-                _last_prop_snapshot = {}
-                for _pe in all_edges:
-                    if _pe.get("mkt_type") != "prop":
-                        continue
-                    _ticker = _pe.get("ticker", "")
-                    _side   = _pe.get("side", "")
-                    if not _ticker or not _side:
-                        continue
-                    _adj_edge = _pe.get("edge", 0.0)
-                    _kalshi   = _pe.get("kalshi", 0.0)
-                    _fair     = _pe.get("fair", 0.0)
-                    _last_prop_snapshot[f"{_ticker}|{_side}"] = {
-                        "adj_edge":   round(_adj_edge, 4),
-                        "kalshi":     round(_kalshi, 4),
-                        "fair":       round(_fair, 4),
-                        "edge_pct":   round(_adj_edge * 100, 1),
-                        "pin_line":   _pe.get("pin_line"),
-                        "kalshi_line": _pe.get("kalshi_line"),
-                    }
+            if _fresh_prop_snap:   # fresh prop scan this cycle — use full snapshot (all markets, not just above-threshold)
+                _last_prop_snapshot = _fresh_prop_snap
 
             # Merge: game-line snapshot + last known prop snapshot.
             # Game lines take precedence on key collision (shouldn't happen).

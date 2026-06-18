@@ -2305,6 +2305,7 @@ def scan_player_props(
     print(f"{'═'*70}")
 
     now_utc = datetime.now(timezone.utc)
+    prop_snapshot: Dict[str, dict] = {}   # all scanned markets regardless of threshold
 
     # 1. Collect Kalshi prop markets
     kalshi_props: List[dict] = []
@@ -2372,7 +2373,7 @@ def scan_player_props(
 
     if not kalshi_props:
         print("  No open Kalshi prop markets found.")
-        return []
+        return [], {}
     print(f"  Kalshi prop markets collected: {len(kalshi_props)}")
 
     # 2. Build needed-teams set
@@ -2397,7 +2398,7 @@ def scan_player_props(
         odds_events = fetch_odds_events_list(odds_sport)
     except Exception as e:
         print(f"  ERROR — Odds API events list: {e}")
-        return []
+        return [], {}
 
     # 4. Build player prop consensus index
     player_lookup = build_all_player_props(odds_sport, odds_events, needed_teams or None, markets=prop_markets)
@@ -2475,6 +2476,21 @@ def scan_player_props(
         no_adj   = (no_raw  - no_fee)  * (1 - EV_HAIRCUT)
 
         best_adj = max(yes_adj, no_adj)
+
+        # Full prop snapshot — capture current Kalshi + Pinnacle for ALL markets
+        # regardless of threshold so the UI can show live prices on logged bets
+        # even after the edge has closed.
+        _snap_ticker = kp.get("ticker", "")
+        if _snap_ticker:
+            prop_snapshot[f"{_snap_ticker}|YES"] = {
+                "adj_edge": round(yes_adj, 4), "kalshi": round(yes_ask, 4),
+                "fair": round(fair_over, 4),   "edge_pct": round(yes_adj * 100, 1),
+            }
+            prop_snapshot[f"{_snap_ticker}|NO"] = {
+                "adj_edge": round(no_adj, 4), "kalshi": round(1 - yes_bid, 4),
+                "fair": round(fair_under, 4), "edge_pct": round(no_adj * 100, 1),
+            }
+
         if best_adj < EDGE_THRESHOLD:
             continue
         if best_adj > PROP_MAX_EDGE:   # 15% cap — tighter than game-line MAX_EDGE (20%); very large prop edges are almost always a mismatch
@@ -2570,7 +2586,7 @@ def scan_player_props(
                 f"{e['side']:<4} {e['raw_edge']:>+5.1%} "
                 f"\033[92m{e['edge']:>+5.1%}\033[0m  {stars}"
             )
-    return edges
+    return edges, prop_snapshot
 
 
 def scan_nba_player_props() -> List[dict]:

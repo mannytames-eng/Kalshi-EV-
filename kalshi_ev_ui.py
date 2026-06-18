@@ -1364,7 +1364,23 @@ def _get_performance(since: Optional[str] = None) -> dict:
         if k <= 0 or k >= 1 or e <= 0:
             return 0.0
         full_kelly = e / (1.0 - k)
-        time_mult  = _time_kelly_mult(b.get("game_time"))
+        # For settled/historical bets reconstruct the multiplier using flagged_at
+        # vs game_time so we don't penalise all past bets with the <4h bracket
+        # just because their game_time is now in the past.
+        _flagged = b.get("flagged_at")
+        _gt      = b.get("game_time")
+        if b["status"] in ("won", "lost") and _flagged and _gt:
+            try:
+                _hrs = (datetime.fromisoformat(_gt.replace("Z", "+00:00")) -
+                        datetime.fromisoformat(_flagged.replace("Z", "+00:00"))).total_seconds() / 3600
+                if _hrs > 24:   time_mult = 0.25
+                elif _hrs > 12: time_mult = 0.75
+                elif _hrs >= 4: time_mult = 1.00
+                else:           time_mult = 0.50
+            except (ValueError, AttributeError):
+                time_mult = _time_kelly_mult(b.get("game_time"))
+        else:
+            time_mult  = _time_kelly_mult(b.get("game_time"))
         mtype      = _infer_mkt_type(b)
         clv_mult   = clv_mults.get(mtype, 1.0)
         return min(full_kelly * KELLY_FRACTION * time_mult * clv_mult, KELLY_SINGLE_CAP)

@@ -627,6 +627,60 @@ for _b in _bets:
         _data_fixed = True
         print(f"  Shadow-backfill: zeroed stake/pnl on {_b.get('id','?')}")
 
+# Fix: Retroactively resize all non-shadow paper stakes using the corrected
+# time-Kelly multiplier (flipped Jun 2026 based on 71-bet performance data).
+# Uses flagged_at vs game_time to reconstruct the correct multiplier at entry.
+# Bets without game_time get 0.75x (unknown, same as live default).
+_RESIZE_VERSION = "v2_flipped_time_mult"
+_resized_count = 0
+for _b in _bets:
+    if _b.get("shadow") or _b.get("correlated"):
+        continue
+    if _b.get("clv_source") == "corrupted_utc":
+        continue
+    if _b.get("_resize_version") == _RESIZE_VERSION:
+        continue   # already resized in a previous deploy
+    _flagged = _b.get("flagged_at")
+    _gt      = _b.get("game_time")
+    _edge    = _b.get("edge_pct", 0) / 100.0
+    _kprice  = _b.get("kalshi_price", 0)
+    if not _flagged or _edge <= 0 or _kprice <= 0 or _kprice >= 1:
+        _b["_resize_version"] = _RESIZE_VERSION
+        continue
+    # Compute hours between flag time and game time
+    try:
+        _dt_flag = datetime.fromisoformat(_flagged.replace("Z", "+00:00"))
+        _dt_game = datetime.fromisoformat(_gt.replace("Z", "+00:00")) if _gt else None
+        _hrs = (_dt_game - _dt_flag).total_seconds() / 3600 if _dt_game else None
+    except (ValueError, AttributeError):
+        _hrs = None
+    # New multiplier brackets (data-driven)
+    if _hrs is None:
+        _tmult = 0.75
+    elif _hrs > 24:
+        _tmult = 0.25
+    elif _hrs > 12:
+        _tmult = 0.75
+    elif _hrs >= 4:
+        _tmult = 1.00
+    else:
+        _tmult = 0.50
+    # Recompute stake
+    _full_k   = _edge / (1.0 - _kprice)
+    _new_stake = round(min(_full_k * PAPER_KELLY_FRACTION * _tmult, PAPER_KELLY_CAP) * PAPER_START_BALANCE, 2)
+    _old_stake = _b.get("paper_stake", 0) or 0
+    _b["paper_stake"]      = _new_stake
+    _b["_resize_version"]  = _RESIZE_VERSION
+    # Recompute paper_pnl for settled bets
+    if _b.get("status") == "won":
+        _b["paper_pnl"] = round(_new_stake * (1.0 - _kprice) / _kprice, 2)
+    elif _b.get("status") == "lost":
+        _b["paper_pnl"] = round(-_new_stake, 2)
+    _resized_count += 1
+if _resized_count:
+    _data_fixed = True
+    print(f"  Retroactive resize: updated stakes/pnl on {_resized_count} bet(s) → new time-Kelly multipliers")
+
 if _data_fixed:
     _save_bets(_bets)
     print("  Applied one-time data corrections (CLV/pin_entry upgrades)")

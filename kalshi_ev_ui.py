@@ -752,8 +752,8 @@ def _add_new_bets(edges: list) -> list:
             # on a prop carries far more variance than 3% on a total or spread,
             # so we require a 7% minimum before logging or staking.
             # Game lines (total, spread) remain at the global 3% floor.
-            if e.get("mkt_type") == "prop" and e.get("edge_pct", 0) < 1.5:
-                print(f"  PASS (prop <1.5%): {e.get('title','')} "
+            if e.get("mkt_type") == "prop" and e.get("edge_pct", 0) < EDGE_THRESHOLD * 100:
+                print(f"  PASS (prop <{EDGE_THRESHOLD*100:.0f}%): {e.get('title','')} "
                       f"{e.get('side','')} edge={e.get('edge_pct',0):.1f}% — skipped")
                 continue
 
@@ -1984,32 +1984,43 @@ def _alert_top10(newly_logged: list = None):
     """
     After each scan, alert on newly logged bets + gone-edge follow-ups.
 
-    newly_logged: bets just added by _add_new_bets this cycle. Only these get
-    new-edge alerts — guarantees every notification corresponds to a logged bet.
-    If None (legacy), falls back to reading _state["edges"] (old behaviour).
+    Alerts fire exactly once per bet (keyed by matchup+title+side+date).
+    Retry-safe: if send_discord fails, the key is NOT added to _alerted_keys,
+    so the next cycle will retry by catching the bet in the recent-unalerted
+    sweep (flagged within last 30 min, still open, not yet alerted).
     """
     global _alerted_keys
 
-    # Always read current scan edges — needed for gone-edge follow-up regardless of path
+    # Always read current scan edges — needed for gone-edge follow-up
     with _lock:
         game_edges = list(_state.get("edges", []))
 
     min_edge = _ALERT_MIN
-    if newly_logged is not None:
-        # New behaviour: alert only on bets that were actually just logged
-        all_edges = sorted(
-            [b for b in newly_logged
-             if b.get("edge_pct", 0) >= min_edge * 100],
-            key=lambda x: x.get("edge_pct", 0),
-            reverse=True,
-        )
-    else:
-        all_edges = sorted(
-            [e for e in game_edges
-             if e.get("edge_pct", e.get("edge", 0) * 100) >= min_edge * 100],
-            key=lambda x: x.get("edge_pct", x.get("edge", 0) * 100),
-            reverse=True,
-        )
+
+    # Primary: bets logged this cycle
+    this_cycle = sorted(
+        [b for b in (newly_logged or []) if b.get("edge_pct", 0) >= min_edge * 100],
+        key=lambda x: x.get("edge_pct", 0), reverse=True,
+    )
+
+    # Retry safety net: open bets flagged in the last 30 min that never got
+    # an alert (covers send_discord failures and any edge-case skip paths).
+    _cutoff = (datetime.now(timezone.utc) - __import__('datetime').timedelta(minutes=30)).isoformat()
+    with _bets_lock:
+        recent_bets = list(_bets)
+    retry_bets = [
+        b for b in recent_bets
+        if b["status"] == "open"
+        and b.get("edge_pct", 0) >= min_edge * 100
+        and not b.get("shadow")
+        and b.get("flagged_at", "") >= _cutoff
+        and _edge_key(b) not in _alerted_keys
+        and b not in this_cycle   # don't double-count bets already in this_cycle
+    ]
+    if retry_bets:
+        print(f"  Discord retry: {len(retry_bets)} unalerted bet(s) from last 30 min")
+
+    all_edges = this_cycle + retry_bets
 
     now_utc = datetime.now(timezone.utc)
     clv_mults = _get_clv_multipliers()

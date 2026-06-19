@@ -72,6 +72,14 @@ MIN_KALSHI_PRICE   = 0.15
 
 MAX_PROP_EVENTS = 15         # prop scan credit budget — MLB only (15 events × 1 credit each)
 
+# ── Prop lambda sanity check ─────────────────────────────────────────────────
+# After computing fair_over from Pinnacle's lambda, also compute what retail
+# books (DK/FanDuel) imply at the *same* Kalshi threshold using their own
+# Poisson lambdas. If Pinnacle diverges from retail by more than this gap,
+# the Pinnacle line is likely stale (e.g. pre-lineup early morning price).
+# The bet is shadowed (tracked, not flagged) until the lines converge.
+PROP_LAMBDA_SANITY_GAP = 0.12  # 12pp divergence at Kalshi threshold → shadow
+
 # ── Book weights for consensus probability ───────────────────────────────────
 # Fair value is Pinnacle ONLY — the sharpest closing-line book.
 # DK and FD are still fetched and used as CONFIRMATION signals in
@@ -2258,13 +2266,27 @@ def build_all_player_props(
                 if lam is None:
                     continue
 
+                # Per-book lambdas — each book fitted to its own line.
+                # Used later to cross-check Pinnacle at the Kalshi threshold.
+                per_book_lambdas: Dict[str, float] = {}
+                for bkey, be in book_entries.items():
+                    op = be.get("over_price")
+                    up = be.get("under_price")
+                    if op is None or up is None:
+                        continue
+                    bpo, _ = no_vig_prob(op, up)
+                    blam = poisson_lambda_from_line(be["line"], bpo)
+                    if blam is not None:
+                        per_book_lambdas[bkey] = blam
+
                 entry = {
-                    "player":       next(iter(book_entries.values()))["player"],
-                    "line":         ref_line,
-                    "over_prob":    consensus_po,
-                    "lambda":       lam,
-                    "books_used":   list(book_probs.keys()),
-                    "books_detail": book_probs,
+                    "player":            next(iter(book_entries.values()))["player"],
+                    "line":              ref_line,
+                    "over_prob":         consensus_po,
+                    "lambda":            lam,
+                    "books_used":        list(book_probs.keys()),
+                    "books_detail":      book_probs,
+                    "per_book_lambdas":  per_book_lambdas,
                 }
                 player_lookup.setdefault(player_key, {})[mtype] = entry
 
@@ -2466,6 +2488,29 @@ def scan_player_props(
         fair_over  = 1.0 - poisson_cdf(t_int, lam)
         fair_under = 1.0 - fair_over
 
+        # ── Prop lambda sanity check ─────────────────────────────────────────
+        # Convert each retail book's lambda to the same Kalshi threshold and
+        # compare against Pinnacle. A >12pp gap means Pinnacle's line is likely
+        # stale (pre-lineup early price). Shadow the bet rather than flagging.
+        _per_book_lams = matched.get("per_book_lambdas", {})
+        _retail_lams   = {b: l for b, l in _per_book_lams.items() if b != "pinnacle"}
+        _prop_sanity_shadow = False
+        if "pinnacle" in _per_book_lams and _retail_lams:
+            _retail_fairs = [1.0 - poisson_cdf(t_int, l) for l in _retail_lams.values()]
+            _avg_retail   = sum(_retail_fairs) / len(_retail_fairs)
+            _gap          = abs(fair_over - _avg_retail)
+            if _gap > PROP_LAMBDA_SANITY_GAP:
+                _retail_str = "  ".join(
+                    f"{b}={1.0 - poisson_cdf(t_int, l):.1%}"
+                    for b, l in _retail_lams.items()
+                )
+                print(
+                    f"  ⚠ prop  {matched.get('player','?'):<25} "
+                    f"SANITY SHADOW — Pinnacle fair={fair_over:.1%} vs retail avg={_avg_retail:.1%} "
+                    f"(gap={_gap:.1%} > {PROP_LAMBDA_SANITY_GAP:.0%})  [{_retail_str}]"
+                )
+                _prop_sanity_shadow = True
+
         yes_bid, yes_ask = kp["yes_bid"], kp["yes_ask"]
         yes_raw  = fair_over  - yes_ask
         no_raw   = fair_under - (1.0 - yes_bid)
@@ -2567,6 +2612,7 @@ def scan_player_props(
             "is_valid_consensus":   True,
             "consensus_reason":     consensus_reason,  # e.g. "Confirmed by Pinnacle + FanDuel"
             "kalshi_price_ts":      now_utc.isoformat(),
+            "sanity_shadow":        _prop_sanity_shadow,
         })
 
     # Sort by confidence × adj_edge, correlation-control, top N

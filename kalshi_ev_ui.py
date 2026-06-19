@@ -849,7 +849,7 @@ def _add_new_bets(edges: list) -> list:
             # Resolve game_time for the time-adaptive Kelly multiplier
             _gt_dt = _parse_ticker_start_time(e["ticker"])
             _game_time_iso = _gt_dt.isoformat() if _gt_dt else None
-            shadow      = _is_shadow(e.get("ticker", ""))
+            shadow      = _is_shadow(e.get("ticker", "")) or e.get("sanity_shadow", False)
             paper_stake = 0.0 if shadow else _paper_kelly_stake(e["edge_pct"], e["kalshi"], _game_time_iso)
 
             # Pinnacle probability at flag time — the baseline for line-shift detection

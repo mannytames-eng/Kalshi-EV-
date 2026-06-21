@@ -983,6 +983,89 @@ def _build_score_index() -> dict:
     return index
 
 
+def _fetch_actual_stat(bet: dict) -> Optional[str]:
+    """
+    Fetch the actual stat result for a resolved prop bet from the MLB Stats API.
+    Returns a human-readable string like "7 Ks", "2 TB", "1 H", or None if unavailable.
+    """
+    prop_type = bet.get("prop_type", "")
+    matchup   = bet.get("matchup", "")
+    ticker    = bet.get("ticker", "")
+    if not prop_type or not matchup or not ticker:
+        return None
+
+    # Stat field mapping per prop type
+    stat_map = {
+        "pitcher_strikeouts":  ("pitching",  "strikeOuts",  "K"),
+        "batter_total_bases":  ("batting",   "totalBases",  "TB"),
+        "batter_hits":         ("batting",   "hits",        "H"),
+        "batter_home_runs":    ("batting",   "homeRuns",    "HR"),
+        "batter_rbis":         ("batting",   "rbi",         "RBI"),
+    }
+    if prop_type not in stat_map:
+        return None
+    stat_group, stat_field, stat_label = stat_map[prop_type]
+
+    game_date = _parse_ticker_date(ticker)
+    if not game_date:
+        return None
+
+    # Parse team abbreviations from ticker (e.g. CWSNYY → CWS, NYY)
+    m = re.search(r"-\d{2}[A-Z]{3}\d{6}([A-Z]{2,3})([A-Z]{2,3})-", ticker)
+    if not m:
+        return None
+    away_abbr, home_abbr = m.group(1), m.group(2)
+
+    try:
+        import urllib.request as _ur
+        # 1. Find the MLB game ID for this date + teams
+        sched_url = (
+            f"https://statsapi.mlb.com/api/v1/schedule?sportId=1&date={game_date}"
+            f"&hydrate=team&fields=dates,games,gamePk,teams,away,home,team,abbreviation"
+        )
+        with _ur.urlopen(sched_url, timeout=5) as r:
+            sched = json.loads(r.read())
+
+        game_pk = None
+        for date_entry in sched.get("dates", []):
+            for g in date_entry.get("games", []):
+                ga = g["teams"]["away"]["team"].get("abbreviation", "")
+                gh = g["teams"]["home"]["team"].get("abbreviation", "")
+                # Normalise a few MLB vs Kalshi abbr differences
+                _norm_abbr = {"CWS": "CWS", "KC": "KC", "WSH": "WSH", "SD": "SD"}
+                if ga in (away_abbr, _norm_abbr.get(away_abbr, "")) and \
+                   gh in (home_abbr, _norm_abbr.get(home_abbr, "")):
+                    game_pk = g["gamePk"]
+                    break
+            if game_pk:
+                break
+
+        if not game_pk:
+            return None
+
+        # 2. Fetch box score
+        box_url = f"https://statsapi.mlb.com/api/v1/game/{game_pk}/boxscore"
+        with _ur.urlopen(box_url, timeout=5) as r:
+            box = json.loads(r.read())
+
+        # 3. Find player by last name match across both teams
+        player_last = matchup.split()[-1].lower()
+        for side in ("away", "home"):
+            team_data = box.get("teams", {}).get(side, {})
+            for pid, pdata in team_data.get("players", {}).items():
+                full_name = pdata.get("person", {}).get("fullName", "")
+                if full_name.split()[-1].lower() != player_last:
+                    continue
+                stats = pdata.get("stats", {}).get(stat_group, {}).get("summary") or \
+                        pdata.get("stats", {}).get(stat_group, {})
+                val = stats.get(stat_field)
+                if val is not None:
+                    return f"{val} {stat_label}"
+    except Exception:
+        pass
+    return None
+
+
 def _resolve_from_score(bet: dict, score_index: dict) -> Optional[bool]:
     """
     For spread/total bets, determine win/loss from final scores.
@@ -1119,6 +1202,8 @@ def _check_resolutions():
                     b["status"]      = "won" if side_won else "lost"
                     b["resolved_at"] = datetime.now(timezone.utc).isoformat()
                     b["resolved_by"] = "score"
+                    if b.get("mkt_type") == "prop" and not b.get("actual_result"):
+                        b["actual_result"] = _fetch_actual_stat(b)
                     # Kelly P&L — use paper_stake as the bet size
                     ps = b.get("paper_stake") or 0.0
                     kelly_pnl = round(ps * (1 - k) / k, 2) if side_won else round(-ps, 2)
@@ -1202,6 +1287,8 @@ def _check_resolutions():
                         b["status"]          = "won" if side_won else "lost"
                         b["resolved_at"]     = datetime.now(timezone.utc).isoformat()
                         b["resolved_by"]     = "kalshi"
+                        if b.get("mkt_type") == "prop" and not b.get("actual_result"):
+                            b["actual_result"] = _fetch_actual_stat(b)
                         if closing_yes is not None:
                             b["closing_yes_pct"] = closing_yes
                         if bet_pin_close is not None:
@@ -4479,7 +4566,7 @@ function renderTop10() {
     const typeTag = isProp
       ? `<span style="font-size:9px;background:#2d1f4e;color:#a371f7;padding:1px 4px;border-radius:3px;margin-right:4px;">PROP</span>`
       : `<span style="font-size:9px;background:${sBg};color:${sFg};padding:1px 4px;border-radius:3px;margin-right:4px;">${sportLabel}</span>`;
-    const unvalidatedBadge = isProp ? '<span class="badge-unvalidated">⚠ UNVALIDATED</span>' : '';
+    const unvalidatedBadge = '';
     const booksCell = (e.books_used && e.books_used.length)
       ? `<span style="font-size:9px;color:var(--muted);">${e.books_used.map(b=>b.replace('draftkings','DK').replace('fanduel','FD').replace('pinnacle','PIN')).join('+')}</span>`
       : '';
@@ -4799,9 +4886,7 @@ function renderPerformance(d) {
       const shadowRowBadge = isShadowRow
         ? ` <span style="font-size:9px;font-weight:700;color:#58a6ff;background:rgba(88,166,255,0.10);border:1px solid rgba(88,166,255,0.3);border-radius:3px;padding:1px 4px;vertical-align:middle;">SHADOW</span>`
         : '';
-      const labelCell = isProp && !isShadowRow
-        ? `<span style="font-weight:600;">${t.label}</span>${shadowRowBadge} <span class="badge-unvalidated">⚠ UNVALIDATED</span>`
-        : `<span style="font-weight:600;">${t.label}</span>${shadowRowBadge}`;
+      const labelCell = `<span style="font-weight:600;">${t.label}</span>${shadowRowBadge}`;
       const kellyCell = kpct != null
         ? `<span class="${kcls}" title="$${t.kelly_dollars != null ? Math.abs(t.kelly_dollars).toFixed(0) : '?'} on $${bankroll} bank">${sign(kpct)}${kpct.toFixed(2)}%</span>`
         : '—';
@@ -5029,7 +5114,7 @@ function renderPerformance(d) {
       <td class="side-${b.side.toLowerCase()}">${b.side}</td>
       <td class="num">${edgeCell}</td>
       <td class="num">${lineMoveCell}</td>
-      <td class="num ${rClass}">${rLabel}</td>
+      <td class="num ${rClass}">${rLabel}${b.actual_result ? `<div style="font-size:10px;color:var(--muted);margin-top:2px;">${b.actual_result}</div>` : ''}</td>
       <td class="num">${kBet}</td>
       <td class="num">${kPnl}</td>
     </tr>`;

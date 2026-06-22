@@ -481,7 +481,11 @@ def fetch_player_prop_odds_event(sport: str, event_id: str, markets: str = None)
     Costs 1 Odds API credit per call.
     """
     if markets is None:
-        markets = "pitcher_strikeouts,batter_hits,batter_home_runs,batter_total_bases,batter_rbis"
+        markets = (
+            "pitcher_strikeouts,batter_hits,batter_home_runs,batter_total_bases,batter_rbis,"
+            "pitcher_strikeouts_alternate,batter_hits_alternate,"
+            "batter_total_bases_alternate,batter_rbis_alternate"
+        )
     sharp_books = ",".join(k for k, w in BOOK_WEIGHTS.items() if w > 0)
     r = requests.get(
         f"{ODDS_BASE}/sports/{sport}/events/{event_id}/odds",
@@ -2127,7 +2131,15 @@ def scan_sport(
 
 
 # ── Player-props helpers ──────────────────────────────────────────────────────
-PLAYER_PROP_MARKETS = "pitcher_strikeouts,batter_hits,batter_home_runs,batter_total_bases,batter_rbis"
+# Standard lines + alternate (milestone X+) lines. Alternates let us match
+# Kalshi's 0.5 / 2.5 / 3.5 markets against Pinnacle's REAL posted price at that
+# line (no Poisson extrapolation — Pinnacle stays the true anchor). HR omitted:
+# it's effectively a single 0.5 (1+) line, so an alternate adds nothing.
+PLAYER_PROP_MARKETS = (
+    "pitcher_strikeouts,batter_hits,batter_home_runs,batter_total_bases,batter_rbis,"
+    "pitcher_strikeouts_alternate,batter_hits_alternate,"
+    "batter_total_bases_alternate,batter_rbis_alternate"
+)
 NBA_PLAYER_PROP_MARKETS = "player_points,player_assists,player_threes"
 
 MLB_PROP_SERIES: Dict[str, str] = {
@@ -2206,17 +2218,24 @@ def build_all_player_props(
             print(f"    ERROR fetching props for {ev.get('away_team')} @ {ev.get('home_team')}: {e}")
             continue
 
-        # Accumulate per-book, per-player, per-prop-type prices
-        # accum[player_norm][prop_type][book_key] = {player, line, over_price, under_price}
-        accum: Dict[str, Dict[str, Dict[str, dict]]] = {}
+        # Accumulate per-book, per-player, per-prop-type, PER-LINE prices.
+        # Standard and *_alternate markets are merged under the same prop_type so
+        # all of a player's lines (0.5 / 1.5 / 2.5 / 3.5 …) coexist.
+        # accum[player_norm][prop_type][line][book_key] = {player, over_price, under_price}
+        accum: Dict[str, Dict[str, Dict[float, Dict[str, dict]]]] = {}
+        # std_line[player_norm][prop_type] = Pinnacle's STANDARD (non-alt) line —
+        # used to pick the "main" line for backward-compatible default pricing.
+        std_line: Dict[str, Dict[str, float]] = {}
 
         for bm in edata.get("bookmakers", []):
             bkey = bm["key"]
             if bkey not in BOOK_WEIGHTS:
                 continue
             for mkt in bm.get("markets", []):
-                mtype    = mkt.get("key", "")
-                outcomes = mkt.get("outcomes", [])
+                mtype_raw = mkt.get("key", "")
+                is_alt    = mtype_raw.endswith("_alternate")
+                mtype     = mtype_raw.replace("_alternate", "")
+                outcomes  = mkt.get("outcomes", [])
                 for o in outcomes:
                     direction = (o.get("name") or "").lower()
                     pname     = (o.get("description") or "").strip()
@@ -2225,69 +2244,81 @@ def build_all_player_props(
                     if not pname or direction not in ("over", "under"):
                         continue
                     key = _norm_player(pname)
-                    accum.setdefault(key, {}).setdefault(mtype, {}).setdefault(bkey, {
-                        "player": pname, "line": pt,
+                    lb = accum.setdefault(key, {}).setdefault(mtype, {}).setdefault(pt, {}).setdefault(bkey, {
+                        "player": pname,
                         "over_price": None, "under_price": None,
                     })
                     if direction == "over":
-                        accum[key][mtype][bkey]["over_price"] = price
-                        accum[key][mtype][bkey]["line"]       = pt
+                        lb["over_price"] = price
                     else:
-                        accum[key][mtype][bkey]["under_price"] = price
+                        lb["under_price"] = price
+                    if not is_alt and bkey == "pinnacle":
+                        std_line.setdefault(key, {})[mtype] = pt
 
-        # Convert per-book prices → weighted consensus no-vig over probability
+        # Convert per-book prices → weighted consensus no-vig over probability,
+        # building one entry per distinct line so alternate lines are priced from
+        # Pinnacle's REAL posted number (not Poisson-extrapolated).
         for player_key, props in accum.items():
-            for mtype, book_entries in props.items():
-                book_probs: Dict[str, float] = {}
-                ref_line: Optional[float] = None
+            for mtype, lines_dict in props.items():
+                line_entries: Dict[float, dict] = {}
 
-                for bkey, be in book_entries.items():
-                    op = be.get("over_price")
-                    up = be.get("under_price")
-                    if op is None or up is None:
+                for line_val, book_entries in lines_dict.items():
+                    book_probs: Dict[str, float] = {}
+                    for bkey, be in book_entries.items():
+                        op = be.get("over_price")
+                        up = be.get("under_price")
+                        if op is None or up is None:
+                            continue
+                        po, _ = no_vig_prob(op, up)
+                        book_probs[bkey] = po
+
+                    if not book_probs:
                         continue
-                    po, _ = no_vig_prob(op, up)
-                    book_probs[bkey] = po
-                    if ref_line is None:
-                        ref_line = be["line"]
-                    if bkey == "pinnacle":
-                        ref_line = be["line"]  # prefer Pinnacle's line
-
-                if not book_probs or ref_line is None:
-                    continue
-
-                # Safety: require Pinnacle or 2+ books for props too
-                if "pinnacle" not in book_probs and len(book_probs) < 2:
-                    continue
-
-                consensus_po, _ = _weighted_consensus(book_probs)
-
-                lam = poisson_lambda_from_line(ref_line, consensus_po)
-                if lam is None:
-                    continue
-
-                # Per-book lambdas — each book fitted to its own line.
-                # Used later to cross-check Pinnacle at the Kalshi threshold.
-                per_book_lambdas: Dict[str, float] = {}
-                for bkey, be in book_entries.items():
-                    op = be.get("over_price")
-                    up = be.get("under_price")
-                    if op is None or up is None:
+                    # Safety: require Pinnacle or 2+ books per line
+                    if "pinnacle" not in book_probs and len(book_probs) < 2:
                         continue
-                    bpo, _ = no_vig_prob(op, up)
-                    blam = poisson_lambda_from_line(be["line"], bpo)
-                    if blam is not None:
-                        per_book_lambdas[bkey] = blam
 
-                entry = {
-                    "player":            next(iter(book_entries.values()))["player"],
-                    "line":              ref_line,
-                    "over_prob":         consensus_po,
-                    "lambda":            lam,
-                    "books_used":        list(book_probs.keys()),
-                    "books_detail":      book_probs,
-                    "per_book_lambdas":  per_book_lambdas,
-                }
+                    consensus_po, _ = _weighted_consensus(book_probs)
+                    lam = poisson_lambda_from_line(line_val, consensus_po)
+                    if lam is None:
+                        continue
+
+                    # Per-book lambdas — each book fitted to THIS line.
+                    per_book_lambdas: Dict[str, float] = {}
+                    for bkey, be in book_entries.items():
+                        op = be.get("over_price")
+                        up = be.get("under_price")
+                        if op is None or up is None:
+                            continue
+                        bpo, _ = no_vig_prob(op, up)
+                        blam = poisson_lambda_from_line(line_val, bpo)
+                        if blam is not None:
+                            per_book_lambdas[bkey] = blam
+
+                    line_entries[line_val] = {
+                        "player":            next(iter(book_entries.values()))["player"],
+                        "line":              line_val,
+                        "over_prob":         consensus_po,
+                        "lambda":            lam,
+                        "books_used":        list(book_probs.keys()),
+                        "books_detail":      book_probs,
+                        "per_book_lambdas":  per_book_lambdas,
+                    }
+
+                if not line_entries:
+                    continue
+
+                # Main line (backward-compat default): Pinnacle's standard line if
+                # present, else the line closest to a coin flip.
+                main_line = std_line.get(player_key, {}).get(mtype)
+                if main_line not in line_entries:
+                    main_line = min(
+                        line_entries.keys(),
+                        key=lambda L: abs(line_entries[L]["over_prob"] - 0.5),
+                    )
+
+                entry = dict(line_entries[main_line])   # default = main line
+                entry["lines"] = line_entries           # all lines (incl. alternates)
                 player_lookup.setdefault(player_key, {})[mtype] = entry
 
         fetched += 1
@@ -2447,6 +2478,19 @@ def scan_player_props(
         matched = _find_player_in_title(search_title, prop_sublookup)
         if matched is None:
             continue
+
+        # ── Exact alternate-line match ───────────────────────────────────────
+        # If Pinnacle posts a real line at the Kalshi threshold (incl. alternate
+        # 0.5 / 2.5 / 3.5 milestone lines), price off that real number rather than
+        # the default main line. No Poisson extrapolation — Pinnacle's posted
+        # no-vig price at the exact line IS the fair value. Requires Pinnacle to
+        # be present on that line so it stays a true sharp anchor.
+        _kthresh    = kp["threshold"]
+        _line_ents  = matched.get("lines", {})
+        for _Lval, _lent in _line_ents.items():
+            if int(_Lval) == int(_kthresh) and "pinnacle" in _lent.get("books_detail", {}):
+                matched = _lent
+                break
 
         # ── Ghost-edge safeguard: integer boundary check ─────────────────────
         # Pinnacle uses half-integer lines (4.5, 5.5, 6.5 …).

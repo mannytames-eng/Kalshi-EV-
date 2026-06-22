@@ -4313,7 +4313,9 @@ function renderTodayEdges() {
       const maxPrice = curFair - MIN_EDGE;
       if (maxPrice > 0 && maxPrice < 1) {
         cutoffCents = maxPrice;
-        cutoffLabel = `${b.side} ≤ ${kalshiToAmerican(maxPrice)}`;
+        // Max price to pay, in cents — exactly what you type into Kalshi's
+        // limit-order field. Avoids American-odds sign confusion (+112 vs +122).
+        cutoffLabel = `${b.side} ≤ ${Math.round(maxPrice * 100)}¢`;
       }
     }
     const liveKalshiSide = curKalshi != null

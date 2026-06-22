@@ -4911,14 +4911,10 @@ function renderPerformance(d) {
       ${pill('Lost', d.lost, 'pnl-neg')}
       ${pill('Open', d.open, 'pnl-neu')}
       ${pill('Win Rate', na(d.win_rate, v => v + '%'))}
-      ${pill('Avg Entry Edge', na(d.avg_edge, v => `<span title="Average stated edge at time of flagging — settled bets only. Not a performance metric.">${'+' + v + '%'}</span>`))}
-      ${pill('Edge (14d)', recentEdgeVal)}
       ${pill('Last Bet', lastBetVal)}
       ${pill('Kelly P&amp;L (% bank)', d.total_kelly_pct != null ? `<span class="${kellyPctClass}">${sign(d.total_kelly_pct)}${d.total_kelly_pct.toFixed(2)}%</span>` : '—')}
-      ${pill('Flat Units', d.total_units != null ? `<span class="${d.total_units >= 0 ? 'pnl-pos' : 'pnl-neg'}" title="$1 flat stake on every bet regardless of sizing. Total: ${sign(d.total_units)}${d.total_units}u | Avg: ${sign(d.avg_units)}${d.avg_units}u/bet">${sign(d.total_units)}${d.total_units}u <span style="font-size:10px;opacity:0.7;">(${sign(d.avg_units)}${d.avg_units}/bet)</span></span>` : '—')}
       ${pill('Entry Discount', d.avg_entry_discount != null ? `<span class="${d.avg_entry_discount >= 0 ? 'pnl-pos' : 'pnl-neg'}" title="Avg (Pinnacle fair value − Kalshi entry) at time of bet. This is your actual alpha — the mispricing you captured. NOT affected by what happened after.">${d.avg_entry_discount > 0 ? '+' : ''}${d.avg_entry_discount}pp</span>` : '—')}
       ${pill('Pin Drift (True CLV)', d.avg_pin_drift != null ? `<span class="${d.avg_pin_drift >= 0 ? 'pnl-pos' : 'pnl-neg'}" title="Avg (Pinnacle close − Pinnacle at entry). Did the sharp market move in your favor AFTER you bet? Positive = Pin confirmed your edge. Zero = you got a good price but Pin didn't move. This is true closing line value.">${d.avg_pin_drift > 0 ? '+' : ''}${d.avg_pin_drift}pp</span>` : '—')}
-      <div class="stat-pill"><div class="label">Model vs Market</div><div class="value">${modelCallout}</div></div>
     </div>
     ${clvBreakdown}
     ${penaltyNote}

@@ -208,11 +208,12 @@ def _is_shadow(ticker: str) -> bool:
     return any(ticker.upper().startswith(s) for s in SHADOW_MARKETS)
 
 # ── Time-to-matchup Kelly multipliers ────────────────────────────────────────
-# Lines are softest and liquidity thinnest far from first pitch; scale down
-# early entries and trust the full edge only when the market has settled.
-#   > 12 h  →  0.25× (overnight / speculative lines)
-#   4–12 h  →  0.50× (mid-day discovery window)
-#   < 4 h   →  1.00× (peak liquidity — full edge)
+# Calibrated from settled-bet performance by time-to-first-pitch (Jun 2026):
+# the 4–12h discovery window outperforms, while sub-4h peak-hour entries lag.
+#   > 24 h  →  0.25× (too far out — very few data points)
+#   12–24 h →  0.75× (neutral performance, mild discount)
+#   4–12 h  →  1.00× (best-performing window — full edge)
+#   < 4 h   →  0.50× (peak-hour noise — worst performers, penalise)
 def _time_kelly_mult(game_time_iso: str | None) -> float:
     """Return the time-to-matchup Kelly multiplier for a given game_time ISO string.
 
@@ -3629,7 +3630,7 @@ HTML = """<!DOCTYPE html>
 
 
 <div id="paper-card" class="card">
-  <div class="card-header" onclick="toggleCard('paper-body')" style="border-left:3px solid #3fb950;">📊 PAPER PORTFOLIO (V2.0 - POST-THROTTLE) — 0.5 Kelly · Props 2.5%+ · Games 3%+ · $1,000 Starting Balance <span class="card-toggle" id="paper-body-toggle">▾</span></div>
+  <div class="card-header" onclick="toggleCard('paper-body')" style="border-left:3px solid #3fb950;">📊 PAPER PORTFOLIO (V2.0 - POST-THROTTLE) — Quarter-Kelly · Props 2.5%+ · Games 3%+ · $1,000 Starting Balance <span class="card-toggle" id="paper-body-toggle">▾</span></div>
   <div id="paper-body" class="card-body"><div class="empty"><span class="spinner"></span>Loading portfolio…</div></div>
 </div>
 
@@ -4859,7 +4860,7 @@ function renderPerformance(d) {
     ${clvBreakdown}
     ${penaltyNote}
     <p style="font-size:11px;color:var(--muted);padding-bottom:10px;">
-      P&amp;L sized by <strong>0.25 Fractional Kelly</strong>, capped at 5% per bet.
+      P&amp;L sized by <strong>0.25 Fractional Kelly</strong>, capped at 3% per bet.
       CLV-penalised types run at 0.5× until their closing-line value stabilises.
       Reported as <strong>% of bankroll</strong> — a 5¢ longshot loss shows −0.15%, not −1 unit.
       ${d.corrupted_excluded ? `<br><span style="color:#8b949e;">⚠ ${d.corrupted_excluded} bets excluded from all stats (wrong Pinnacle reference — UTC/ET date collision, fixed May 2026). Shown as <strong>BAD REF</strong> in the history table.</span>` : ''}
@@ -5291,7 +5292,7 @@ async function fetchPaper() {
       </div>
     </div>
     <div style="padding:6px 12px;border-bottom:1px solid var(--border);background:#0d1117;">
-      <span style="font-size:11px;color:var(--muted);">📊 V2.0 reset Jun 8 2026 ·<strong style="color:var(--text);">props ≥2.5% · games ≥3%</strong> · 0.5 Kelly (time-throttled: ×0.25 / ×0.50 / ×1.0) · 3% max stake · compounding from $${d.start_balance.toFixed(0)} since ${d.start_date} · CLV captured every 2 min until game start</span>
+      <span style="font-size:11px;color:var(--muted);">📊 V2.0 reset Jun 8 2026 ·<strong style="color:var(--text);">props ≥2.5% · games ≥3%</strong> · Quarter-Kelly (time-throttled: ×0.25 / ×0.50 / ×0.75 / ×1.0) · 3% max stake · compounding from $${d.start_balance.toFixed(0)} since ${d.start_date} · CLV captured every 2 min until game start</span>
     </div>`;
 
     // ── Bet table ──────────────────────────────────────────────────────────

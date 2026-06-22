@@ -195,6 +195,11 @@ PAPER_START_BALANCE  = 1000.0    # starting virtual bankroll
 PAPER_START_DATE     = "2026-06-08"  # V2.0 reset — pre-throttle + Jun 7 bad-pipeline bets archived
 PAPER_KELLY_FRACTION = 0.25     # quarter-Kelly base fraction
 PAPER_KELLY_CAP      = 0.03     # max 3% of current balance per bet (validation-phase cap)
+# Aggregate daily gate (on TOP of per-bet Kelly sizing — does not change it).
+# Rejects any new bet that would push today's committed Kelly stake above this
+# fraction of the starting bankroll. Resets at midnight Pacific. Guards against
+# over-exposure on high-volume days when many correctly-sized bets stack up.
+DAILY_EXPOSURE_CAP   = 0.15     # max 15% of bankroll committed per PT day
 
 # ── Shadow markets ─────────────────────────────────────────────────────────────
 # Markets listed here are fully tracked (logged, CLV captured, win/loss recorded)
@@ -771,6 +776,41 @@ def _paper_kelly_stake(edge_pct: float, kalshi_price: float,
     return round(frac * balance, 2)
 
 
+def _pt_date(iso_or_dt) -> str:
+    """Return the Pacific-time calendar date (YYYY-MM-DD) for a UTC ISO string or
+    datetime. Used for the daily exposure window, which resets at midnight PT."""
+    if not iso_or_dt:
+        return ""
+    try:
+        dt = (iso_or_dt if isinstance(iso_or_dt, datetime)
+              else datetime.fromisoformat(str(iso_or_dt).replace("Z", "+00:00")))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        try:
+            from zoneinfo import ZoneInfo
+            return dt.astimezone(ZoneInfo("America/Los_Angeles")).strftime("%Y-%m-%d")
+        except Exception:
+            # Fallback: fixed PDT offset (UTC-7) — correct during MLB season
+            from datetime import timedelta as _td
+            return (dt - _td(hours=7)).strftime("%Y-%m-%d")
+    except (ValueError, AttributeError, TypeError):
+        return ""
+
+
+def _todays_committed_exposure() -> float:
+    """Sum of paper_stake committed today (PT) across funded bets — i.e. the
+    same set that counts toward the paper balance (non-shadow, non-correlated,
+    non-capped; capped/shadow are $0 anyway). Caller must hold _bets_lock."""
+    today = _pt_date(datetime.now(timezone.utc))
+    return sum(
+        b.get("paper_stake", 0.0) or 0.0
+        for b in _bets
+        if not b.get("correlated", False)
+        and not b.get("shadow", False)
+        and _pt_date(b.get("flagged_at", "")) == today
+    )
+
+
 def _add_new_bets(edges: list) -> list:
     """Log any edge we haven't seen before as an open bet.  Returns list of newly added bets.
 
@@ -799,6 +839,10 @@ def _add_new_bets(edges: list) -> list:
             return (b["matchup"], b.get("mkt_type", ""), b["side"], gd)
 
         open_slots = {_open_slot(b) for b in _bets if b["status"] == "open"}
+        # Running total of Kelly stake already committed today (PT). New funded
+        # bets in this cycle add to it so the daily cap holds within one scan too.
+        _committed_today = _todays_committed_exposure()
+        _daily_cap_dollars = DAILY_EXPOSURE_CAP * PAPER_START_BALANCE
         added = 0
         for e in edges:
             # Skip edges already invalidated by Pinnacle line movement
@@ -853,6 +897,24 @@ def _add_new_bets(edges: list) -> list:
             shadow      = _is_shadow(e.get("ticker", "")) or e.get("sanity_shadow", False)
             paper_stake = 0.0 if shadow else _paper_kelly_stake(e["edge_pct"], e["kalshi"], _game_time_iso)
 
+            # ── Daily aggregate exposure gate (on TOP of per-bet Kelly) ──────
+            # Per-bet sizing above is untouched. If funding this bet would push
+            # today's committed Kelly stake past DAILY_EXPOSURE_CAP of bankroll,
+            # log it at $0 stake and flag it as daily_capped (visible, no P&L).
+            daily_capped = False
+            if not shadow and not is_correlated and paper_stake > 0:
+                if _committed_today + paper_stake > _daily_cap_dollars + 1e-9:
+                    print(
+                        f"  DAILY CAP: {e.get('title','')} {e.get('side','')} "
+                        f"— stake ${paper_stake:.2f} skipped (today "
+                        f"${_committed_today:.2f} + ${paper_stake:.2f} > cap "
+                        f"${_daily_cap_dollars:.2f} = {DAILY_EXPOSURE_CAP:.0%} of bank)"
+                    )
+                    daily_capped = True
+                    paper_stake  = 0.0
+                else:
+                    _committed_today += paper_stake
+
             # Pinnacle probability at flag time — the baseline for line-shift detection
             bd = e.get("books_detail", {})
             pin_prob_raw = bd.get("pinnacle")  # Pinnacle no-vig prob for YES side
@@ -902,6 +964,7 @@ def _add_new_bets(edges: list) -> list:
                 "paper_pnl":          None,                  # set on resolution
                 "correlated":         is_correlated,         # excluded from win-rate/Kelly stats
                 "shadow":             shadow,                 # True = tracked but $0 stake, excluded from balance
+                "daily_capped":       daily_capped,          # True = skipped (daily exposure cap), $0 stake
             }
 
             _bets.append(new_bet)
@@ -5290,6 +5353,19 @@ async function fetchPaper() {
         <div style="font-size:11px;color:var(--muted);margin-top:1px;">$${d.open_exposure.toFixed(2)} at risk</div>
         <div style="font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:0.06em;margin-top:3px;">Bankroll</div>
       </div>
+      ${(() => {
+        if (d.daily_exposure_pct == null || d.daily_cap_pct == null) return '';
+        const used = d.daily_exposure_pct, cap = d.daily_cap_pct;
+        const ratio = cap > 0 ? used / cap : 0;
+        const expColor = ratio >= 1 ? 'var(--red)' : ratio >= 0.8 ? '#e3a53a' : 'var(--green)';
+        const cappedTxt = d.daily_capped_today > 0
+          ? `${d.daily_capped_today} skipped (cap)` : 'within cap';
+        return `<div style="background:var(--surface);padding:14px 16px;text-align:center;">
+        <div style="font-size:22px;font-weight:700;color:${expColor};letter-spacing:-0.5px;">${used.toFixed(1)}% / ${cap.toFixed(0)}%</div>
+        <div style="font-size:11px;color:var(--muted);margin-top:1px;">${cappedTxt}</div>
+        <div style="font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:0.06em;margin-top:3px;" title="Total Kelly stake committed today (PT) vs the DAILY_EXPOSURE_CAP. New bets that would exceed the cap are logged at $0 stake.">Daily Exposure</div>
+      </div>`;
+      })()}
     </div>
     <div style="padding:6px 12px;border-bottom:1px solid var(--border);background:#0d1117;">
       <span style="font-size:11px;color:var(--muted);">📊 V2.0 reset Jun 8 2026 ·<strong style="color:var(--text);">props ≥2.5% · games ≥3%</strong> · Quarter-Kelly (time-throttled: ×0.25 / ×0.50 / ×0.75 / ×1.0) · 3% max stake · compounding from $${d.start_balance.toFixed(0)} since ${d.start_date} · CLV captured every 2 min until game start</span>
@@ -5314,6 +5390,9 @@ async function fetchPaper() {
         const statusColor = b.status === 'won' ? 'var(--green)' : b.status === 'lost' ? 'var(--red)' : 'var(--muted)';
         const statusLabel = b.status === 'won' ? '✓ WON' : b.status === 'lost' ? '✗ LOST' : '…';
         const flagDate = b.flagged_at ? fmtDate(b.flagged_at) : '';
+        const capBadge = b.daily_capped
+          ? ` <span title="Skipped by the daily exposure cap — logged at $0 stake, excluded from balance." style="font-size:9px;font-weight:700;color:#e3a53a;background:rgba(227,165,58,0.12);border:1px solid rgba(227,165,58,0.3);border-radius:3px;padding:1px 4px;vertical-align:middle;">CAP</span>`
+          : '';
         // Edge badge: distinguish 3-5% "data" edges from 5%+ "signal" edges
         const edgePct = b.edge_pct != null ? b.edge_pct : 0;
         const edgeTag = edgePct >= 5
@@ -5329,7 +5408,7 @@ async function fetchPaper() {
         return `<tr style="${b.clv_source === 'corrupted_utc' ? 'opacity:0.55;' : ''}">
           <td style="color:var(--muted);font-size:11px;">${flagDate}</td>
           <td class="matchup-inline">${matchupHtml(b.matchup)}</td>
-          <td style="font-size:12px;max-width:200px;">${b.title}</td>
+          <td style="font-size:12px;max-width:200px;">${b.title}${capBadge}</td>
           <td class="side-${(b.side||'').toLowerCase()}">${b.side}</td>
           <td class="num">${edgeTag}</td>
           <td class="num">${valCell}</td>
@@ -5721,9 +5800,13 @@ class Handler(BaseHTTPRequestHandler):
                 paper_bets = [b for b in _bets
                               if b.get("flagged_at", "") >= PAPER_START_DATE
                               and b.get("paper_stake") is not None]
-            # shadow bets: still shown in the bet table but excluded from
-            # won/lost/win_rate counts and balance (stake is $0 anyway)
-            live_paper  = [b for b in paper_bets if not _is_shadow(b.get("ticker", ""))]
+            # shadow + daily-capped bets: still shown in the bet table but excluded
+            # from won/lost/win_rate/avg_stake counts and balance — they were never
+            # funded ($0 stake). (Capped bets still count in the pick-quality
+            # Performance panel, which measures the edge regardless of funding.)
+            live_paper  = [b for b in paper_bets
+                           if not _is_shadow(b.get("ticker", ""))
+                           and not b.get("daily_capped")]
             balance     = _compute_paper_balance()
             open_exp    = round(sum(b["paper_stake"] for b in live_paper if b["status"] == "open"), 2)
             settled     = [b for b in live_paper if b["status"] in ("won", "lost")
@@ -5740,6 +5823,16 @@ class Handler(BaseHTTPRequestHandler):
                                  key=lambda b: b.get("flagged_at",""), reverse=True)
             recent = _clean_p + _corrupt_p
 
+            # ── Daily exposure (aggregate gate) ──────────────────────────────
+            with _bets_lock:
+                _committed_today = _todays_committed_exposure()
+            _today_pt = _pt_date(datetime.now(timezone.utc))
+            daily_exposure_pct = round(_committed_today / PAPER_START_BALANCE * 100, 1)
+            daily_capped_today = len([
+                b for b in paper_bets
+                if b.get("daily_capped") and _pt_date(b.get("flagged_at", "")) == _today_pt
+            ])
+
             result = {
                 "balance":        balance,
                 "start_balance":  PAPER_START_BALANCE,
@@ -5754,6 +5847,11 @@ class Handler(BaseHTTPRequestHandler):
                 "open":           len([b for b in live_paper if b["status"] == "open"]),
                 "win_rate":       win_rate,
                 "avg_stake":      avg_stake,
+                # Daily aggregate exposure gate
+                "daily_exposure":      round(_committed_today, 2),
+                "daily_exposure_pct":  daily_exposure_pct,
+                "daily_cap_pct":       round(DAILY_EXPOSURE_CAP * 100, 1),
+                "daily_capped_today":  daily_capped_today,
                 "bets":           recent,
             }
             self._send(200, "application/json", json.dumps(result).encode())

@@ -2189,13 +2189,11 @@ def send_discord(embed: dict, content: str = "") -> bool:
 
 
 def _prob_to_american_str(p: Optional[float]) -> str:
-    """Convert decimal probability to American odds string, e.g. 0.60 → '-150'."""
+    """Convert decimal probability to a cents price string, e.g. 0.55 → '55¢'.
+    (Named *american for back-compat; now returns Kalshi-style cents prices.)"""
     if p is None or p <= 0 or p >= 1:
         return "?"
-    if p >= 0.5:
-        return f"-{round(p / (1 - p) * 100)}"
-    else:
-        return f"+{round((1 - p) / p * 100)}"
+    return f"{round(p * 100)}¢"
 
 
 def _sms_kelly(e: dict) -> float:
@@ -2342,7 +2340,7 @@ def _alert_top10(newly_logged: list = None):
             market_fields.append({
                 "name":   f"[{mtype}] {e.get('title','')}  —  {side}",
                 "value":  (f"`+{ep}%` adj EV  •  Kelly `${kb:.0f}` ({kp}%){ct}\n"
-                           f"Kalshi `{ka}` ({round(k*100)}¢)  •  Fair `{fa}`"),
+                           f"Kalshi `{ka}`  •  Fair `{fa}`"),
                 "inline": False,
             })
 
@@ -3955,20 +3953,17 @@ function renderRoiChart(points) {
 
 function pct(v) { return v.toFixed(1) + '%'; }
 
-/** Convert a decimal (no-vig) probability to an American odds string.
- *  e.g. probToAmerican(0.60) → "-150"   probToAmerican(0.40) → "+150"
+/** Convert a decimal (no-vig) probability to a cents price string.
+ *  e.g. probToAmerican(0.55) → "55¢"   probToAmerican(0.40) → "40¢"
+ *  (Named *American for back-compat; now displays Kalshi-style cents prices.)
  *  Returns "—" for null / out-of-range inputs.
  */
 function probToAmerican(p) {
   if (p == null || p <= 0 || p >= 1) return '—';
-  if (p >= 0.5) {
-    return '-' + Math.round(p / (1 - p) * 100);
-  } else {
-    return '+' + Math.round((1 - p) / p * 100);
-  }
+  return Math.round(p * 100) + '¢';
 }
 
-/** Format a Kalshi decimal price (0–1) as American odds. */
+/** Format a Kalshi decimal price (0–1) as a cents price. */
 function kalshiToAmerican(k) { return probToAmerican(k); }
 
 function getBankroll() {
@@ -4548,7 +4543,7 @@ function renderLiveEdges() {
     return;
   }
 
-  function fmtAmer(n) { return n == null ? '—' : n > 0 ? `+${n}` : `${n}`; }
+  function fmtAmer(n) { return n == null ? '—' : `${n}`; }   // cents strings already formatted; pass through
 
   const rows = qualified.map(e => {
     const consReason  = e.consensus_reason || '';
@@ -4652,11 +4647,9 @@ function renderTop10() {
     const bAbbr10  = {pinnacle:'PIN', draftkings:'DK', fanduel:'FD'};
     const bLines10 = bOrder10.filter(b => pbn10[b]).map(b => {
       const bd = pbn10[b];
-      const yA = bd.yes_american != null ? (bd.yes_american > 0 ? '+'+bd.yes_american : bd.yes_american) : '—';
-      const nA = bd.no_american  != null ? (bd.no_american  > 0 ? '+'+bd.no_american  : bd.no_american)  : '—';
-      const yP = bd.yes_prob != null ? (bd.yes_prob*100).toFixed(1)+'%' : '?';
-      const nP = bd.no_prob  != null ? (bd.no_prob *100).toFixed(1)+'%' : '?';
-      return `${bAbbr10[b]}: YES ${yA} (${yP})  NO ${nA} (${nP})`;
+      const yA = bd.yes_prob != null ? Math.round(bd.yes_prob*100)+'¢' : '—';
+      const nA = bd.no_prob  != null ? Math.round(bd.no_prob *100)+'¢' : '—';
+      return `${bAbbr10[b]}: YES ${yA}  NO ${nA}`;
     });
     const tip10 = bLines10.length
       ? `No-vig per book:\\n${bLines10.join('\\n')}\\nFair value: Pinnacle only`
@@ -4717,7 +4710,7 @@ function renderTop10() {
     <thead><tr>
       <th>#</th><th>Matchup / Player</th><th>Prop</th><th>Side</th>
       <th class="num">Adj. EV</th>
-      <th class="num" title="Model fair value for this exact Kalshi threshold → Kalshi ask price (both in American odds). Hover for per-book breakdown.">Fair → Kalshi</th>
+      <th class="num" title="Model fair value for this exact Kalshi threshold → Kalshi ask price (both in cents). Hover for per-book breakdown.">Fair → Kalshi</th>
       <th class="num" title="How closely Pinnacle, DraftKings, and FanDuel agree on fair probability. ★★★ = tight agreement = higher confidence.">Confidence</th>
       <th class="num">Kelly Bet</th>
       <th class="num" title="Re-fetch Kalshi + Pinnacle right now and confirm the edge is still valid before betting">Pre-Bet Check</th>

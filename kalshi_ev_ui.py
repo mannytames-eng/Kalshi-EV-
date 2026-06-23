@@ -838,7 +838,14 @@ def _add_new_bets(edges: list) -> list:
                 return ("prop", b["matchup"], gd)
             return (b["matchup"], b.get("mkt_type", ""), b["side"], gd)
 
-        open_slots = {_open_slot(b) for b in _bets if b["status"] == "open"}
+        # Shadow bets ($0 stake, e.g. HR) are NOT real positions and must not
+        # claim a correlation slot — otherwise a shadow HR bet would force a real
+        # Total Bases bet on the same player to be marked correlated.
+        open_slots = {
+            _open_slot(b) for b in _bets
+            if b["status"] == "open"
+            and not b.get("shadow") and not _is_shadow(b.get("ticker", ""))
+        }
         # Running total of Kelly stake already committed today (PT). New funded
         # bets in this cycle add to it so the daily cap holds within one scan too.
         _committed_today = _todays_committed_exposure()
@@ -970,8 +977,8 @@ def _add_new_bets(edges: list) -> list:
             _bets.append(new_bet)
             newly_added.append(new_bet)
             existing_ids.add(bid)
-            if not is_correlated:
-                open_slots.add(slot)   # only primary bet claims the slot
+            if not is_correlated and not shadow:
+                open_slots.add(slot)   # only primary, funded bet claims the slot
             added += 1
         if added:
             save_ok = _save_bets(_bets)

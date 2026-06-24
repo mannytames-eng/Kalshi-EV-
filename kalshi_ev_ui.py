@@ -212,36 +212,20 @@ SHADOW_MARKETS: list[str] = [
 def _is_shadow(ticker: str) -> bool:
     return any(ticker.upper().startswith(s) for s in SHADOW_MARKETS)
 
-# ── Time-to-matchup Kelly multipliers ────────────────────────────────────────
-# Calibrated from settled-bet performance by time-to-first-pitch (Jun 2026):
-# the 4–12h discovery window outperforms, while sub-4h peak-hour entries lag.
-#   > 24 h  →  0.25× (too far out — very few data points)
-#   12–24 h →  0.75× (neutral performance, mild discount)
-#   4–12 h  →  1.00× (best-performing window — full edge)
-#   < 4 h   →  0.50× (peak-hour noise — worst performers, penalise)
+# ── Time-to-matchup Kelly multiplier ─────────────────────────────────────────
+# FLATTENED to 1.0× on 2026-06-23. The previous 4-bucket multiplier was
+# calibrated on win-rate deltas from ~71 bets — a signal we later proved is pure
+# noise at that sample size (it had fully inverted by Jun 23). A CLV-by-time-
+# bucket test showed pin_drift (true CLV) is flat across every bucket
+# (-0.25 to 0.00pp, all indistinguishable), i.e. time-to-game does NOT predict
+# edge quality. With no CLV basis to size buckets differently, we treat them
+# equally: full quarter-Kelly, no time adjustment. Risk is controlled by the 3%
+# per-bet cap and 15% daily exposure cap. Kept as a function (returning a
+# constant) so the call sites and any future re-introduction stay trivial.
 def _time_kelly_mult(game_time_iso: str | None) -> float:
-    """Return the time-to-matchup Kelly multiplier for a given game_time ISO string.
-
-    Calibrated from 71 settled bets (Jun 2026):
-      4-12h window: +15.3pp delta, +9.34 flat units → full Kelly
-      12-24h window: +1.7pp delta, +0.52 flat units → mild discount
-      <4h window:  -4.8pp delta, -2.78 flat units → penalise (peak-hour noise)
-      24h+: too few bets to trust → conservative
-    """
-    if not game_time_iso:
-        return 0.75   # unknown game time — treat as mid-range
-    try:
-        gt = datetime.fromisoformat(game_time_iso.replace("Z", "+00:00"))
-        hours_until = (gt - datetime.now(timezone.utc)).total_seconds() / 3600
-    except (ValueError, AttributeError):
-        return 0.75
-    if hours_until > 24:
-        return 0.25   # too far out — very few data points
-    if hours_until > 12:
-        return 0.75   # 12-24h — neutral performance, mild discount
-    if hours_until >= 4:
-        return 1.00   # 4-12h — best performing window, full Kelly
-    return 0.50       # <4h — worst performers (peak-hour noise), penalise
+    """Time-to-matchup Kelly multiplier. Flattened to 1.0× — no CLV evidence
+    that time-to-first-pitch predicts edge quality (see comment above)."""
+    return 1.0
 
 # ── Shared state (updated by background thread) ───────────────────────────────
 _lock    = threading.Lock()
@@ -972,6 +956,7 @@ def _add_new_bets(edges: list) -> list:
                 "correlated":         is_correlated,         # excluded from win-rate/Kelly stats
                 "shadow":             shadow,                 # True = tracked but $0 stake, excluded from balance
                 "daily_capped":       daily_capped,          # True = skipped (daily exposure cap), $0 stake
+                "time_mult_applied":  _time_kelly_mult(_game_time_iso),  # time-Kelly mult used at placement (1.0 since 2026-06-23)
             }
 
             _bets.append(new_bet)
@@ -1522,23 +1507,27 @@ def _get_performance(since: Optional[str] = None) -> dict:
         if k <= 0 or k >= 1 or e <= 0:
             return 0.0
         full_kelly = e / (1.0 - k)
-        # For settled/historical bets reconstruct the multiplier using flagged_at
-        # vs game_time so we don't penalise all past bets with the <4h bracket
-        # just because their game_time is now in the past.
-        _flagged = b.get("flagged_at")
-        _gt      = b.get("game_time")
-        if b["status"] in ("won", "lost") and _flagged and _gt:
-            try:
-                _hrs = (datetime.fromisoformat(_gt.replace("Z", "+00:00")) -
-                        datetime.fromisoformat(_flagged.replace("Z", "+00:00"))).total_seconds() / 3600
-                if _hrs > 24:   time_mult = 0.25
-                elif _hrs > 12: time_mult = 0.75
-                elif _hrs >= 4: time_mult = 1.00
-                else:           time_mult = 0.50
-            except (ValueError, AttributeError):
-                time_mult = _time_kelly_mult(b.get("game_time"))
+        # Prefer the multiplier actually applied at placement (stamped on bets
+        # since 2026-06-23). For older bets without the stamp, reconstruct the
+        # historical bracket from flagged_at vs game_time so their displayed
+        # sizing still matches what was actually staked under the old policy.
+        if b.get("time_mult_applied") is not None:
+            time_mult = b["time_mult_applied"]
         else:
-            time_mult  = _time_kelly_mult(b.get("game_time"))
+            _flagged = b.get("flagged_at")
+            _gt      = b.get("game_time")
+            if b["status"] in ("won", "lost") and _flagged and _gt:
+                try:
+                    _hrs = (datetime.fromisoformat(_gt.replace("Z", "+00:00")) -
+                            datetime.fromisoformat(_flagged.replace("Z", "+00:00"))).total_seconds() / 3600
+                    if _hrs > 24:   time_mult = 0.25
+                    elif _hrs > 12: time_mult = 0.75
+                    elif _hrs >= 4: time_mult = 1.00
+                    else:           time_mult = 0.50
+                except (ValueError, AttributeError):
+                    time_mult = _time_kelly_mult(b.get("game_time"))
+            else:
+                time_mult  = _time_kelly_mult(b.get("game_time"))
         mtype      = _infer_mkt_type(b)
         clv_mult   = clv_mults.get(mtype, 1.0)
         return min(full_kelly * KELLY_FRACTION * time_mult * clv_mult, KELLY_SINGLE_CAP)

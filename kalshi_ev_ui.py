@@ -5103,7 +5103,12 @@ function renderPerformance(d) {
     const entryK      = b.kalshi_price    != null ? (b.kalshi_price * 100).toFixed(0) : null;
     const pinAtEntry  = b.pin_prob_at_flag != null ? b.pin_prob_at_flag.toFixed(1)    : null;
     const pinAtClose  = b.closing_pin_pct  != null && b.status !== 'open' ? b.closing_pin_pct.toFixed(1) : null;
-    const kalshiClose = b.closing_yes_pct  != null && b.status !== 'open' ? (b.closing_yes_pct).toFixed(0) : null;
+    // closing_yes_pct is always the YES-side price; entryK is the bet-side price.
+    // For NO bets, convert the close to the NO side (100 − YES) so the K: move
+    // compares like with like (was showing a bogus swing on every NO bet).
+    const kalshiClose = b.closing_yes_pct  != null && b.status !== 'open'
+      ? (b.side === 'NO' ? (100 - b.closing_yes_pct) : b.closing_yes_pct).toFixed(0)
+      : null;
 
     let lineMoveCell = '—';
     if (entryK != null) {

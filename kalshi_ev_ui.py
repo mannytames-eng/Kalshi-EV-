@@ -1048,6 +1048,18 @@ def _fetch_actual_stat(bet: dict) -> Optional[str]:
     prop_type = bet.get("prop_type", "")
     matchup   = bet.get("matchup", "")
     ticker    = bet.get("ticker", "")
+    # prop_type isn't persisted on the bet object — derive it from the Kalshi
+    # ticker prefix so this works for both new and historical bets.
+    if not prop_type:
+        _prefix_map = {
+            "KXMLBKS":  "pitcher_strikeouts",
+            "KXMLBHIT": "batter_hits",
+            "KXMLBTB":  "batter_total_bases",
+            "KXMLBRBI": "batter_rbis",
+            "KXMLBHR":  "batter_home_runs",
+        }
+        _tu = ticker.upper()
+        prop_type = next((pt for pfx, pt in _prefix_map.items() if _tu.startswith(pfx)), "")
     if not prop_type or not matchup or not ticker:
         return None
 
@@ -1113,9 +1125,8 @@ def _fetch_actual_stat(bet: dict) -> Optional[str]:
                 full_name = pdata.get("person", {}).get("fullName", "")
                 if full_name.split()[-1].lower() != player_last:
                     continue
-                stats = pdata.get("stats", {}).get(stat_group, {}).get("summary") or \
-                        pdata.get("stats", {}).get(stat_group, {})
-                val = stats.get(stat_field)
+                stats = pdata.get("stats", {}).get(stat_group, {})
+                val = stats.get(stat_field) if isinstance(stats, dict) else None
                 if val is not None:
                     return f"{val} {stat_label}"
     except Exception:
@@ -6115,6 +6126,43 @@ def _background_wc_watcher_loop():
         time.sleep(_WC_CHECK_INTERVAL)
 
 
+def _backfill_actual_results():
+    """One-time background fill of actual_result for settled prop bets that
+    resolved before the fetch was fixed. Rate-limited; saves in batches.
+    Only touches bets missing the field, so it self-terminates after one pass."""
+    import time as _t
+    _t.sleep(15)   # let startup settle before hitting the MLB Stats API
+    with _bets_lock:
+        todo = [b for b in _bets
+                if b.get("status") in ("won", "lost")
+                and b.get("mkt_type") == "prop"
+                and not b.get("actual_result")
+                and not b.get("ticker", "").upper().startswith("KXMLBHR")]
+    if not todo:
+        return
+    print(f"  [backfill] filling actual_result for {len(todo)} settled prop bets…")
+    filled = 0
+    for i, b in enumerate(todo):
+        try:
+            res = _fetch_actual_stat(b)
+        except Exception:
+            res = None
+        if res:
+            with _bets_lock:
+                for x in _bets:
+                    if x["id"] == b["id"]:
+                        x["actual_result"] = res
+                        break
+            filled += 1
+        _t.sleep(0.4)   # rate-limit the MLB Stats API
+        if (i + 1) % 20 == 0:
+            with _bets_lock:
+                _save_bets(_bets)
+    with _bets_lock:
+        _save_bets(_bets)
+    print(f"  [backfill] done — filled {filled}/{len(todo)}")
+
+
 # ── Entry point ───────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     import webbrowser
@@ -6229,6 +6277,9 @@ if __name__ == "__main__":
     # Watchdog monitors all bg threads and revives any that die
     tw = threading.Thread(target=_watchdog_loop, name="watchdog", daemon=True)
     tw.start()
+
+    # One-time backfill of actual_result on pre-fix settled prop bets
+    threading.Thread(target=_backfill_actual_results, name="backfill-results", daemon=True).start()
 
     class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
         daemon_threads = True   # don't block shutdown on open connections

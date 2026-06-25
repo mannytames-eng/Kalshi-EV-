@@ -5939,6 +5939,33 @@ class Handler(BaseHTTPRequestHandler):
             }
             self._send(200, "application/json", json.dumps(result).encode())
 
+        elif path == "/api/debug/actual_stat":
+            # Diagnose why actual_result isn't populating: run the fetch on the
+            # first settled prop bet and surface the result or the exception.
+            import traceback as _tb
+            with _bets_lock:
+                sample = next((b for b in _bets
+                               if b.get("status") in ("won", "lost")
+                               and b.get("mkt_type") == "prop"
+                               and not b.get("ticker", "").upper().startswith("KXMLBHR")), None)
+            out = {"sample_ticker": sample.get("ticker") if sample else None,
+                   "sample_matchup": sample.get("matchup") if sample else None}
+            if sample:
+                try:
+                    out["result"] = _fetch_actual_stat(sample)
+                except Exception as _e:
+                    out["error"] = f"{type(_e).__name__}: {_e}"
+                    out["trace"] = _tb.format_exc()[-800:]
+                # Also a raw connectivity probe to the MLB API
+                try:
+                    import urllib.request as _ur2
+                    with _ur2.urlopen("https://statsapi.mlb.com/api/v1/schedule?sportId=1&date=2026-06-25", timeout=6) as _r:
+                        out["mlb_api_reachable"] = (_r.status == 200)
+                except Exception as _e2:
+                    out["mlb_api_reachable"] = False
+                    out["mlb_api_error"] = f"{type(_e2).__name__}: {_e2}"
+            self._send(200, "application/json", json.dumps(out).encode())
+
         elif path == "/api/test-discord":
             ok = send_test_discord()
             result = {"ok": ok, "webhook_set": bool(_DISCORD_WEBHOOK)}

@@ -4808,8 +4808,9 @@ async function fetchPerformance() {
 
 function renderPerformance(d) {
   let perfBodyHtml = '';   // accumulate all perf-body sections; written once at the end
-  function pill(label, value, cls) {
-    return `<div class="stat-pill"><div class="label">${label}</div><div class="value ${cls||''}">${value}</div></div>`;
+  function pill(label, value, cls, sub) {
+    const subHtml = sub ? `<div style="font-size:9px;color:var(--muted);margin-top:3px;line-height:1.25;font-weight:400;">${sub}</div>` : '';
+    return `<div class="stat-pill"><div class="label">${label}</div><div class="value ${cls||''}">${value}</div>${subHtml}</div>`;
   }
   function na(v, fmt) { return v != null ? fmt(v) : '—'; }
   function uClass(v) { return v == null ? '' : v > 0 ? 'pnl-pos' : v < 0 ? 'pnl-neg' : 'pnl-neu'; }
@@ -4904,11 +4905,11 @@ function renderPerformance(d) {
       ${pill('Won', d.won, 'pnl-pos')}
       ${pill('Lost', d.lost, 'pnl-neg')}
       ${pill('Open', d.open, 'pnl-neu')}
-      ${pill('Win Rate', na(d.win_rate, v => v + '%'))}
+      ${pill('Win Rate', na(d.win_rate, v => v + '%'), '', 'how often our bets won')}
       ${pill('Last Bet', lastBetVal)}
-      ${pill('Kelly P&amp;L (% bank)', d.total_kelly_pct != null ? `<span class="${kellyPctClass}">${sign(d.total_kelly_pct)}${d.total_kelly_pct.toFixed(2)}%</span>` : '—')}
-      ${pill('Entry Discount', d.avg_entry_discount != null ? `<span class="${d.avg_entry_discount >= 0 ? 'pnl-pos' : 'pnl-neg'}" title="Avg (Pinnacle fair value − Kalshi entry) at time of bet. This is your actual alpha — the mispricing you captured. NOT affected by what happened after.">${d.avg_entry_discount > 0 ? '+' : ''}${d.avg_entry_discount}pp</span>` : '—')}
-      ${pill('Pin Drift (True CLV)', d.avg_pin_drift != null ? `<span class="${d.avg_pin_drift >= 0 ? 'pnl-pos' : 'pnl-neg'}" title="Avg (Pinnacle close − Pinnacle at entry). Did the sharp market move in your favor AFTER you bet? Positive = Pin confirmed your edge. Zero = you got a good price but Pin didn't move. This is true closing line value.">${d.avg_pin_drift > 0 ? '+' : ''}${d.avg_pin_drift}pp</span>` : '—')}
+      ${pill('Kelly P&amp;L (% bank)', d.total_kelly_pct != null ? `<span class="${kellyPctClass}">${sign(d.total_kelly_pct)}${d.total_kelly_pct.toFixed(2)}%</span>` : '—', '', 'profit, scaled by each edge')}
+      ${pill('Entry Discount', d.avg_entry_discount != null ? `<span class="${d.avg_entry_discount >= 0 ? 'pnl-pos' : 'pnl-neg'}" title="Avg (Pinnacle fair value − Kalshi entry) at time of bet. This is your actual alpha — the mispricing you captured. NOT affected by what happened after.">${d.avg_entry_discount > 0 ? '+' : ''}${d.avg_entry_discount}pp</span>` : '—', '', 'how underpriced our bets were vs the sharp line')}
+      ${pill('Pin Drift (True CLV)', d.avg_pin_drift != null ? `<span class="${d.avg_pin_drift >= 0 ? 'pnl-pos' : 'pnl-neg'}" title="Avg (Pinnacle close − Pinnacle at entry). Did the sharp market move in your favor AFTER you bet? Positive = Pin confirmed your edge. Zero = you got a good price but Pin didn't move. This is true closing line value.">${d.avg_pin_drift > 0 ? '+' : ''}${d.avg_pin_drift}pp</span>` : '—', '', 'did the sharp line agree after we bet')}
     </div>
     ${clvBreakdown}
     ${penaltyNote}
@@ -5323,15 +5324,18 @@ async function fetchPaper() {
         <div style="font-size:24px;font-weight:800;color:${unitsColor};letter-spacing:-0.5px;">${unitsTxt}</div>
         <div style="font-size:11px;color:${unitsColor};opacity:0.7;margin-top:1px;">${unitsSubTxt}</div>
         <div style="font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:0.06em;margin-top:3px;" title="$1 flat stake on every bet — removes all Kelly sizing noise. Best single measure of pick quality.">Flat Units (${settled} settled)</div>
+        <div style="font-size:9px;color:var(--muted);opacity:0.75;margin-top:2px;line-height:1.2;">profit if every bet were $1</div>
       </div>
       <div style="background:var(--surface);padding:14px 16px;text-align:center;">
         <div style="font-size:24px;font-weight:800;color:${vsMarketColor};">${vsMarketTxt}</div>
         <div style="font-size:11px;color:var(--muted);margin-top:1px;">${winRate != null ? winRate + '%' : '—'} actual vs ${impliedAvg != null ? impliedAvg.toFixed(1) + '%' : '—'} implied</div>
         <div style="font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:0.06em;margin-top:3px;" title="Actual win rate minus Kalshi-implied win probability. Positive = beating the market.">Win Rate vs Implied</div>
+        <div style="font-size:9px;color:var(--muted);opacity:0.75;margin-top:2px;line-height:1.2;">how much we beat the market's odds</div>
       </div>
       <div style="background:var(--surface);padding:14px 16px;text-align:center;">
         <div style="font-size:24px;font-weight:800;color:${clvColor};">${clvTxt}</div>
         <div style="font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:0.06em;margin-top:3px;" title="Closing Line Value using Pinnacle's closing price. Positive = we bought below fair value. Most reliable edge signal.">${clvLabel}</div>
+        <div style="font-size:9px;color:var(--muted);opacity:0.75;margin-top:2px;line-height:1.2;">we bought below the sharp closing price</div>
       </div>
       <div style="background:var(--surface);padding:14px 16px;text-align:center;">
         <div style="font-size:22px;font-weight:700;color:var(--green);">${d.won}W <span style="color:var(--red);">${d.lost}L</span></div>

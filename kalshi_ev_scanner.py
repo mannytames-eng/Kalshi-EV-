@@ -481,7 +481,7 @@ def fetch_player_prop_odds_event(sport: str, event_id: str, markets: str = None)
     Costs 1 Odds API credit per call.
     """
     if markets is None:
-        markets = "pitcher_strikeouts,batter_hits,batter_home_runs,batter_total_bases,batter_rbis"
+        markets = "pitcher_strikeouts,batter_hits,batter_total_bases,batter_rbis"
     sharp_books = ",".join(k for k, w in BOOK_WEIGHTS.items() if w > 0)
     r = requests.get(
         f"{ODDS_BASE}/sports/{sport}/events/{event_id}/odds",
@@ -2134,13 +2134,15 @@ def scan_sport(
 # (e.g. total bases [0.5, 1.5], strikeouts [4.5, 5.5]). The per-line index in
 # build_all_player_props() captures all of them, which is what lets us match
 # Kalshi's 0.5 / 2.5 milestone markets to a real Pinnacle price.
-PLAYER_PROP_MARKETS = "pitcher_strikeouts,batter_hits,batter_home_runs,batter_total_bases,batter_rbis"
+# Home runs retired 2026-06-24: extreme-longshot market where the proportional
+# no-vig de-vig overstates the fair value, so apparent CLV was an artifact — 43
+# shadow bets ran -5.5pp vs expected. Not scanned (saves credits), not displayed.
+PLAYER_PROP_MARKETS = "pitcher_strikeouts,batter_hits,batter_total_bases,batter_rbis"
 NBA_PLAYER_PROP_MARKETS = "player_points,player_assists,player_threes"
 
 MLB_PROP_SERIES: Dict[str, str] = {
     "KXMLBKS":  "pitcher_strikeouts",
     "KXMLBHIT": "batter_hits",
-    "KXMLBHR":  "batter_home_runs",
     "KXMLBTB":  "batter_total_bases",
     "KXMLBRBI": "batter_rbis",
 }

@@ -206,7 +206,8 @@ DAILY_EXPOSURE_CAP   = 0.15     # max 15% of bankroll committed per PT day
 # but staked at $0 and excluded from paper balance, Kelly P&L, and summary pills.
 # Move a ticker prefix here to validate a new market before committing real stakes.
 SHADOW_MARKETS: list[str] = [
-    "KXMLBHR",   # Home runs — new market, accumulating CLV data before going live
+    # (empty) — add a ticker prefix here to validate a new market at $0 stake.
+    # Home runs were retired 2026-06-24 (longshot de-vig overstated edge).
 ]
 
 def _is_shadow(ticker: str) -> bool:
@@ -1438,6 +1439,10 @@ def _get_performance(since: Optional[str] = None) -> dict:
     """
     with _bets_lock:
         bets = list(_bets)
+
+    # Home runs retired 2026-06-24 — hide from all dashboard views (historical
+    # HR bets remain in the data file but are no longer displayed or counted).
+    bets = [b for b in bets if not b.get("ticker", "").upper().startswith("KXMLBHR")]
 
     if since:
         # since is a date string; flagged_at is a full ISO timestamp
@@ -4915,8 +4920,8 @@ function renderPerformance(d) {
     </p>`;
 
   // By-type breakdown table
-  const PROP_LABELS = new Set(['Strikeouts (K)', 'Home Runs', 'Hits', 'Total Bases', 'RBIs', 'MLB Props', 'NBA Props']);
-  const TYPE_ORDER  = ['MLB Total', 'MLB Spread', 'Strikeouts (K)', 'Home Runs', 'Hits', 'Total Bases', 'RBIs', 'MLB Props', 'NBA Props'];
+  const PROP_LABELS = new Set(['Strikeouts (K)', 'Hits', 'Total Bases', 'RBIs', 'MLB Props', 'NBA Props']);
+  const TYPE_ORDER  = ['MLB Total', 'MLB Spread', 'Strikeouts (K)', 'Hits', 'Total Bases', 'RBIs', 'MLB Props', 'NBA Props'];
   if (d.by_type && d.by_type.length) {
     const sorted = [...d.by_type].sort((a, b) => {
       const ai = TYPE_ORDER.indexOf(a.label); const bi = TYPE_ORDER.indexOf(b.label);
@@ -5789,7 +5794,8 @@ class Handler(BaseHTTPRequestHandler):
             with _bets_lock:
                 paper_bets = [b for b in _bets
                               if b.get("flagged_at", "") >= PAPER_START_DATE
-                              and b.get("paper_stake") is not None]
+                              and b.get("paper_stake") is not None
+                              and not b.get("ticker", "").upper().startswith("KXMLBHR")]  # HR retired
             # shadow + daily-capped bets: still shown in the bet table but excluded
             # from won/lost/win_rate/avg_stake counts and balance — they were never
             # funded ($0 stake). (Capped bets still count in the pick-quality

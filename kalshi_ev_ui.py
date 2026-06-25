@@ -5344,21 +5344,21 @@ async function fetchPaper() {
         <div style="font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:0.06em;margin-top:3px;">Bankroll</div>
       </div>
       ${(() => {
-        if (d.daily_exposure_pct == null || d.daily_cap_pct == null) return '';
-        const used = d.daily_exposure_pct, cap = d.daily_cap_pct;
-        const ratio = cap > 0 ? used / cap : 0;
-        const expColor = ratio >= 1 ? 'var(--red)' : ratio >= 0.8 ? '#e3a53a' : 'var(--green)';
-        const cappedTxt = d.daily_capped_today > 0
-          ? `${d.daily_capped_today} skipped (cap)` : 'within cap';
+        if (d.avg_kalshi_move == null) return '';
+        const mv = d.avg_kalshi_move;
+        const mvColor = mv > 0.2 ? 'var(--green)' : mv < -0.2 ? 'var(--red)' : 'var(--muted)';
+        const favTxt = d.kalshi_move_n > 0
+          ? `${Math.round(d.kalshi_move_favor / d.kalshi_move_n * 100)}% moved our way`
+          : '';
         return `<div style="background:var(--surface);padding:14px 16px;text-align:center;">
-        <div style="font-size:22px;font-weight:700;color:${expColor};letter-spacing:-0.5px;">${used.toFixed(1)}% / ${cap.toFixed(0)}%</div>
-        <div style="font-size:11px;color:var(--muted);margin-top:1px;">${cappedTxt}</div>
-        <div style="font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:0.06em;margin-top:3px;" title="Total Kelly stake committed today (PT) vs the DAILY_EXPOSURE_CAP. New bets that would exceed the cap are logged at $0 stake.">Daily Exposure</div>
+        <div style="font-size:22px;font-weight:700;color:${mvColor};letter-spacing:-0.5px;">${mv > 0 ? '+' : ''}${mv.toFixed(2)}¢</div>
+        <div style="font-size:11px;color:var(--muted);margin-top:1px;">${favTxt}</div>
+        <div style="font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:0.06em;margin-top:3px;" title="Average bet-side Kalshi line movement from entry to close across settled bets. Positive = Kalshi repriced toward your position after you bet (positive Kalshi-side CLV). Bet-side: for NO bets the close is 100 − YES.">Avg Kalshi Move</div>
       </div>`;
       })()}
     </div>
     <div style="padding:6px 12px;border-bottom:1px solid var(--border);background:#0d1117;">
-      <span style="font-size:11px;color:var(--muted);">📊 V2.0 reset Jun 8 2026 ·<strong style="color:var(--text);">props ≥2.5% · games ≥3%</strong> · Quarter-Kelly (time-throttled: ×0.25 / ×0.50 / ×0.75 / ×1.0) · 3% max stake · compounding from $${d.start_balance.toFixed(0)} since ${d.start_date} · CLV captured every 2 min until game start</span>
+      <span style="font-size:11px;color:var(--muted);">📊 V2.0 reset Jun 8 2026 ·<strong style="color:var(--text);">props ≥2.5% · games ≥3%</strong> · Quarter-Kelly · 3% max stake · 15% daily cap · compounding from $${d.start_balance.toFixed(0)} since ${d.start_date} · CLV captured every 2 min until game start</span>
     </div>`;
 
     // ── Bet table ──────────────────────────────────────────────────────────
@@ -5806,6 +5806,21 @@ class Handler(BaseHTTPRequestHandler):
             roi_pct     = round(total_pnl / PAPER_START_BALANCE * 100, 2)
             win_rate    = round(len(won_bets) / len(settled) * 100, 1) if settled else None
             avg_stake   = round(sum(b["paper_stake"] for b in live_paper) / len(live_paper), 2) if live_paper else None
+            # ── Avg Kalshi line movement (bet-side): did Kalshi reprice toward us
+            # after entry? entry and close are both taken on the bet side (for NO
+            # bets the close is 100 − closing_yes_pct). Positive = our contract got
+            # more expensive = market moved our way = positive Kalshi-side CLV.
+            _kmoves = []
+            for b in settled:
+                cy = b.get("closing_yes_pct"); kpx = b.get("kalshi_price")
+                if cy is None or kpx is None:
+                    continue
+                entry_side = kpx * 100
+                close_side = (100 - cy) if b.get("side") == "NO" else cy
+                _kmoves.append(close_side - entry_side)
+            avg_kalshi_move    = round(sum(_kmoves) / len(_kmoves), 2) if _kmoves else None
+            kalshi_move_n      = len(_kmoves)
+            kalshi_move_favor  = len([m for m in _kmoves if m > 0.5])
             # Clean bets newest-first, corrupted bets appended at end
             _clean_p  = sorted([b for b in paper_bets if b.get("clv_source") != "corrupted_utc"],
                                 key=lambda b: b.get("flagged_at",""), reverse=True)
@@ -5837,11 +5852,15 @@ class Handler(BaseHTTPRequestHandler):
                 "open":           len([b for b in live_paper if b["status"] == "open"]),
                 "win_rate":       win_rate,
                 "avg_stake":      avg_stake,
-                # Daily aggregate exposure gate
+                # Daily aggregate exposure gate (cap still enforced; kept for API)
                 "daily_exposure":      round(_committed_today, 2),
                 "daily_exposure_pct":  daily_exposure_pct,
                 "daily_cap_pct":       round(DAILY_EXPOSURE_CAP * 100, 1),
                 "daily_capped_today":  daily_capped_today,
+                # Avg Kalshi line movement (bet-side)
+                "avg_kalshi_move":     avg_kalshi_move,
+                "kalshi_move_n":       kalshi_move_n,
+                "kalshi_move_favor":   kalshi_move_favor,
                 "bets":           recent,
             }
             self._send(200, "application/json", json.dumps(result).encode())

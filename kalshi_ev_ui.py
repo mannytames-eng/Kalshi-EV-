@@ -5701,6 +5701,8 @@ class Handler(BaseHTTPRequestHandler):
                     if b["status"] in ("won", "lost")
                     and b.get("paper_pnl") is not None
                     and not b.get("correlated", False)
+                    and not b.get("shadow", False)                                 # $0-stake bets don't belong on the ROI curve
+                    and not b.get("ticker", "").upper().startswith("KXMLBHR")       # HR retired
                     and b.get("clv_source") != "corrupted_utc"
                     and b.get("flagged_at", "") >= PAPER_START_DATE
                 ]

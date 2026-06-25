@@ -607,6 +607,16 @@ for _b in _bets:
         _b["correlated"] = False
         _data_fixed = True
 
+# Fix: Francisco Alvarez TB (Jun 22) was falsely marked correlated by a shadow
+# HR bet that claimed its slot — before the shadow-slot fix shipped. It's the
+# only real Alvarez position that day, so it should count. Stake/pnl already
+# computed; just clear the flag.
+_falsecorr_id = "KXMLBTB-26JUN221910CHCNYM-NYMFALVAREZ4-2|YES"
+for _b in _bets:
+    if _b.get("id") == _falsecorr_id and _b.get("correlated") is True:
+        _b["correlated"] = False
+        _data_fixed = True
+
 # Fix: Retroactively mark all KXMLBHR bets logged before shadow mode was added
 # (2026-06-17) as shadow and zero their stakes/pnl so they don't drag Kelly P&L.
 for _b in _bets:

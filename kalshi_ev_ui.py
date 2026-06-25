@@ -1045,6 +1045,7 @@ def _fetch_actual_stat(bet: dict) -> Optional[str]:
     Fetch the actual stat result for a resolved prop bet from the MLB Stats API.
     Returns a human-readable string like "7 Ks", "2 TB", "1 H", or None if unavailable.
     """
+    import re   # re is imported locally throughout this module, not globally
     prop_type = bet.get("prop_type", "")
     matchup   = bet.get("matchup", "")
     ticker    = bet.get("ticker", "")

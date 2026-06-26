@@ -3818,6 +3818,29 @@ function fmtDate(iso) {
 
 function edgeKey(e) { return e.matchup + '|' + e.title + '|' + e.side; }
 
+// MLB team logo for a player-prop ticker. The player's team is the prefix of
+// the player segment (e.g. KXMLBKS-...SEAPIT-SEABMILLER50-6 => SEA). Disambiguate
+// 2- vs 3-letter abbrs against the matchup teams. Logos from ESPN CDN; broken
+// loads hide themselves. Returns '' for non-player-prop tickers (game lines etc).
+const _MLB_TEAMS = new Set(['ARI','AZ','ATL','BAL','BOS','CHC','CWS','CIN','CLE','COL','DET','HOU','KC','LAA','LAD','MIA','MIL','MIN','NYM','NYY','OAK','ATH','PHI','PIT','SD','SF','SEA','STL','TB','TEX','TOR','WSH']);
+const _MLB_LOGO = {ARI:'ari',AZ:'ari',ATL:'atl',BAL:'bal',BOS:'bos',CHC:'chc',CWS:'chw',CIN:'cin',CLE:'cle',COL:'col',DET:'det',HOU:'hou',KC:'kc',LAA:'laa',LAD:'lad',MIA:'mia',MIL:'mil',MIN:'min',NYM:'nym',NYY:'nyy',OAK:'oak',ATH:'oak',PHI:'phi',PIT:'pit',SD:'sd',SF:'sf',SEA:'sea',STL:'stl',TB:'tb',TEX:'tex',TOR:'tor',WSH:'wsh'};
+function mlbLogo(ticker) {
+  if (!ticker) return '';
+  const m = ticker.match(/^KXMLB(?:KS|TB|HIT|RBI|HR)-\d{2}[A-Z]{3}\d{6}([A-Z]+)-([A-Z]+?)\d/);
+  if (!m) return '';
+  const matchup = m[1], playerSeg = m[2];
+  let away, home;
+  for (const n of [3, 2]) {
+    const a = matchup.slice(0, n), h = matchup.slice(n);
+    if (_MLB_TEAMS.has(a) && _MLB_TEAMS.has(h)) { away = a; home = h; break; }
+  }
+  if (!away) return '';
+  const team = playerSeg.startsWith(away) ? away : (playerSeg.startsWith(home) ? home : null);
+  const abbr = team && _MLB_LOGO[team];
+  if (!abbr) return '';
+  return `<img src="https://a.espncdn.com/i/teamlogos/mlb/500/${abbr}.png" onerror="this.style.display='none'" style="width:18px;height:18px;vertical-align:middle;margin-right:6px;object-fit:contain;">`;
+}
+
 // Edge color by strength: orange (weakest) → yellow → green → bright green (strongest)
 function edgeColor(pct) {
   if (pct >= 12) return '#00e676';   // bright green  — 12%+
@@ -4122,7 +4145,7 @@ function renderTable(edges) {
       ? `<span class="badge-drift">(${e.drift_pct > 0 ? '+' : ''}${e.drift_pct}%)</span>` : '';
     rows += `
     <tr>
-      <td class="matchup-inline">${matchupHtml(e.matchup)}</td>
+      <td class="matchup-inline">${mlbLogo(e.ticker)}${matchupHtml(e.matchup)}</td>
       <td class="prop-col">${e.title}${kalshiLineBadge(e)}${newBadge}${staleBadge}${driftTxt}${trackBtn(e)}</td>
       <td class="num pin-line">${pinLineLabel(e)}</td>
       <td class="side-${e.side.toLowerCase()}">${e.side}</td>
@@ -5188,7 +5211,7 @@ function renderPerformance(d) {
     return `<tr style="${b.correlated || b.clv_source === 'corrupted_utc' ? 'opacity:0.55;' : isShadow ? 'opacity:0.75;border-left:2px solid #58a6ff22;' : ''}">
       <td>${ts}</td>
       <td>${gameTimeCell}</td>
-      <td>${b.matchup}${corrBadge}${corruptBadge}${shadowBadge}</td>
+      <td>${mlbLogo(b.ticker)}${b.matchup}${corrBadge}${corruptBadge}${shadowBadge}</td>
       <td class="prop-col">${b.title}</td>
       <td class="side-${b.side.toLowerCase()}">${b.side}</td>
       <td class="num">${edgeCell}</td>

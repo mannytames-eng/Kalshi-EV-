@@ -3823,7 +3823,7 @@ function edgeKey(e) { return e.matchup + '|' + e.title + '|' + e.side; }
 // 2- vs 3-letter abbrs against the matchup teams. Logos from ESPN CDN; broken
 // loads hide themselves. Returns '' for non-player-prop tickers (game lines etc).
 const _MLB_TEAMS = new Set(['ARI','AZ','ATL','BAL','BOS','CHC','CWS','CIN','CLE','COL','DET','HOU','KC','LAA','LAD','MIA','MIL','MIN','NYM','NYY','OAK','ATH','PHI','PIT','SD','SF','SEA','STL','TB','TEX','TOR','WSH']);
-const _MLB_LOGO = {ARI:'ari',AZ:'ari',ATL:'atl',BAL:'bal',BOS:'bos',CHC:'chc',CWS:'chw',CIN:'cin',CLE:'cle',COL:'col',DET:'det',HOU:'hou',KC:'kc',LAA:'laa',LAD:'lad',MIA:'mia',MIL:'mil',MIN:'min',NYM:'nym',NYY:'nyy',OAK:'oak',ATH:'oak',PHI:'phi',PIT:'pit',SD:'sd',SF:'sf',SEA:'sea',STL:'stl',TB:'tb',TEX:'tex',TOR:'tor',WSH:'wsh'};
+const _MLB_ID = {LAA:108,ARI:109,AZ:109,BAL:110,BOS:111,CHC:112,CIN:113,CLE:114,COL:115,DET:116,HOU:117,KC:118,LAD:119,WSH:120,NYM:121,OAK:133,ATH:133,PIT:134,SD:135,SEA:136,SF:137,STL:138,TB:139,TEX:140,TOR:141,MIN:142,PHI:143,ATL:144,CWS:145,MIA:146,NYY:147,MIL:158};
 function mlbLogo(ticker) {
   if (!ticker) return '';
   const m = ticker.match(/^KXMLB(?:KS|TB|HIT|RBI|HR)-\d{2}[A-Z]{3}\d{6}([A-Z]+)-([A-Z]+?)\d/);
@@ -3836,9 +3836,10 @@ function mlbLogo(ticker) {
   }
   if (!away) return '';
   const team = playerSeg.startsWith(away) ? away : (playerSeg.startsWith(home) ? home : null);
-  const abbr = team && _MLB_LOGO[team];
-  if (!abbr) return '';
-  return `<img src="https://a.espncdn.com/i/teamlogos/mlb/500/${abbr}.png" onerror="this.style.display='none'" style="width:18px;height:18px;vertical-align:middle;margin-right:6px;object-fit:contain;">`;
+  const id = team && _MLB_ID[team];
+  if (!id) return '';
+  // MLB's official asset CDN (not ad-blocked, unlike espncdn).
+  return `<img src="https://www.mlbstatic.com/team-logos/${id}.svg" onerror="this.style.display='none'" style="width:18px;height:18px;vertical-align:middle;margin-right:6px;object-fit:contain;">`;
 }
 
 // Edge color by strength: orange (weakest) → yellow → green → bright green (strongest)

@@ -1090,15 +1090,18 @@ def _fetch_actual_stat(bet: dict) -> Optional[str]:
     if not game_date:
         return None
 
-    # Parse team abbreviations from ticker (e.g. CWSNYY → CWS, NYY)
-    m = re.search(r"-\d{2}[A-Z]{3}\d{6}([A-Z]{2,3})([A-Z]{2,3})-", ticker)
+    # Concatenated team segment from ticker (e.g. AZSTL, SEAPIT, SFMIA). Do NOT
+    # try to split it — 2-letter abbrs (AZ/SF/SD/KC/TB) make the split ambiguous
+    # ("AZSTL" is AZ+STL, not AZS+TL). Match the whole segment against each game's
+    # away+home concatenation instead, which is unambiguous.
+    m = re.search(r"-\d{2}[A-Z]{3}\d{6}([A-Z]+)-", ticker)
     if not m:
         return None
-    away_abbr, home_abbr = m.group(1), m.group(2)
+    team_seg = m.group(1)
 
     try:
         import urllib.request as _ur
-        # 1. Find the MLB game ID for this date + teams
+        # 1. Find the MLB game(s) for this date matching the team segment
         sched_url = (
             f"https://statsapi.mlb.com/api/v1/schedule?sportId=1&date={game_date}"
             f"&hydrate=team&fields=dates,games,gamePk,teams,away,home,team,abbreviation"
@@ -1106,40 +1109,32 @@ def _fetch_actual_stat(bet: dict) -> Optional[str]:
         with _ur.urlopen(sched_url, timeout=5) as r:
             sched = json.loads(r.read())
 
-        game_pk = None
+        game_pks = []
         for date_entry in sched.get("dates", []):
             for g in date_entry.get("games", []):
                 ga = g["teams"]["away"]["team"].get("abbreviation", "")
                 gh = g["teams"]["home"]["team"].get("abbreviation", "")
-                # Normalise a few MLB vs Kalshi abbr differences
-                _norm_abbr = {"CWS": "CWS", "KC": "KC", "WSH": "WSH", "SD": "SD"}
-                if ga in (away_abbr, _norm_abbr.get(away_abbr, "")) and \
-                   gh in (home_abbr, _norm_abbr.get(home_abbr, "")):
-                    game_pk = g["gamePk"]
-                    break
-            if game_pk:
-                break
-
-        if not game_pk:
+                if f"{ga}{gh}" == team_seg:
+                    game_pks.append(g["gamePk"])
+        if not game_pks:
             return None
 
-        # 2. Fetch box score
-        box_url = f"https://statsapi.mlb.com/api/v1/game/{game_pk}/boxscore"
-        with _ur.urlopen(box_url, timeout=5) as r:
-            box = json.loads(r.read())
-
-        # 3. Find player by last name match across both teams
+        # 2-3. Search the matched game(s) (handles doubleheaders) for the player
         player_last = matchup.split()[-1].lower()
-        for side in ("away", "home"):
-            team_data = box.get("teams", {}).get(side, {})
-            for pid, pdata in team_data.get("players", {}).items():
-                full_name = pdata.get("person", {}).get("fullName", "")
-                if full_name.split()[-1].lower() != player_last:
-                    continue
-                stats = pdata.get("stats", {}).get(stat_group, {})
-                val = stats.get(stat_field) if isinstance(stats, dict) else None
-                if val is not None:
-                    return f"{val} {stat_label}"
+        for game_pk in game_pks:
+            box_url = f"https://statsapi.mlb.com/api/v1/game/{game_pk}/boxscore"
+            with _ur.urlopen(box_url, timeout=5) as r:
+                box = json.loads(r.read())
+            for side in ("away", "home"):
+                team_data = box.get("teams", {}).get(side, {})
+                for pid, pdata in team_data.get("players", {}).items():
+                    full_name = pdata.get("person", {}).get("fullName", "")
+                    if full_name.split()[-1].lower() != player_last:
+                        continue
+                    stats = pdata.get("stats", {}).get(stat_group, {})
+                    val = stats.get(stat_field) if isinstance(stats, dict) else None
+                    if val is not None:
+                        return f"{val} {stat_label}"
     except Exception:
         pass
     return None

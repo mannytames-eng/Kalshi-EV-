@@ -5198,7 +5198,7 @@ function renderPerformance(d) {
       <td class="side-${b.side.toLowerCase()}">${b.side}</td>
       <td class="num">${edgeCell}</td>
       <td class="num">${lineMoveCell}</td>
-      <td class="num ${rClass}">${rLabel}${b.actual_result ? `<div style="font-size:10px;color:var(--muted);margin-top:2px;">${b.actual_result}</div>` : ''}</td>
+      <td class="num ${rClass}">${rLabel}${b.actual_result ? `<div style="margin-top:4px;"><span title="Actual result for this player/game (MLB official box score)" style="display:inline-block;font-size:11px;font-weight:700;color:var(--text);background:var(--surface);border:1px solid var(--border);border-radius:4px;padding:1px 6px;letter-spacing:0.2px;">${b.actual_result}</span></div>` : ''}</td>
       <td class="num">${kBet}</td>
       <td class="num">${kPnl}</td>
     </tr>`;

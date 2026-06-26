@@ -5193,7 +5193,13 @@ function renderPerformance(d) {
       <td class="side-${b.side.toLowerCase()}">${b.side}</td>
       <td class="num">${edgeCell}</td>
       <td class="num">${lineMoveCell}</td>
-      <td class="num ${rClass}">${rLabel}${b.actual_result ? `<div style="margin-top:4px;"><span title="Actual result for this player/game (MLB official box score)" style="display:inline-block;font-size:11px;font-weight:700;color:var(--text);background:var(--surface);border:1px solid var(--border);border-radius:4px;padding:1px 6px;letter-spacing:0.2px;">${b.actual_result}</span></div>` : ''}</td>
+      <td class="num ${rClass}">${rLabel}${b.actual_result ? (() => {
+        const hit = b.status === 'won';
+        const fg = hit ? 'var(--green)' : 'var(--red)';
+        const bg = hit ? 'rgba(63,185,80,0.12)' : 'rgba(248,81,73,0.12)';
+        const bd = hit ? 'rgba(63,185,80,0.4)' : 'rgba(248,81,73,0.4)';
+        return `<div style="margin-top:4px;"><span title="Actual result for this player/game (MLB official box score)" style="display:inline-block;font-size:11px;font-weight:700;color:${fg};background:${bg};border:1px solid ${bd};border-radius:4px;padding:1px 6px;letter-spacing:0.2px;">${b.actual_result}</span></div>`;
+      })() : ''}</td>
       <td class="num">${kBet}</td>
       <td class="num">${kPnl}</td>
     </tr>`;

@@ -1050,11 +1050,10 @@ def _build_score_index() -> dict:
     return index
 
 
-def _fetch_actual_stat(bet: dict) -> Optional[str]:
-    """
-    Fetch the actual stat result for a resolved prop bet from the MLB Stats API.
-    Returns a human-readable string like "7 Ks", "2 TB", "1 H", or None if unavailable.
-    """
+def _lookup_box_stat(bet: dict):
+    """Core MLB box-score lookup for a prop bet. Returns (value:int, label:str)
+    or None. Works on both final and in-progress (live) box scores — the MLB
+    Stats API updates the same endpoint during the game."""
     import re   # re is imported locally throughout this module, not globally
     prop_type = bet.get("prop_type", "")
     matchup   = bet.get("matchup", "")
@@ -1134,10 +1133,71 @@ def _fetch_actual_stat(bet: dict) -> Optional[str]:
                     stats = pdata.get("stats", {}).get(stat_group, {})
                     val = stats.get(stat_field) if isinstance(stats, dict) else None
                     if val is not None:
-                        return f"{val} {stat_label}"
+                        return (val, stat_label)
     except Exception:
         pass
     return None
+
+
+def _fetch_actual_stat(bet: dict) -> Optional[str]:
+    """Human-readable final result like '7 K' / '2 TB', or None if unavailable."""
+    r = _lookup_box_stat(bet)
+    return f"{r[0]} {r[1]}" if r else None
+
+
+def _live_stat_text(bet: dict, value, label) -> str:
+    """Build the live in-game text, e.g. '4 K · needs 6+' (YES) or
+    '1 TB · needs under 2' (NO)."""
+    import re
+    title = bet.get("title", "")
+    m = re.search(r"(\d+)\+", title)          # "6+ strikeouts" → 6
+    thresh = int(m.group(1)) if m else None
+    if thresh is None:
+        kl = bet.get("kalshi_line_at_flag")
+        thresh = int(kl) + 1 if kl is not None else None
+    cur = f"{value} {label}"
+    if thresh is None:
+        return cur
+    return f"{cur} · needs under {thresh}" if bet.get("side") == "NO" else f"{cur} · needs {thresh}+"
+
+
+# ── Live in-game stat cache (refreshed by a background loop) ──────────────────
+_live_stats: dict = {}                 # bet_id → display string like "4 K · needs 6+"
+_live_stats_lock = threading.Lock()
+
+def _live_stats_loop():
+    """Every 60s, refresh live in-game stats for open prop bets whose game has
+    started. Reads the live MLB box score; rate-limited and self-contained."""
+    import time as _t
+    while True:
+        try:
+            now = datetime.now(timezone.utc)
+            with _bets_lock:
+                inplay = []
+                for b in _bets:
+                    if b.get("status") != "open" or b.get("mkt_type") != "prop":
+                        continue
+                    gt = b.get("game_time")
+                    started = False
+                    if gt:
+                        try:
+                            started = datetime.fromisoformat(gt.replace("Z", "+00:00")) <= now
+                        except (ValueError, AttributeError):
+                            started = False
+                    if started:
+                        inplay.append(dict(b))   # shallow copy — don't hold the lock during HTTP
+            fresh = {}
+            for b in inplay:
+                r = _lookup_box_stat(b)
+                if r:
+                    fresh[b["id"]] = _live_stat_text(b, r[0], r[1])
+                _t.sleep(0.3)
+            with _live_stats_lock:
+                _live_stats.clear()
+                _live_stats.update(fresh)
+        except Exception as _e:
+            print(f"  live-stats loop error: {_e}")
+        _t.sleep(60)
 
 
 def _resolve_from_score(bet: dict, score_index: dict) -> Optional[bool]:
@@ -4505,7 +4565,10 @@ function renderTodayEdges() {
       const now = Date.now();
       const diffMs = gameStart - now;
       if (diffMs < 0) {
-        gameTimeBadge = `<span style="display:block;font-size:10px;color:#f85149;font-weight:700;margin-top:3px;">● IN PLAY — do not bet</span>`;
+        const liveStat = b.live_stat
+          ? `<span style="display:block;font-size:11px;font-weight:700;color:var(--text);margin-top:3px;" title="Live in-game stat (MLB box score, updates ~every minute)">📊 ${b.live_stat}</span>`
+          : '';
+        gameTimeBadge = `<span style="display:block;font-size:10px;color:#f85149;font-weight:700;margin-top:3px;">● IN PLAY — do not bet</span>${liveStat}`;
       } else {
         const opts = {month:'short', day:'numeric', hour:'numeric', minute:'2-digit', timeZoneName:'short'};
         const label = gameStart.toLocaleString('en-US', opts);
@@ -5797,6 +5860,10 @@ class Handler(BaseHTTPRequestHandler):
                     and b.get("paper_stake") is not None
                 ]
             open_bets.sort(key=lambda b: b.get("flagged_at", ""), reverse=True)
+            # Attach live in-game stat (from the background cache) for IN PLAY bets
+            with _live_stats_lock:
+                _ls = dict(_live_stats)
+            open_bets = [{**b, "live_stat": _ls.get(b["id"])} for b in open_bets]
             print(f"  /api/today_edges: found {len(open_bets)} open positions")
             try:
                 payload = json.dumps(open_bets).encode()
@@ -6330,6 +6397,9 @@ if __name__ == "__main__":
 
     # One-time backfill of actual_result on pre-fix settled prop bets
     threading.Thread(target=_backfill_actual_results, name="backfill-results", daemon=True).start()
+
+    # Live in-game stats for IN PLAY open prop bets
+    threading.Thread(target=_live_stats_loop, name="live-stats", daemon=True).start()
 
     class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
         daemon_threads = True   # don't block shutdown on open connections

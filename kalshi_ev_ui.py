@@ -4543,7 +4543,7 @@ function renderTodayEdges() {
 
     return `<tr>
       <td style="font-size:11px;color:var(--muted);white-space:nowrap;">${flagTime}</td>
-      <td>${matchupHtml(b.matchup)}${gameTimeBadge}</td>
+      <td>${mlbLogo(b.ticker)}${matchupHtml(b.matchup)}${gameTimeBadge}</td>
       <td class="prop-col" style="font-size:12px;">${b.title}${kalshiLineBadge(b)}${driftTxt}${tickerTxt}${kalshiLink}</td>
       <td class="${sideClass}">${b.side}</td>
       <td class="num" style="color:${edgeColor(b.edge_pct)};font-weight:700;">+${pct(b.edge_pct)}${flagOddsTxt}</td>
@@ -5467,7 +5467,7 @@ async function fetchPaper() {
 
         return `<tr style="${b.clv_source === 'corrupted_utc' ? 'opacity:0.55;' : ''}">
           <td style="color:var(--muted);font-size:11px;">${flagDate}</td>
-          <td class="matchup-inline">${matchupHtml(b.matchup)}</td>
+          <td class="matchup-inline">${mlbLogo(b.ticker)}${matchupHtml(b.matchup)}</td>
           <td style="font-size:12px;max-width:200px;">${b.title}${capBadge}</td>
           <td class="side-${(b.side||'').toLowerCase()}">${b.side}</td>
           <td class="num">${edgeTag}</td>

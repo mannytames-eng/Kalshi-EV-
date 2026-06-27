@@ -1161,6 +1161,42 @@ def _live_stat_text(bet: dict, value, label) -> str:
     return f"{cur} · needs under {thresh}" if bet.get("side") == "NO" else f"{cur} · needs {thresh}+"
 
 
+def _fetch_game_inning(bet: dict) -> Optional[str]:
+    """Return the live inning for a bet's game, e.g. 'Top 7th', 'Bot 3rd',
+    'Mid 5th', 'Final', or None. Uses the schedule's linescore hydrate."""
+    import re
+    ticker = bet.get("ticker", "")
+    game_date = _parse_ticker_date(ticker)
+    m = re.search(r"-\d{2}[A-Z]{3}\d{6}([A-Z]+)-", ticker)
+    if not game_date or not m:
+        return None
+    team_seg = m.group(1)
+    try:
+        import urllib.request as _ur
+        url = (f"https://statsapi.mlb.com/api/v1/schedule?sportId=1&date={game_date}"
+               f"&hydrate=team,linescore")
+        with _ur.urlopen(url, timeout=5) as r:
+            sched = json.loads(r.read())
+        for date_entry in sched.get("dates", []):
+            for g in date_entry.get("games", []):
+                ga = g["teams"]["away"]["team"].get("abbreviation", "")
+                gh = g["teams"]["home"]["team"].get("abbreviation", "")
+                if f"{ga}{gh}" != team_seg:
+                    continue
+                if (g.get("status", {}) or {}).get("abstractGameState", "") == "Final":
+                    return "Final"
+                ls = g.get("linescore", {}) or {}
+                ordn = ls.get("currentInningOrdinal")
+                if not ordn:
+                    return None
+                pre = {"Top": "Top", "Bottom": "Bot", "Middle": "Mid", "End": "End"}.get(
+                    ls.get("inningState", ""), "")
+                return f"{pre} {ordn}".strip()
+    except Exception:
+        pass
+    return None
+
+
 # ── Live in-game stat cache (refreshed by a background loop) ──────────────────
 _live_stats: dict = {}                 # bet_id → display string like "4 K · needs 6+"
 _live_stats_lock = threading.Lock()
@@ -1189,8 +1225,12 @@ def _live_stats_loop():
             fresh = {}
             for b in inplay:
                 r = _lookup_box_stat(b)
-                if r:
-                    fresh[b["id"]] = _live_stat_text(b, r[0], r[1])
+                inning = _fetch_game_inning(b)
+                if r or inning:
+                    fresh[b["id"]] = {
+                        "stat":   _live_stat_text(b, r[0], r[1]) if r else None,
+                        "inning": inning,
+                    }
                 _t.sleep(0.3)
             with _live_stats_lock:
                 _live_stats.clear()
@@ -4565,7 +4605,8 @@ function renderTodayEdges() {
       const now = Date.now();
       const diffMs = gameStart - now;
       if (diffMs < 0) {
-        gameTimeBadge = `<span style="display:block;font-size:10px;color:#f85149;font-weight:700;margin-top:3px;">● IN PLAY — do not bet</span>`;
+        const innTxt = b.live_inning ? ` · ${b.live_inning}` : '';
+        gameTimeBadge = `<span style="display:block;font-size:10px;color:#f85149;font-weight:700;margin-top:3px;">● In play${innTxt}</span>`;
       } else {
         const opts = {month:'short', day:'numeric', hour:'numeric', minute:'2-digit', timeZoneName:'short'};
         const label = gameStart.toLocaleString('en-US', opts);
@@ -5842,7 +5883,10 @@ class Handler(BaseHTTPRequestHandler):
             # Attach live in-game stat (from the background cache) for IN PLAY bets
             with _live_stats_lock:
                 _ls = dict(_live_stats)
-            open_bets = [{**b, "live_stat": _ls.get(b["id"])} for b in open_bets]
+            open_bets = [{**b,
+                          "live_stat":   (_ls.get(b["id"]) or {}).get("stat"),
+                          "live_inning": (_ls.get(b["id"]) or {}).get("inning")}
+                         for b in open_bets]
             print(f"  /api/today_edges: found {len(open_bets)} open positions")
             try:
                 payload = json.dumps(open_bets).encode()

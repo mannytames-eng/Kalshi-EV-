@@ -1823,6 +1823,10 @@ def _get_performance(since: Optional[str] = None) -> dict:
 
     by_type = {}
     for b in clean_settled:
+        # Correlated bets are excluded from all stats (win rate, units, Kelly) —
+        # skip them here too so the by_type rows reconcile with the headline.
+        if _is_correlated(b):
+            continue
         label = _perf_label(b)
         is_shad = _is_shadow_bet(b)
         if label not in by_type:

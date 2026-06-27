@@ -4565,10 +4565,7 @@ function renderTodayEdges() {
       const now = Date.now();
       const diffMs = gameStart - now;
       if (diffMs < 0) {
-        const liveStat = b.live_stat
-          ? `<span style="display:block;font-size:11px;font-weight:700;color:var(--text);margin-top:3px;" title="Live in-game stat (MLB box score, updates ~every minute)">📊 ${b.live_stat}</span>`
-          : '';
-        gameTimeBadge = `<span style="display:block;font-size:10px;color:#f85149;font-weight:700;margin-top:3px;">● IN PLAY — do not bet</span>${liveStat}`;
+        gameTimeBadge = `<span style="display:block;font-size:10px;color:#f85149;font-weight:700;margin-top:3px;">● IN PLAY — do not bet</span>`;
       } else {
         const opts = {month:'short', day:'numeric', hour:'numeric', minute:'2-digit', timeZoneName:'short'};
         const label = gameStart.toLocaleString('en-US', opts);
@@ -4581,28 +4578,10 @@ function renderTodayEdges() {
     const sideClass = b.side === 'YES' ? 'side-yes' : 'side-no';
     const tickerTxt = `<span style="display:block;font-size:8px;color:var(--muted);font-family:monospace;margin-top:2px;">${b.ticker}</span>`;
 
-    // ── Line movement: entry line vs current live line ──────────────────────
-    // entry: pin_line_at_flag (Pinnacle) or kalshi_line_at_flag (Kalshi threshold)
-    // live:  snap.pin_line (from latest market_snapshot, updated every scan cycle)
-    // Show as "8.0 ➔ 8.5" — blank if neither side has data.
-    const entryLine = b.pin_line_at_flag != null ? b.pin_line_at_flag
-                    : b.kalshi_line_at_flag != null ? b.kalshi_line_at_flag
-                    : null;
-    const liveLine  = snap != null && snap.pin_line != null ? snap.pin_line
-                    : snap != null && snap.kalshi_line != null ? snap.kalshi_line
-                    : null;
-    let lineMoveTxt = '—';
-    if (entryLine != null) {
-      const entryFmt = Number.isInteger(entryLine) ? entryLine + '.0' : entryLine;
-      if (liveLine != null && liveLine !== entryLine) {
-        const liveFmt  = Number.isInteger(liveLine)  ? liveLine  + '.0' : liveLine;
-        const moved    = liveLine !== entryLine;
-        const color    = moved ? '#e3a53a' : 'var(--muted)';
-        lineMoveTxt = `<span style="font-weight:600;color:${color};white-space:nowrap;">${entryFmt} ➔ ${liveFmt}</span>`;
-      } else {
-        lineMoveTxt = `<span style="color:var(--muted);white-space:nowrap;">${entryFmt}</span>`;
-      }
-    }
+    // ── Live in-game counter (replaces the old Entry➔Live line column) ──────
+    const liveCounter = b.live_stat
+      ? `<span style="font-weight:700;font-size:13px;color:var(--text);white-space:nowrap;" title="Live in-game stat — MLB box score, updates ~every minute">${b.live_stat}</span>`
+      : `<span style="color:var(--muted);">—</span>`;
 
     return `<tr>
       <td style="font-size:11px;color:var(--muted);white-space:nowrap;">${flagTime}</td>
@@ -4610,7 +4589,7 @@ function renderTodayEdges() {
       <td class="prop-col" style="font-size:12px;">${b.title}${kalshiLineBadge(b)}${driftTxt}${tickerTxt}${kalshiLink}</td>
       <td class="${sideClass}">${b.side}</td>
       <td class="num" style="color:${edgeColor(b.edge_pct)};font-weight:700;">+${pct(b.edge_pct)}${flagOddsTxt}</td>
-      <td class="num">${lineMoveTxt}</td>
+      <td class="num">${liveCounter}</td>
       <td class="num">${lastScanEdge}</td>
       <td class="num">${recBadge}</td>
       <td class="num">${stake}</td>
@@ -4621,7 +4600,7 @@ function renderTodayEdges() {
     <thead><tr>
       <th>Flagged</th><th>Matchup</th><th>Bet</th><th>Side</th>
       <th class="num">Edge @ Flag</th>
-      <th class="num" style="white-space:nowrap;">Line (Entry ➔ Live)</th>
+      <th class="num">Live</th>
       <th class="num">Last Scan <span style="font-size:9px;font-weight:400;color:var(--muted);">(≤2 min)</span></th>
       <th class="num">Status</th>
       <th class="num">Stake</th>

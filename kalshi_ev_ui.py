@@ -1871,6 +1871,8 @@ def _get_performance(since: Optional[str] = None) -> dict:
         # Average CLV across all settled bets in this market type
         avg_clv_t       = round(sum(d["clv"]) / len(d["clv"]), 2) if d["clv"] else None
         avg_pin_drift_t = round(sum(d["pin_drifts"]) / len(d["pin_drifts"]), 2) if d["pin_drifts"] else None
+        # Total flat units ($1 on every bet) for this market type
+        total_units_t   = round(sum(d["units"]), 2) if d["units"] else None
         type_breakdown.append({
             "label":             label,
             "won":               d["won"],
@@ -1882,6 +1884,7 @@ def _get_performance(since: Optional[str] = None) -> dict:
             "kelly_dollars":     kelly_t,
             "avg_clv":           avg_clv_t,
             "avg_pin_drift":     avg_pin_drift_t,
+            "total_units":       total_units_t,
             "insufficient_data": total_t < MIN_SAMPLE,
             "sample_size":       total_t,
             "shadow":            d.get("shadow", False),
@@ -5071,11 +5074,11 @@ function renderPerformance(d) {
       const kellyCell = kpct != null
         ? `<span class="${kcls}" title="$${t.kelly_dollars != null ? Math.abs(t.kelly_dollars).toFixed(0) : '?'} on $${bankroll} bank">${sign(kpct)}${kpct.toFixed(2)}%</span>`
         : '—';
-      // Prefer avg_pin_drift (true CLV: closing_pin − pin_at_entry) over old avg_clv (inflated by entry discount)
-      const pd    = t.avg_pin_drift != null ? t.avg_pin_drift : null;
-      const pdCls = pd == null ? '' : pd > 0 ? 'pnl-pos' : pd < 0 ? 'pnl-neg' : '';
-      const clvCell = pd != null
-        ? `<span class="${pdCls}" title="Avg Pin Drift for this market type: Pinnacle close minus Pinnacle at entry. True closing line value — positive = Pin confirmed your edge after you bet.">${sign(pd)}${pd.toFixed(2)}pp</span>`
+      // Total flat units ($1 on every bet) for this market type
+      const tu     = t.total_units != null ? t.total_units : null;
+      const tuCls  = tu == null ? '' : tu > 0 ? 'pnl-pos' : tu < 0 ? 'pnl-neg' : '';
+      const unitsCell = tu != null
+        ? `<span class="${tuCls}" title="Total flat units for this market type — net profit if you'd staked $1 on every bet. Removes Kelly sizing noise; pure pick quality.">${sign(tu)}${tu.toFixed(2)}u</span>`
         : '—';
       const shadowTotal = (t.shadow_won || 0) + (t.shadow_lost || 0);
       const shadowWr    = shadowTotal > 0 ? Math.round(100 * (t.shadow_won || 0) / shadowTotal) : null;
@@ -5091,7 +5094,7 @@ function renderPerformance(d) {
         <td class="num pnl-neg">${lostCell}</td>
         <td class="num">${isShadowRow && shadowTotal > 0 ? `<span style="color:var(--muted);font-size:10px;" title="Shadow win rate — not counted in live stats">${shadowWr}% (${shadowTotal})</span>` : wrCell}</td>
         <td class="num">${isShadowRow ? '<span style="color:var(--muted);font-size:10px;">$0 stake</span>' : kellyCell}</td>
-        <td class="num">${clvCell}</td>
+        <td class="num">${isShadowRow ? '<span style="color:var(--muted);font-size:10px;">$0 stake</span>' : unitsCell}</td>
       </tr>`;
     }).join('');
     perfBodyHtml += `
@@ -5100,7 +5103,7 @@ function renderPerformance(d) {
           <th>Market Type</th><th class="num">Won</th><th class="num">Lost</th>
           <th class="num">Win Rate</th>
           <th class="num" title="Kelly P&amp;L as % of bankroll (hover for dollar amount)">Kelly P&amp;L (% bank)</th>
-          <th class="num" title="Avg Pin Drift: Pinnacle close minus Pinnacle at entry. True CLV — did the sharp market confirm your edge after you bet?">Avg Pin Drift</th>
+          <th class="num" title="Total flat units — net profit per market type if you'd staked $1 on every bet. Bet-size-agnostic pick quality.">Total Units</th>
         </tr></thead>
         <tbody>${typeRows}</tbody>
       </table>`;

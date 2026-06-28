@@ -682,9 +682,9 @@ if _resized_count:
     _data_fixed = True
     print(f"  Retroactive resize: updated stakes/pnl on {_resized_count} bet(s) → new time-Kelly multipliers")
 
-# Fix: enforce one funded edge per player per day. If multiple non-shadow prop
-# edges on the same player/game escaped correlation tagging (pre-fix bets), keep
-# the earliest-flagged funded and mark the rest correlated (excluded from stats).
+# Fix: enforce one funded edge per player per day, keeping the MOST PROBABLE
+# (highest Kalshi price) line — nearer a coin flip = less longshot de-vig
+# inflation. All other same-player/day prop bets are marked correlated.
 from collections import defaultdict as _dd_corr
 _pp_groups = _dd_corr(list)
 for _b in _bets:
@@ -697,14 +697,18 @@ _dedup_count = 0
 for (_pl, _gd), _grp in _pp_groups.items():
     if len(_grp) < 2:
         continue
-    _grp.sort(key=lambda x: x.get("flagged_at", ""))   # earliest stays funded
+    _grp.sort(key=lambda x: -(x.get("kalshi_price") or 0))   # highest price kept
+    _keeper = _grp[0]
+    if _keeper.get("correlated"):          # best line was wrongly correlated → restore
+        _keeper["correlated"] = False
+        _dedup_count += 1
     for _b in _grp[1:]:
         if not _b.get("correlated"):
             _b["correlated"] = True
             _dedup_count += 1
 if _dedup_count:
     _data_fixed = True
-    print(f"  Dedup: marked {_dedup_count} same-player/day prop bet(s) correlated")
+    print(f"  Dedup: enforced most-probable line on {_dedup_count} same-player/day prop bet(s)")
 
 if _data_fixed:
     _save_bets(_bets)
@@ -865,6 +869,22 @@ def _add_new_bets(edges: list) -> list:
             if b["status"] == "open"
             and not b.get("shadow") and not _is_shadow(b.get("ticker", ""))
         }
+        # Among NEW qualifying prop edges for the same player+game in this batch,
+        # the funded one is the MOST PROBABLE (highest Kalshi price) — nearer a
+        # coin flip = less longshot de-vig inflation = more reliable edge. The
+        # rest are marked correlated. (Only qualifying edges count, so if the
+        # most-probable line is below the floor, the next one can still fund.)
+        _best_prop = {}   # (matchup, game_date) -> highest qualifying Kalshi price
+        for e in edges:
+            if e.get("mkt_type") != "prop" or e.get("pin_invalidated"):
+                continue
+            if e.get("edge_pct", 0) < EDGE_THRESHOLD * 100:
+                continue
+            _bk = (e.get("matchup", ""), _parse_ticker_date(e.get("ticker", "")))
+            _bp = e.get("kalshi", 0) or 0
+            if _bk not in _best_prop or _bp > _best_prop[_bk]:
+                _best_prop[_bk] = _bp
+
         # Running total of Kelly stake already committed today (PT). New funded
         # bets in this cycle add to it so the daily cap holds within one scan too.
         _committed_today = _todays_committed_exposure()
@@ -914,6 +934,11 @@ def _add_new_bets(edges: list) -> list:
             else:
                 slot = (e.get("matchup", ""), e.get("mkt_type", ""), e.get("side", ""), game_date)
             is_correlated = slot in open_slots
+            # Within this batch, only the most-probable (highest-price) prop edge
+            # per player is funded; lower-priced same-player edges are correlated.
+            if not is_correlated and e.get("mkt_type") == "prop":
+                if (e.get("kalshi", 0) or 0) < _best_prop.get((e.get("matchup", ""), game_date), 0):
+                    is_correlated = True
 
             # entry_yes_pct = Kalshi YES ask % when flagged (for CLV calculation)
             kalshi_yes_at_flag = e["kalshi_pct"] if e["side"] == "YES" else round((1 - e["kalshi"]) * 100, 1)

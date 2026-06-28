@@ -682,33 +682,61 @@ if _resized_count:
     _data_fixed = True
     print(f"  Retroactive resize: updated stakes/pnl on {_resized_count} bet(s) → new time-Kelly multipliers")
 
-# Fix: enforce one funded edge per player per day, keeping the MOST PROBABLE
-# (highest Kalshi price) line — nearer a coin flip = less longshot de-vig
-# inflation. All other same-player/day prop bets are marked correlated.
+# ── Same-player dedup — SETTLED BETS ARE FROZEN ──────────────────────────────
+# Settled bets keep the classification they had when recorded; we never rewrite
+# history. New/open bets get the "most-probable line" rule at flag time (live
+# pre-pass in _add_new_bets) and via the open-only pass below.
 from collections import defaultdict as _dd_corr
-_pp_groups = _dd_corr(list)
+
+# One-time revert: an earlier retroactive highest-price dedup had rewritten
+# SETTLED same-player pairs, funding later losers over earlier winners. Restore
+# them to the original live behavior — earliest-flagged funded, rest correlated.
+_REVERT_VERSION = "v1_settled_dedup_revert"
+if not any(_b.get("_settled_revert") == _REVERT_VERSION
+           for _b in _bets if _b.get("status") in ("won", "lost")):
+    _rv = _dd_corr(list)
+    for _b in _bets:
+        if (_b.get("mkt_type") != "prop" or _b.get("shadow")
+                or _b.get("status") not in ("won", "lost")
+                or _b.get("clv_source") == "corrupted_utc"):
+            continue
+        _rv[(_b.get("matchup", ""), _parse_ticker_date(_b.get("ticker", "")))].append(_b)
+    _rev = 0
+    for _grp in _rv.values():
+        if len(_grp) < 2:
+            continue
+        _grp.sort(key=lambda x: x.get("flagged_at", ""))   # earliest flagged = funded
+        if _grp[0].get("correlated"):
+            _grp[0]["correlated"] = False; _rev += 1
+        for _b in _grp[1:]:
+            if not _b.get("correlated"):
+                _b["correlated"] = True; _rev += 1
+    for _b in _bets:
+        if _b.get("status") in ("won", "lost"):
+            _b["_settled_revert"] = _REVERT_VERSION
+    if _rev:
+        _data_fixed = True
+        print(f"  Settled revert: restored {_rev} same-player bet(s) to original (first-flagged) classification")
+
+# Ongoing: most-probable (highest price) line on OPEN bets only — settled frozen.
+_open_pp = _dd_corr(list)
 for _b in _bets:
-    if (_b.get("mkt_type") != "prop" or _b.get("shadow")
-            or _b.get("clv_source") == "corrupted_utc"):
+    if (_b.get("mkt_type") != "prop" or _b.get("shadow") or _b.get("status") != "open"):
         continue
-    _gd = _parse_ticker_date(_b.get("ticker", ""))
-    _pp_groups[(_b.get("matchup", ""), _gd)].append(_b)
+    _open_pp[(_b.get("matchup", ""), _parse_ticker_date(_b.get("ticker", "")))].append(_b)
 _dedup_count = 0
-for (_pl, _gd), _grp in _pp_groups.items():
+for _grp in _open_pp.values():
     if len(_grp) < 2:
         continue
     _grp.sort(key=lambda x: -(x.get("kalshi_price") or 0))   # highest price kept
-    _keeper = _grp[0]
-    if _keeper.get("correlated"):          # best line was wrongly correlated → restore
-        _keeper["correlated"] = False
-        _dedup_count += 1
+    if _grp[0].get("correlated"):
+        _grp[0]["correlated"] = False; _dedup_count += 1
     for _b in _grp[1:]:
         if not _b.get("correlated"):
-            _b["correlated"] = True
-            _dedup_count += 1
+            _b["correlated"] = True; _dedup_count += 1
 if _dedup_count:
     _data_fixed = True
-    print(f"  Dedup: enforced most-probable line on {_dedup_count} same-player/day prop bet(s)")
+    print(f"  Open dedup: most-probable line on {_dedup_count} open same-player bet(s)")
 
 if _data_fixed:
     _save_bets(_bets)

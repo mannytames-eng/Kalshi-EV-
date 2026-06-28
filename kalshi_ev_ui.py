@@ -682,6 +682,30 @@ if _resized_count:
     _data_fixed = True
     print(f"  Retroactive resize: updated stakes/pnl on {_resized_count} bet(s) → new time-Kelly multipliers")
 
+# Fix: enforce one funded edge per player per day. If multiple non-shadow prop
+# edges on the same player/game escaped correlation tagging (pre-fix bets), keep
+# the earliest-flagged funded and mark the rest correlated (excluded from stats).
+from collections import defaultdict as _dd_corr
+_pp_groups = _dd_corr(list)
+for _b in _bets:
+    if (_b.get("mkt_type") != "prop" or _b.get("shadow")
+            or _b.get("clv_source") == "corrupted_utc"):
+        continue
+    _gd = _parse_ticker_date(_b.get("ticker", ""))
+    _pp_groups[(_b.get("matchup", ""), _gd)].append(_b)
+_dedup_count = 0
+for (_pl, _gd), _grp in _pp_groups.items():
+    if len(_grp) < 2:
+        continue
+    _grp.sort(key=lambda x: x.get("flagged_at", ""))   # earliest stays funded
+    for _b in _grp[1:]:
+        if not _b.get("correlated"):
+            _b["correlated"] = True
+            _dedup_count += 1
+if _dedup_count:
+    _data_fixed = True
+    print(f"  Dedup: marked {_dedup_count} same-player/day prop bet(s) correlated")
+
 if _data_fixed:
     _save_bets(_bets)
     print("  Applied one-time data corrections (CLV/pin_entry upgrades)")

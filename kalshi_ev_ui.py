@@ -5115,7 +5115,6 @@ function renderPerformance(d) {
       ${pill('Open', d.open, 'pnl-neu')}
       ${pill('Win Rate', na(d.win_rate, v => v + '%'), '', 'how often our bets won')}
       ${pill('Entry Discount', d.avg_entry_discount != null ? `<span class="${d.avg_entry_discount >= 0 ? 'pnl-pos' : 'pnl-neg'}" title="Avg (Pinnacle fair value − Kalshi entry) at time of bet. This is your actual alpha — the mispricing you captured. NOT affected by what happened after.">${d.avg_entry_discount > 0 ? '+' : ''}${d.avg_entry_discount}pp</span>` : '—', '', 'how underpriced our bets were vs the sharp line')}
-      ${pill('Pin Drift (True CLV)', d.avg_pin_drift != null ? `<span class="${d.avg_pin_drift >= 0 ? 'pnl-pos' : 'pnl-neg'}" title="Avg (Pinnacle close − Pinnacle at entry). Did the sharp market move in your favor AFTER you bet? Positive = Pin confirmed your edge. Zero = you got a good price but Pin didn't move. This is true closing line value.">${d.avg_pin_drift > 0 ? '+' : ''}${d.avg_pin_drift}pp</span>` : '—', '', 'did the sharp line agree after we bet')}
       ${pill('Last Bet', lastBetVal)}
       ${pill('Kelly P&amp;L (% bank)', d.total_kelly_pct != null ? `<span class="${kellyPctClass}">${sign(d.total_kelly_pct)}${d.total_kelly_pct.toFixed(2)}%</span>` : '—', '', 'secondary — noisy at this sample')}
     </div>
@@ -5193,11 +5192,8 @@ function renderPerformance(d) {
   // ── Alpha section ────────────────────────────────────────────────────────
   if (d.alpha_buckets && d.alpha_buckets.length) {
     const entryDisc = d.avg_entry_discount;
-    const pinDrift  = d.avg_pin_drift;
     const edSign    = entryDisc != null && entryDisc > 0 ? '+' : '';
-    const pdSign    = pinDrift  != null && pinDrift  > 0 ? '+' : '';
     const edCls     = entryDisc != null ? (entryDisc >= 0 ? 'pnl-pos' : 'pnl-neg') : '';
-    const pdCls     = pinDrift  != null ? (pinDrift  >= 0 ? 'pnl-pos' : 'pnl-neg') : '';
     const alphaRows = d.alpha_buckets.map(b => {
       const dCls  = b.delta > 0 ? 'pnl-pos' : b.delta < 0 ? 'pnl-neg' : '';
       const dSign = b.delta > 0 ? '+' : '';
@@ -5216,12 +5212,10 @@ function renderPerformance(d) {
           <span style="font-size:10px;color:var(--muted);">▶</span> Model Alpha
           <span style="font-size:11px;font-weight:400;color:var(--muted);margin-left:4px;">
             Entry Discount <span class="${edCls}">${entryDisc != null ? edSign + entryDisc + 'pp' : '—'}</span>
-            &nbsp;·&nbsp; Pin Drift <span class="${pdCls}">${pinDrift != null ? pdSign + pinDrift + 'pp' : '—'}</span>
           </span>
         </summary>
         <div style="font-size:11px;color:var(--muted);margin:4px 0 8px;line-height:1.5;">
           <strong style="color:var(--fg);">Entry Discount</strong> = Pinnacle fair value − Kalshi entry price. This is your actual alpha — the mispricing you exploited at the moment of the bet.<br>
-          <strong style="color:var(--fg);">Pin Drift</strong> = Pinnacle close − Pinnacle at entry. Did the sharp market confirm your read after you bet? Positive = Pinnacle agreed. Zero = you got a good price but Pin held flat.<br>
           <strong style="color:var(--fg);">Delta</strong> = actual win rate minus Kalshi's implied probability. Positive = outperforming market expectations.
         </div>
         <table style="font-size:12px;">
@@ -5339,21 +5333,7 @@ function renderPerformance(d) {
         discountLine = `<div style="font-size:10px;color:var(--muted);">Pin at entry: ${pinAtEntry}%</div>`;
       }
 
-      // Row 2 — Pin Drift: did the sharp market agree with us after we bet?
-      let driftLine = '';
-      if (b.pin_drift != null && b.status !== 'open') {
-        const drColor = b.pin_drift > 0 ? 'var(--green)' : b.pin_drift < 0 ? 'var(--red)' : 'var(--fg)';
-        const drSign  = b.pin_drift > 0 ? '+' : '';
-        const driftTitle = `Pin Drift: Pinnacle moved ${drSign}${b.pin_drift}pp after entry (${pinAtEntry}% → ${pinAtClose}%). Positive = Pin agreed with your read.`;
-        driftLine = `<div style="font-size:11px;margin-top:2px;" title="${driftTitle}">
-          <span style="color:var(--muted);font-size:10px;">Pin Drift </span><span style="color:${drColor};font-weight:700;">${drSign}${b.pin_drift}pp</span>
-          <span style="color:var(--muted);font-size:10px;"> (→ ${pinAtClose ?? 'open'}%)</span>
-        </div>`;
-      } else if (b.status === 'open') {
-        driftLine = `<span style="color:var(--muted);font-size:10px;">→ open</span>`;
-      }
-
-      // Row 3 — Kalshi repricing: did the market rerate our contract?
+      // Row 2 — Kalshi repricing: did the market rerate our contract?
       let kalshiLine = '';
       if (kalshiClose != null) {
         const kDelta = parseFloat(kalshiClose) - parseFloat(entryK);
@@ -5364,7 +5344,7 @@ function renderPerformance(d) {
         </div>`;
       }
 
-      lineMoveCell = `${discountLine}${driftLine}${kalshiLine}`;
+      lineMoveCell = `${discountLine}${kalshiLine}`;
     }
     const corrBadge = b.correlated
       ? `<span title="Correlated — same game/type/side already open. Logged for record; excluded from win rate &amp; Kelly stats." style="font-size:9px;font-weight:700;color:#e3a53a;background:rgba(227,165,58,0.12);border:1px solid rgba(227,165,58,0.3);border-radius:3px;padding:1px 4px;margin-left:5px;vertical-align:middle;">CORR</span>`

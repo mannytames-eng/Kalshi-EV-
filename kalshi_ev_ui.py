@@ -4613,11 +4613,24 @@ function renderTodayEdges() {
     const drift    = live != null && live.drift_pct != null ? live.drift_pct : 0;
     const driftBad = drift <= -3;
 
+    // ── Stale-entry detection ────────────────────────────────────────────────
+    // If the FAIR value (Pinnacle) has moved >10pp since we flagged, the entry
+    // line was likely stale/soft (the Marte case: NO fair 64%→50%). The entry
+    // edge is suspect regardless of the current Kalshi price.
+    const entryFairPct = b.pin_prob_at_flag;
+    const curFairPct   = curFair != null ? curFair * 100 : null;
+    const fairMoved    = (entryFairPct != null && curFairPct != null) ? (curFairPct - entryFairPct) : null;
+    const staleEntry   = fairMoved != null && Math.abs(fairMoved) > 10;
+
     if (!inSnapshot) {
       // Not in scan at all — Pinnacle offline or market closed
       recLabel = 'PASS';
       recColor = 'var(--muted)';
       recTip   = 'Market not found in latest scan — Pinnacle data unavailable or Kalshi market closed';
+    } else if (staleEntry) {
+      recLabel = `⚠ STALE ${fairMoved > 0 ? '+' : '−'}${Math.abs(fairMoved).toFixed(0)}pp`;
+      recColor = '#f85149';
+      recTip   = `Fair value moved ${fairMoved > 0 ? '+' : ''}${fairMoved.toFixed(1)}pp since flag (${entryFairPct.toFixed(0)}% → ${curFairPct.toFixed(0)}%). The entry Pinnacle line was likely stale/soft — this edge is suspect. Do NOT trust the flagged edge.`;
     } else if (curEdgePct === null || curEdgePct <= 0 || aboveCutoff) {
       recLabel = 'PASS';
       recColor = '#f85149';

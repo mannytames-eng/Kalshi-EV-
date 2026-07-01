@@ -80,11 +80,13 @@ MAX_PROP_EVENTS = 15         # prop scan credit budget — MLB only (15 events �
 # The bet is shadowed (tracked, not flagged) until the lines converge.
 PROP_LAMBDA_SANITY_GAP = 0.12  # 12pp divergence at Kalshi threshold → shadow
 
-# When NO retail book posted this player (Pinnacle-only, nothing to cross-check),
-# a large edge is disproportionately a stale/soft Pinnacle line rather than a
-# real inefficiency (4 of 5 such edges historically lost). Shadow — don't fund —
-# any Pinnacle-only edge at or above this size.
-PROP_PIN_ONLY_MAX_EDGE = 0.05  # 5% adj edge
+# When NO retail book posted this player yet (Pinnacle-only), a large edge is
+# indistinguishable from a stale/soft early Pinnacle line (4 of 5 such edges
+# historically lost). Rather than fund or shadow, DEFER edges at/above this size
+# and wait for DK/FanDuel to post — a real early Pinnacle edge survives and funds
+# once retail confirms; a stale one never does. Pinnacle still drives everything
+# below this threshold on its own.
+PROP_PIN_ONLY_MAX_EDGE = 0.05  # 5% adj edge — defer above this until retail posts
 
 # ── Book weights for consensus probability ───────────────────────────────────
 # Fair value is Pinnacle ONLY — the sharpest closing-line book.
@@ -2573,17 +2575,6 @@ def scan_player_props(
 
         best_adj = max(yes_adj, no_adj)
 
-        # Pinnacle-only fallback: no retail book posted this player, so the >12pp
-        # cross-check above couldn't run. A large edge here is almost always a
-        # stale Pinnacle line (see Marte/Perez/Avila) — shadow it, don't fund.
-        if not _retail_lams and best_adj >= PROP_PIN_ONLY_MAX_EDGE:
-            print(
-                f"  ⚠ prop  {matched.get('player','?'):<25} "
-                f"SANITY SHADOW — Pinnacle-only edge {best_adj:.1%} ≥ {PROP_PIN_ONLY_MAX_EDGE:.0%}, "
-                f"no retail book to validate"
-            )
-            _prop_sanity_shadow = True
-
         # Full prop snapshot — capture current Kalshi + Pinnacle for ALL markets
         # regardless of threshold so the UI can show live prices on logged bets
         # even after the edge has closed.
@@ -2603,6 +2594,23 @@ def scan_player_props(
         if best_adj > PROP_MAX_EDGE:   # 15% cap — tighter than game-line MAX_EDGE (20%); very large prop edges are almost always a mismatch
             print(
                 f"  ✗ prop  {matched.get('player','?'):<25} REJECTED — adj edge {best_adj:.1%} > PROP_MAX_EDGE {PROP_MAX_EDGE:.0%}"
+            )
+            continue
+
+        # ── Large Pinnacle-only edge → DEFER (wait for retail) ────────────────
+        # Pinnacle stays the driver: small edges fund on Pinnacle alone. But a
+        # LARGE edge with no retail book posted yet is indistinguishable from a
+        # stale/soft early Pinnacle line (the Marte case). Rather than fund a
+        # possible fake or shadow a possible real edge, we SKIP it this cycle.
+        # On a later scan, once DK/FanDuel post: if they confirm, it funds then;
+        # if they disagree, _validate_book_consensus rejects it; if Pinnacle was
+        # stale, it corrects and the edge is simply gone. Real early Pinnacle
+        # edges survive and get funded; stale ones never do.
+        if not _retail_lams and best_adj >= PROP_PIN_ONLY_MAX_EDGE:
+            print(
+                f"  ⏳ prop  {matched.get('player','?'):<25} "
+                f"DEFERRED — Pinnacle-only edge {best_adj:.1%} ≥ {PROP_PIN_ONLY_MAX_EDGE:.0%}, "
+                f"waiting for retail (DK/FD) to post & confirm before funding"
             )
             continue
 

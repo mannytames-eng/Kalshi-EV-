@@ -595,6 +595,7 @@ _bad_match_ids = {
     "KXMLBSPREAD-26MAY152138LADLAA-LAD2|NO",        # LAD@LAA spread matched to SF@LAD
     "KXMLBKS-26MAY192140LADSD-SDGCANNING17-6|YES",  # Canning ghost edge: Pinnacle "over 4.5 Ks" (P(X≥5)) matched to Kalshi "6+" (P(X≥6)) — line mismatch int(4.5)=4 ≠ kalshi_thresh=5
     "KXMLBTOTAL-26MAY202040LADSD-9|YES",             # Suspected floor_strike mismatch: scanner fair=46% but Pinnacle over 8.5 = +151 (~40%) — quarantined pending total-diag log verification
+    "KXMLBTB-26JUL012140SFAZ-AZKMARTE4-2|NO",        # Stale Pinnacle line: scanner cached NO=63.9% but live Pinnacle=50.2% (Kalshi 53c → actually -EV). Fake 8.4% edge; kept re-flagging from stale prop cache. Permanently suppressed.
 }
 _bets = [_b for _b in _bets if _b.get("id") not in _bad_match_ids]
 _data_fixed = True

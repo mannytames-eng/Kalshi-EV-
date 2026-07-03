@@ -5520,8 +5520,12 @@ async function fetchPaper() {
     const clvColor  = pinData ? (pinData.avg_clv >= 0 ? 'var(--green)' : 'var(--red)') : 'var(--muted)';
     const clvLabel  = pinData ? `Avg CLV — PIN (${pinData.count} bets)` : 'Avg CLV — PIN';
 
-    // Kelly P&L as secondary context
-    const kellyPct  = perf.total_kelly_pct;
+    // Kelly P&L — use the compounding paper balance so this matches the ROI
+    // chart at the bottom exactly (perf.total_kelly_pct is a separate non-
+    // compounding calc and was showing a different number).
+    const kellyPct  = (d.start_balance && d.balance != null)
+      ? (d.balance - d.start_balance) / d.start_balance * 100
+      : perf.total_kelly_pct;
     const kellyColor = kellyPct == null ? 'var(--muted)' : kellyPct >= 0 ? 'var(--green)' : 'var(--red)';
     const kellyTxt  = kellyPct == null ? '—' : `${kellyPct >= 0 ? '+' : ''}${kellyPct.toFixed(2)}%`;
 

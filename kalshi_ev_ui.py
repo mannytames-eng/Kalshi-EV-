@@ -5545,6 +5545,18 @@ async function fetchPaper() {
         <div style="font-size:9px;color:var(--muted);opacity:0.75;margin-top:2px;line-height:1.2;">how far Kalshi's line moved toward us by close</div>
       </div>`;
       })()}
+      <!-- 2b. Avg Price Difference (entry discount): how far below fair we bought -->
+      ${(() => {
+        const ed = perf.avg_entry_discount;
+        if (ed == null) return '';
+        const edColor = ed > 0 ? 'var(--green)' : ed < 0 ? 'var(--red)' : 'var(--muted)';
+        return `<div style="background:var(--surface);padding:14px 16px;text-align:center;">
+        <div style="font-size:24px;font-weight:800;color:${edColor};letter-spacing:-0.5px;">${ed > 0 ? '+' : ''}${ed.toFixed(1)}¢</div>
+        <div style="font-size:11px;color:var(--muted);margin-top:1px;">below fair value</div>
+        <div style="font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:0.06em;margin-top:3px;" title="Average price difference at entry: Pinnacle's fair value minus the Kalshi price we paid, in cents. How much cheaper than the sharp fair value we bought, on average, at the moment we flagged each edge.">Avg Price Difference</div>
+        <div style="font-size:9px;color:var(--muted);opacity:0.75;margin-top:2px;line-height:1.2;">how far below fair we bought</div>
+      </div>`;
+      })()}
       <!-- 3. Win Rate vs Implied -->
       <div style="background:var(--surface);padding:14px 16px;text-align:center;">
         <div style="font-size:24px;font-weight:800;color:${vsMarketColor};">${vsMarketTxt}</div>
@@ -5571,20 +5583,13 @@ async function fetchPaper() {
       <!-- 6. Kelly P&L (secondary) -->
       <div style="background:var(--surface);padding:14px 16px;text-align:center;">
         <div style="font-size:22px;font-weight:700;color:${kellyColor};">${kellyTxt}</div>
-        <div style="font-size:11px;color:var(--muted);margin-top:1px;">${pnlSign}$${d.total_pnl.toFixed(2)} on $${d.start_balance.toFixed(0)}</div>
+        <div style="font-size:11px;color:var(--muted);margin-top:1px;">simulated, quarter-Kelly</div>
         <div style="font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:0.06em;margin-top:3px;" title="Kelly-sized P&L as % of bankroll. Secondary — reflects staking decisions, not model quality. Sample too small to be meaningful; judge by the edge signals above.">Kelly P&amp;L (% bank)</div>
         <div style="font-size:9px;color:var(--muted);opacity:0.75;margin-top:2px;line-height:1.2;">noisy at this sample — don't judge by this</div>
       </div>
-      <!-- 7. Bankroll (secondary) -->
-      <div style="background:var(--surface);padding:14px 16px;text-align:center;">
-        <div style="font-size:22px;font-weight:700;color:${pnlColor};letter-spacing:-0.5px;">$${d.balance.toFixed(2)}</div>
-        <div style="font-size:11px;color:var(--muted);margin-top:1px;">$${d.open_exposure.toFixed(2)} at risk</div>
-        <div style="font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:0.06em;margin-top:3px;" title="Simulated paper bankroll. The $1,000 starting figure is an arbitrary unit — ROI% is what matters, and it's noise at this sample.">Bankroll</div>
-        <div style="font-size:9px;color:var(--muted);opacity:0.75;margin-top:2px;line-height:1.2;">simulated — $1k is an arbitrary unit</div>
-      </div>
     </div>
     <div style="padding:6px 12px;border-bottom:1px solid var(--border);background:#0d1117;">
-      <span style="font-size:11px;color:var(--muted);">📊 V2.0 reset Jun 8 2026 ·<strong style="color:var(--text);">props ≥2.5% · games ≥3%</strong> · Quarter-Kelly · 3% max stake · 15% daily cap · compounding from $${d.start_balance.toFixed(0)} since ${d.start_date} · CLV captured every 2 min until game start</span>
+      <span style="font-size:11px;color:var(--muted);">📊 V2.0 reset Jun 8 2026 ·<strong style="color:var(--text);">props ≥2.5% · games ≥3%</strong> · Quarter-Kelly · 3% max stake · 15% daily cap · CLV captured every 2 min until game start</span>
     </div>`;
 
     // ── Bet table ──────────────────────────────────────────────────────────

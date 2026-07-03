@@ -5588,7 +5588,7 @@ async function fetchPaper() {
       <div style="background:var(--surface);padding:14px 16px;text-align:center;">
         <div style="font-size:22px;font-weight:700;color:${kellyColor};">${kellyTxt}</div>
         <div style="font-size:11px;color:var(--muted);margin-top:1px;">simulated, quarter-Kelly</div>
-        <div style="font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:0.06em;margin-top:3px;" title="Kelly-sized P&L as % of bankroll. Secondary — reflects staking decisions, not model quality. Sample too small to be meaningful; judge by the edge signals above.">Kelly P&amp;L (% bank)</div>
+        <div style="font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:0.06em;margin-top:3px;" title="Return on the simulated paper bankroll (compounding, quarter-Kelly sizing) — matches the ROI chart below. Secondary: reflects staking decisions, not model quality, and is noise at this sample. Judge by the edge signals above.">ROI</div>
         <div style="font-size:9px;color:var(--muted);opacity:0.75;margin-top:2px;line-height:1.2;">noisy at this sample — don't judge by this</div>
       </div>
     </div>

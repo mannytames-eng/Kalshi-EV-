@@ -5085,13 +5085,13 @@ function renderPerformance(d) {
   const clvBreakdown = clvSrcRows ? `
     <div style="margin:0 0 10px;border:1px solid var(--border);border-radius:6px;overflow:hidden;">
       <div style="padding:6px 10px;background:#161b22;font-size:10px;font-weight:600;color:var(--muted);text-transform:uppercase;letter-spacing:.05em;border-bottom:1px solid var(--border);">
-        CLV Source Breakdown — what's behind the Avg CLV number
+        Value vs Pinnacle Close — by data source (distinct from true CLV)
       </div>
       <table style="width:100%;border-collapse:collapse;">
         <thead><tr>
           <th style="font-size:10px;color:var(--muted);text-transform:uppercase;padding:4px 10px;text-align:left;">Source</th>
           <th class="num" style="font-size:10px;color:var(--muted);text-transform:uppercase;padding:4px 10px;">Sample</th>
-          <th class="num" style="font-size:10px;color:var(--muted);text-transform:uppercase;padding:4px 10px;">Avg CLV</th>
+          <th class="num" style="font-size:10px;color:var(--muted);text-transform:uppercase;padding:4px 10px;" title="Closing Pinnacle prob − Kalshi entry price. How much better than Pinnacle's closing fair value you bought. Note: partly mechanical (you only bet when Kalshi < Pin). The true CLV metric is 'Avg CLV' (Kalshi's own line move).">Value vs Pin</th>
         </tr></thead>
         <tbody>${clvSrcRows}</tbody>
       </table>
@@ -5529,13 +5529,8 @@ async function fetchPaper() {
     let html = `
     <div style="padding:5px 12px;background:#0d1117;border-bottom:1px solid var(--border);font-size:9px;color:var(--muted);text-transform:uppercase;letter-spacing:0.08em;font-weight:600;">Edge signals — how we judge the model</div>
     <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:1px;background:var(--border);border-bottom:1px solid var(--border);">
-      <!-- 1. Avg CLV — most reliable edge signal -->
-      <div style="background:var(--surface);padding:14px 16px;text-align:center;">
-        <div style="font-size:24px;font-weight:800;color:${clvColor};">${clvTxt}</div>
-        <div style="font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:0.06em;margin-top:3px;" title="Closing Line Value using Pinnacle's closing price. Positive = we bought below fair value. Most reliable edge signal.">${clvLabel}</div>
-        <div style="font-size:9px;color:var(--muted);opacity:0.75;margin-top:2px;line-height:1.2;">we bought below the sharp closing price</div>
-      </div>
-      <!-- 2. Avg Kalshi Move -->
+      <!-- 1. Avg CLV — the TRUE closing-line value: how far Kalshi's line moved
+           toward us from entry to close (bet-side). The most reliable signal. -->
       ${(() => {
         if (d.avg_kalshi_move == null) return '';
         const mv = d.avg_kalshi_move;
@@ -5546,8 +5541,8 @@ async function fetchPaper() {
         return `<div style="background:var(--surface);padding:14px 16px;text-align:center;">
         <div style="font-size:24px;font-weight:800;color:${mvColor};letter-spacing:-0.5px;">${mv > 0 ? '+' : ''}${mv.toFixed(2)}¢</div>
         <div style="font-size:11px;color:var(--muted);margin-top:1px;">${favTxt}</div>
-        <div style="font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:0.06em;margin-top:3px;" title="Average bet-side Kalshi line movement from entry to close across settled bets. Positive = Kalshi repriced toward your position after you bet (positive Kalshi-side CLV). Bet-side: for NO bets the close is 100 − YES.">Avg Kalshi Move</div>
-        <div style="font-size:9px;color:var(--muted);opacity:0.75;margin-top:2px;line-height:1.2;">how far the market moved toward us</div>
+        <div style="font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:0.06em;margin-top:3px;" title="True Closing Line Value: average bet-side movement of KALSHI's own price from your entry to the close. Positive = the market you traded repriced toward you after you bet — the cleanest proof you were early to the right price. Bet-side: for NO bets the close is 100 − YES.">Avg CLV</div>
+        <div style="font-size:9px;color:var(--muted);opacity:0.75;margin-top:2px;line-height:1.2;">how far Kalshi's line moved toward us by close</div>
       </div>`;
       })()}
       <!-- 3. Win Rate vs Implied -->

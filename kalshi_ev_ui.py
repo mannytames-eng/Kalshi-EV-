@@ -6044,7 +6044,8 @@ class Handler(BaseHTTPRequestHandler):
             # Performance panel, which measures the edge regardless of funding.)
             live_paper  = [b for b in paper_bets
                            if not _is_shadow(b.get("ticker", ""))
-                           and not b.get("daily_capped")]
+                           and not b.get("daily_capped")
+                           and not b.get("correlated", False)]   # excluded from stats & balance
             balance     = _compute_paper_balance()
             open_exp    = round(sum(b["paper_stake"] for b in live_paper if b["status"] == "open"), 2)
             settled     = [b for b in live_paper if b["status"] in ("won", "lost")

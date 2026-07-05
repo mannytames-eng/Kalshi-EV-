@@ -5504,14 +5504,17 @@ async function fetchPaper() {
       : `${flatUnits >= 0 ? '+' : ''}${flatUnits.toFixed(2)}u`;
     const unitsSubTxt = avgUnits == null ? '' : `${avgUnits >= 0 ? '+' : ''}${avgUnits.toFixed(3)}/bet`;
 
-    // Win rate vs implied (model vs market)
-    const winRate      = perf.win_rate;
-    const impliedAvg   = perf.avg_kalshi_implied;  // market-implied win %
-    const vsMarket     = (winRate != null && impliedAvg != null)
-      ? (winRate - impliedAvg).toFixed(1) : null;
+    // Win rate vs implied — restricted to the 2-4% edge bucket only. It's the
+    // only bucket with a meaningful sample (~110 bets); the 4%+ buckets have
+    // 1-4 bets each and are pure noise, so including them was misleading.
+    const coreBucket   = (perf.alpha_buckets || []).find(b => b.label && b.label.startsWith('2'));
+    const winRate      = coreBucket ? coreBucket.win_rate : null;   // actual
+    const impliedAvg   = coreBucket ? coreBucket.expected : null;   // market-implied
+    const vsMarket     = coreBucket ? coreBucket.delta.toFixed(1) : null;
     const vsMarketTxt  = vsMarket == null ? '—'
       : `${vsMarket >= 0 ? '+' : ''}${vsMarket}%`;
     const vsMarketColor = vsMarket == null ? 'var(--muted)' : vsMarket >= 0 ? 'var(--green)' : 'var(--red)';
+    const coreN        = coreBucket ? coreBucket.n : null;
 
     // Avg CLV — PIN source only for honest number
     const clvSrc    = perf.clv_by_source || {};
@@ -5561,12 +5564,12 @@ async function fetchPaper() {
         <div style="font-size:9px;color:var(--muted);opacity:0.75;margin-top:2px;line-height:1.2;">how far below fair we bought</div>
       </div>`;
       })()}
-      <!-- 3. Win Rate vs Implied -->
+      <!-- 3. Win Rate vs Implied (2-4% edge bucket only) -->
       <div style="background:var(--surface);padding:14px 16px;text-align:center;">
         <div style="font-size:24px;font-weight:800;color:${vsMarketColor};">${vsMarketTxt}</div>
         <div style="font-size:11px;color:var(--muted);margin-top:1px;">${winRate != null ? winRate + '%' : '—'} actual vs ${impliedAvg != null ? impliedAvg.toFixed(1) + '%' : '—'} implied</div>
-        <div style="font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:0.06em;margin-top:3px;" title="Actual win rate minus Kalshi-implied win probability. Positive = beating the market.">Win Rate vs Implied</div>
-        <div style="font-size:9px;color:var(--muted);opacity:0.75;margin-top:2px;line-height:1.2;">how much we beat the market's odds</div>
+        <div style="font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:0.06em;margin-top:3px;" title="Actual win rate minus Kalshi-implied win probability, restricted to the 2-4% edge bucket (the only one with a meaningful sample). Positive = beating the market.">Win Rate vs Implied</div>
+        <div style="font-size:9px;color:var(--muted);opacity:0.75;margin-top:2px;line-height:1.2;">2–4% edge bucket${coreN != null ? ' (' + coreN + ' bets)' : ''}</div>
       </div>
       <!-- 4. Flat Units -->
       <div style="background:var(--surface);padding:14px 16px;text-align:center;">

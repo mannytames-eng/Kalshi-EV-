@@ -619,6 +619,24 @@ for _b in _bets:
         _b["correlated"] = False
         _data_fixed = True
 
+# Fix: Grant Holmes 5+ Ks (Jul 8) — NO flagged 14:33 UTC was kept live and the
+# later YES (flagged 19:55 UTC, same exact ticker/line) was marked correlated —
+# backwards. Pinnacle moved from 51.3% to 56.9% between the two flags, i.e. the
+# sharp market reversed toward YES; the NO bet's rationale was stale by the time
+# YES was flagged. Per the same-ticker-opposite-side reversal rule (now applied
+# going forward in _add_new_bets), demote the stale NO and promote the fresh YES.
+_gholmes_stale_id     = "KXMLBKS-26JUL081840ATLPIT-ATLGHOLMES66-5|NO"
+_gholmes_fresh_id     = "KXMLBKS-26JUL081840ATLPIT-ATLGHOLMES66-5|YES"
+for _b in _bets:
+    if _b.get("id") == _gholmes_stale_id and not _b.get("correlated"):
+        _b["correlated"] = True
+        _b["correlation_reason"] = "Superseded by opposite-side edge on the same market — Pinnacle reversed toward YES after this bet was flagged"
+        _data_fixed = True
+    if _b.get("id") == _gholmes_fresh_id and _b.get("correlated"):
+        _b["correlated"] = False
+        _b.pop("correlation_reason", None)
+        _data_fixed = True
+
 # Fix: Retroactively mark all KXMLBHR bets logged before shadow mode was added
 # (2026-06-17) as shadow and zero their stakes/pnl so they don't drag Kelly P&L.
 for _b in _bets:
@@ -899,6 +917,14 @@ def _add_new_bets(edges: list) -> list:
             if b["status"] == "open"
             and not b.get("shadow") and not _is_shadow(b.get("ticker", ""))
         }
+        # Map each occupied slot to its holder bet(s) so a same-ticker,
+        # opposite-side reversal (Pinnacle flipped after the first bet was
+        # placed) can demote the stale bet instead of blocking the fresh one.
+        _slot_holders: dict = {}
+        for _ob in _bets:
+            if (_ob["status"] == "open" and not _ob.get("shadow")
+                    and not _is_shadow(_ob.get("ticker", ""))):
+                _slot_holders.setdefault(_open_slot(_ob), []).append(_ob)
         # Among NEW qualifying prop edges for the same player+game in this batch,
         # the funded one is the MOST PROBABLE (highest Kalshi price) — nearer a
         # coin flip = less longshot de-vig inflation = more reliable edge. The
@@ -964,6 +990,33 @@ def _add_new_bets(edges: list) -> list:
             else:
                 slot = (e.get("matchup", ""), e.get("mkt_type", ""), e.get("side", ""), game_date)
             is_correlated = slot in open_slots
+
+            # ── Same-ticker, opposite-side reversal ──────────────────────────
+            # If the slot is held by an open bet on the EXACT same market but
+            # the opposite side, our own fair-value read has flipped since that
+            # bet was placed — Pinnacle no longer supports it. The fresher edge
+            # reflects newer information, so demote the stale bet (exclude it
+            # from stats/exposure) instead of discarding the new one.
+            if is_correlated:
+                stale_bet = next(
+                    (h for h in _slot_holders.get(slot, [])
+                     if h.get("ticker") == e.get("ticker") and h.get("side") != e.get("side")),
+                    None,
+                )
+                if stale_bet is not None and not stale_bet.get("correlated"):
+                    stale_bet["correlated"] = True
+                    stale_bet["correlation_reason"] = (
+                        f"Superseded by opposite-side edge on the same market — Pinnacle "
+                        f"reversed; {e.get('side')} edge flagged {e.get('edge_pct', 0):.1f}% "
+                        f"at {datetime.now(timezone.utc).isoformat()}"
+                    )
+                    open_slots.discard(slot)
+                    _committed_today -= stale_bet.get("paper_stake", 0.0) or 0.0
+                    is_correlated = False
+                    print(f"  REVERSAL: {e.get('title','')} — demoting stale "
+                          f"{stale_bet.get('side')} bet (flagged {stale_bet.get('flagged_at','?')}), "
+                          f"promoting fresh {e.get('side')} edge")
+
             # Within this batch, only the most-probable (highest-price) prop edge
             # per player is funded; lower-priced same-player edges are correlated.
             if not is_correlated and e.get("mkt_type") == "prop":

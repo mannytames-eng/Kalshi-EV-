@@ -596,6 +596,7 @@ _bad_match_ids = {
     "KXMLBKS-26MAY192140LADSD-SDGCANNING17-6|YES",  # Canning ghost edge: Pinnacle "over 4.5 Ks" (P(X≥5)) matched to Kalshi "6+" (P(X≥6)) — line mismatch int(4.5)=4 ≠ kalshi_thresh=5
     "KXMLBTOTAL-26MAY202040LADSD-9|YES",             # Suspected floor_strike mismatch: scanner fair=46% but Pinnacle over 8.5 = +151 (~40%) — quarantined pending total-diag log verification
     "KXMLBTB-26JUL012140SFAZ-AZKMARTE4-2|NO",        # Stale Pinnacle line: scanner cached NO=63.9% but live Pinnacle=50.2% (Kalshi 53c → actually -EV). Fake 8.4% edge; kept re-flagging from stale prop cache. Permanently suppressed.
+    "KXMLBTB-26JUL071840ATHDET-ATHMMUNCY3-2|YES",    # Player-name collision: two real players named "Max Muncy" (Athletics infielder, Dodgers 3B/1B) both scanned same day for batter_total_bases. build_all_player_props() keys player_lookup by name only (no team) and overwrites on collision (kalshi_ev_scanner.py _norm_player/line ~2331); target_events sorted by commence_time put the earlier-starting ATH game first, so the later-processed LAD Muncy's Pinnacle/DK line likely won the shared key. Same ATH-matched-to-LAD-data failure mode as the SF@ATH entry above. Compounded by MLB_ABBR missing an "ATH" entry (only has "OAK") — Athletics team-name resolution is broken on the backend post-2025 rebrand, weakening the needed_teams game filter for this team specifically. 9.1% edge, lost. Permanently suppressed pending a team-aware player-matching fix.
 }
 _bets = [_b for _b in _bets if _b.get("id") not in _bad_match_ids]
 _data_fixed = True

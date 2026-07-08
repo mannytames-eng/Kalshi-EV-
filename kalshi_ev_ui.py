@@ -1994,6 +1994,23 @@ def _get_performance(since: Optional[str] = None) -> dict:
     avg_entry_discount = round(sum(_entry_discounts) / len(_entry_discounts), 1) if _entry_discounts else None
     avg_pin_drift      = round(sum(_pin_drifts_agg)  / len(_pin_drifts_agg),  1) if _pin_drifts_agg  else None
 
+    # True alpha = realized, Kalshi-only price movement (entry vs. closing Kalshi
+    # price, side-aware — for NO bets close_side = 100 − closing_yes_pct). This is
+    # the confirmed alpha: did Kalshi's own line move toward us after we bet?
+    # Entry Discount above is only the *predicted* mispricing vs. Pinnacle at the
+    # moment of the bet — it is never confirmed against what actually happened.
+    _true_alpha_vals: list = []
+    for b in all_settled:
+        _cy  = b.get("closing_yes_pct")
+        _kpx = b.get("kalshi_price")
+        if _cy is None or _kpx is None:
+            continue
+        _entry_side = _kpx * 100
+        _close_side = (100 - _cy) if b.get("side") == "NO" else _cy
+        _true_alpha_vals.append(_close_side - _entry_side)
+    avg_true_alpha = round(sum(_true_alpha_vals) / len(_true_alpha_vals), 2) if _true_alpha_vals else None
+    true_alpha_n   = len(_true_alpha_vals)
+
     # Edge bucket breakdown: do higher-edge bets win more?
     _ALPHA_BUCKETS = [("2–4%", 2.0, 4.0), ("4–6%", 4.0, 6.0), ("6–8%", 6.0, 8.0), ("8%+", 8.0, 999.0)]
     alpha_buckets: list = []
@@ -2065,8 +2082,10 @@ def _get_performance(since: Optional[str] = None) -> dict:
         "source_audit":         source_audit,      # win-rate by (mkt_type, clv_source) — warns if <38%
         "corrupted_excluded":   corrupted_count,   # bets excluded from stats (data-quality)
         "clv_by_source":        clv_by_source,     # {pin/pin_entry/kalshi: {count, avg_clv}}
-        "avg_entry_discount":   avg_entry_discount, # avg (pin_at_flag - entry_kalshi) — the actual mispricing captured
-        "avg_pin_drift":        avg_pin_drift,      # avg (closing_pin - pin_at_flag) — true CLV: did Pin agree?
+        "avg_entry_discount":   avg_entry_discount, # avg (pin_at_flag - entry_kalshi) — predicted mispricing at entry, NOT confirmed
+        "avg_pin_drift":        avg_pin_drift,      # avg (closing_pin - pin_at_flag) — did Pin agree after the fact?
+        "avg_true_alpha":       avg_true_alpha,     # avg Kalshi-only close-vs-entry move, side-aware — the confirmed/realized alpha
+        "true_alpha_n":         true_alpha_n,
         "alpha_buckets":        alpha_buckets,      # win rate vs expected by edge bucket
     }
 
@@ -5129,7 +5148,8 @@ function renderPerformance(d) {
       ${pill('Lost', d.lost, 'pnl-neg')}
       ${pill('Open', d.open, 'pnl-neu')}
       ${pill('Win Rate', na(d.win_rate, v => v + '%'), '', 'how often our bets won')}
-      ${pill('Entry Discount', d.avg_entry_discount != null ? `<span class="${d.avg_entry_discount >= 0 ? 'pnl-pos' : 'pnl-neg'}" title="Avg (Pinnacle fair value − Kalshi entry) at time of bet. This is your actual alpha — the mispricing you captured. NOT affected by what happened after.">${d.avg_entry_discount > 0 ? '+' : ''}${d.avg_entry_discount}pp</span>` : '—', '', 'how underpriced our bets were vs the sharp line')}
+      ${pill('True Alpha', d.avg_true_alpha != null ? `<span class="${d.avg_true_alpha >= 0 ? 'pnl-pos' : 'pnl-neg'}" title="Avg Kalshi close vs. entry price (side-aware), n=${d.true_alpha_n}. This is the confirmed alpha — did Kalshi's own line move toward us after we bet? Entry Discount (below) is only the predicted mispricing vs. Pinnacle at bet time, never confirmed.">${d.avg_true_alpha > 0 ? '+' : ''}${d.avg_true_alpha}pp</span>` : '—', '', 'realized Kalshi-only price move, entry to close — the confirmed alpha')}
+      ${pill('Entry Discount', d.avg_entry_discount != null ? `<span class="${d.avg_entry_discount >= 0 ? 'pnl-pos' : 'pnl-neg'}" title="Avg (Pinnacle fair value − Kalshi entry) at time of bet. This is the PREDICTED mispricing vs. the sharp line — not confirmed by what happened after. See True Alpha for the realized number.">${d.avg_entry_discount > 0 ? '+' : ''}${d.avg_entry_discount}pp</span>` : '—', '', 'how underpriced our bets looked vs. the sharp line at entry (predicted, not confirmed)')}
       ${pill('Last Bet', lastBetVal)}
       ${pill('Kelly P&amp;L (% bank)', d.total_kelly_pct != null ? `<span class="${kellyPctClass}">${sign(d.total_kelly_pct)}${d.total_kelly_pct.toFixed(2)}%</span>` : '—', '', 'secondary — noisy at this sample')}
     </div>
@@ -5206,6 +5226,9 @@ function renderPerformance(d) {
 
   // ── Alpha section ────────────────────────────────────────────────────────
   if (d.alpha_buckets && d.alpha_buckets.length) {
+    const trueAlpha = d.avg_true_alpha;
+    const taSign    = trueAlpha != null && trueAlpha > 0 ? '+' : '';
+    const taCls     = trueAlpha != null ? (trueAlpha >= 0 ? 'pnl-pos' : 'pnl-neg') : '';
     const entryDisc = d.avg_entry_discount;
     const edSign    = entryDisc != null && entryDisc > 0 ? '+' : '';
     const edCls     = entryDisc != null ? (entryDisc >= 0 ? 'pnl-pos' : 'pnl-neg') : '';
@@ -5226,11 +5249,12 @@ function renderPerformance(d) {
         <summary style="cursor:pointer;font-size:13px;font-weight:600;color:var(--fg);user-select:none;padding:6px 0;list-style:none;display:flex;align-items:center;gap:8px;">
           <span style="font-size:10px;color:var(--muted);">▶</span> Model Alpha
           <span style="font-size:11px;font-weight:400;color:var(--muted);margin-left:4px;">
-            Entry Discount <span class="${edCls}">${entryDisc != null ? edSign + entryDisc + 'pp' : '—'}</span>
+            True Alpha <span class="${taCls}">${trueAlpha != null ? taSign + trueAlpha + 'pp' : '—'}</span>
           </span>
         </summary>
         <div style="font-size:11px;color:var(--muted);margin:4px 0 8px;line-height:1.5;">
-          <strong style="color:var(--fg);">Entry Discount</strong> = Pinnacle fair value − Kalshi entry price. This is your actual alpha — the mispricing you exploited at the moment of the bet.<br>
+          <strong style="color:var(--fg);">True Alpha</strong> = Kalshi closing price − Kalshi entry price (side-aware), n=${d.true_alpha_n || 0}. Did Kalshi's own line move toward us after we bet? This is the confirmed, realized alpha.<br>
+          <strong style="color:var(--fg);">Entry Discount</strong> = Pinnacle fair value − Kalshi entry price (<span class="${edCls}">${entryDisc != null ? edSign + entryDisc + 'pp' : '—'}</span>). This is only the predicted mispricing at bet time — it assumes Pinnacle was right and is never confirmed by what actually happened.<br>
           <strong style="color:var(--fg);">Delta</strong> = actual win rate minus Kalshi's implied probability. Positive = outperforming market expectations.
         </div>
         <table style="font-size:12px;">

@@ -201,7 +201,14 @@ PAPER_KELLY_CAP      = 0.03     # max 3% of current balance per bet (validation-
 # stat mismatch is most likely to overstate confidence. Cap high-edge TB bets
 # tighter than the general ceiling regardless of how large the reported edge
 # is; low-edge TB (no signal of a gap) is unaffected.
-TB_HIGH_EDGE_THRESHOLD = 7.0     # pp — matches the original prop edge-floor design
+# Gates on raw_edge_pct (pre-haircut), not edge_pct (post-haircut) — the
+# EV_HAIRCUT compresses edge_pct enough that gating on it almost never fires
+# where the signal actually lives. Retroactive check on 51 settled TB bets
+# (2026-07-08): gating on edge_pct >= 7 caught 2 bets; raw_edge_pct >= 7 caught
+# 9, matching the group the original investigation flagged (8L-1W in that
+# group — still just n=9, not confirmation the gap is real, only that this
+# threshold reaches the right bets if it is).
+TB_HIGH_EDGE_THRESHOLD = 7.0     # pp, on raw_edge_pct — matches the original prop edge-floor design
 TB_HIGH_EDGE_CAP       = 0.015  # 1.5% of balance — half the general cap
 # Aggregate daily gate (on TOP of per-bet Kelly sizing — does not change it).
 # Rejects any new bet that would push today's committed Kelly stake above this
@@ -844,7 +851,8 @@ def _compute_paper_balance() -> float:
 
 
 def _paper_kelly_stake(edge_pct: float, kalshi_price: float,
-                       game_time_iso: str | None = None, ticker: str = "") -> float:
+                       game_time_iso: str | None = None, ticker: str = "",
+                       raw_edge_pct: float = 0.0) -> float:
     """Calculate Kelly-sized paper stake against current portfolio balance.
 
     Sizing chain:
@@ -852,8 +860,15 @@ def _paper_kelly_stake(edge_pct: float, kalshi_price: float,
       base        = full_kelly × PAPER_KELLY_FRACTION   ← quarter-Kelly
       calibrated  = base × _time_kelly_mult(game_time)  ← time-to-game discount
       capped       = min(calibrated, cap)               ← 3% hard ceiling
-                                                            (1.5% for high-edge Total Bases)
+                                                            (1.5% for high-raw-edge Total Bases)
       stake        = capped × portfolio_balance
+
+    The high-edge TB cap gates on raw_edge_pct (pre-haircut), not edge_pct
+    (post-haircut) — the EV_HAIRCUT compresses edge_pct enough that gating on
+    it almost never fires where the actual signal lives (see 2026-07-08
+    retroactive check: gating on edge_pct >= 7 caught 2/51 settled bets;
+    raw_edge_pct >= 7 caught 9/51, matching the group the 2026-07-07
+    calibration investigation flagged).
     """
     k = kalshi_price
     e = edge_pct / 100.0
@@ -863,7 +878,7 @@ def _paper_kelly_stake(edge_pct: float, kalshi_price: float,
     full_kelly = e / (1.0 - k)
     time_mult  = _time_kelly_mult(game_time_iso)
     cap = PAPER_KELLY_CAP
-    if ticker.upper().startswith("KXMLBTB") and edge_pct >= TB_HIGH_EDGE_THRESHOLD:
+    if ticker.upper().startswith("KXMLBTB") and raw_edge_pct >= TB_HIGH_EDGE_THRESHOLD:
         cap = TB_HIGH_EDGE_CAP
     frac       = min(full_kelly * PAPER_KELLY_FRACTION * time_mult, cap)
     return round(frac * balance, 2)
@@ -1051,7 +1066,10 @@ def _add_new_bets(edges: list) -> list:
             _gt_dt = _parse_ticker_start_time(e["ticker"])
             _game_time_iso = _gt_dt.isoformat() if _gt_dt else None
             shadow      = _is_shadow(e.get("ticker", "")) or e.get("sanity_shadow", False)
-            paper_stake = 0.0 if shadow else _paper_kelly_stake(e["edge_pct"], e["kalshi"], _game_time_iso, e.get("ticker", ""))
+            paper_stake = 0.0 if shadow else _paper_kelly_stake(
+                e["edge_pct"], e["kalshi"], _game_time_iso, e.get("ticker", ""),
+                round(e.get("raw_edge", 0) * 100, 1),
+            )
 
             # ── Daily aggregate exposure gate (on TOP of per-bet Kelly) ──────
             # Per-bet sizing above is untouched. If funding this bet would push
@@ -1807,7 +1825,7 @@ def _get_performance(since: Optional[str] = None) -> dict:
         mtype      = _infer_mkt_type(b)
         clv_mult   = clv_mults.get(mtype, 1.0)
         cap = KELLY_SINGLE_CAP
-        if b.get("ticker", "").upper().startswith("KXMLBTB") and b.get("edge_pct", 0) >= TB_HIGH_EDGE_THRESHOLD:
+        if b.get("ticker", "").upper().startswith("KXMLBTB") and b.get("raw_edge_pct", 0) >= TB_HIGH_EDGE_THRESHOLD:
             cap = TB_HIGH_EDGE_CAP
         return min(full_kelly * KELLY_FRACTION * time_mult * clv_mult, cap)
 

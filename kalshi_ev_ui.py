@@ -1290,8 +1290,11 @@ def _lookup_box_stat(bet: dict):
         if not game_pks:
             return None
 
-        # 2-3. Search the matched game(s) (handles doubleheaders) for the player
-        player_last = matchup.split()[-1].lower()
+        # 2-3. Search the matched game(s) (handles doubleheaders) for the player.
+        # Some Kalshi market titles append a team suffix in parens to disambiguate
+        # same-name players (e.g. "Max Muncy (LAD)" vs "Max Muncy (ATH)") — strip
+        # it before taking the last token, or player_last becomes "(lad)".
+        player_last = re.sub(r"\s*\([^)]*\)\s*$", "", matchup).split()[-1].lower()
         for game_pk in game_pks:
             box_url = f"https://statsapi.mlb.com/api/v1/game/{game_pk}/boxscore"
             with _ur.urlopen(box_url, timeout=5) as r:

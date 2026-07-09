@@ -195,6 +195,14 @@ PAPER_START_BALANCE  = 1000.0    # starting virtual bankroll
 PAPER_START_DATE     = "2026-06-08"  # V2.0 reset — pre-throttle + Jun 7 bad-pipeline bets archived
 PAPER_KELLY_FRACTION = 0.25     # quarter-Kelly base fraction
 PAPER_KELLY_CAP      = 0.03     # max 3% of current balance per bet (validation-phase cap)
+# Total Bases: the 2026-07-07 investigation found the model's win-rate gap vs.
+# expectation concentrates in HIGH raw-edge bets (n=23, gap=-24.3pp, p=0.018) —
+# a big "edge" on a TB longshot line is exactly where the Poisson-on-compound-
+# stat mismatch is most likely to overstate confidence. Cap high-edge TB bets
+# tighter than the general ceiling regardless of how large the reported edge
+# is; low-edge TB (no signal of a gap) is unaffected.
+TB_HIGH_EDGE_THRESHOLD = 7.0     # pp — matches the original prop edge-floor design
+TB_HIGH_EDGE_CAP       = 0.015  # 1.5% of balance — half the general cap
 # Aggregate daily gate (on TOP of per-bet Kelly sizing — does not change it).
 # Rejects any new bet that would push today's committed Kelly stake above this
 # fraction of the starting bankroll. Resets at midnight Pacific. Guards against
@@ -637,6 +645,16 @@ for _b in _bets:
         _b.pop("correlation_reason", None)
         _data_fixed = True
 
+# Fix: Josh Lowe 2+ TB (Jul 8), still open at deploy time — resize to the new
+# TB_HIGH_EDGE_CAP (1.5%) now that the high-edge TB cap has shipped. Was staked
+# at the general 3% cap ($24.64 off a lower live balance); recomputed here on
+# the flat PAPER_START_BALANCE basis used by the resize convention below.
+_jlowe_id = "KXMLBTB-26JUL082005LAATEX-LAAJLOWE3-2|YES"
+for _b in _bets:
+    if _b.get("id") == _jlowe_id and _b.get("status") == "open" and _b.get("paper_stake", 0) != 15.0:
+        _b["paper_stake"] = 15.0
+        _data_fixed = True
+
 # Fix: Retroactively mark all KXMLBHR bets logged before shadow mode was added
 # (2026-06-17) as shadow and zero their stakes/pnl so they don't drag Kelly P&L.
 for _b in _bets:
@@ -826,14 +844,15 @@ def _compute_paper_balance() -> float:
 
 
 def _paper_kelly_stake(edge_pct: float, kalshi_price: float,
-                       game_time_iso: str | None = None) -> float:
+                       game_time_iso: str | None = None, ticker: str = "") -> float:
     """Calculate Kelly-sized paper stake against current portfolio balance.
 
     Sizing chain:
       full_kelly  = edge / (1 − kalshi_price)          ← raw Kelly fraction
       base        = full_kelly × PAPER_KELLY_FRACTION   ← quarter-Kelly
       calibrated  = base × _time_kelly_mult(game_time)  ← time-to-game discount
-      capped       = min(calibrated, PAPER_KELLY_CAP)   ← 3% hard ceiling
+      capped       = min(calibrated, cap)               ← 3% hard ceiling
+                                                            (1.5% for high-edge Total Bases)
       stake        = capped × portfolio_balance
     """
     k = kalshi_price
@@ -843,7 +862,10 @@ def _paper_kelly_stake(edge_pct: float, kalshi_price: float,
     balance    = _compute_paper_balance()
     full_kelly = e / (1.0 - k)
     time_mult  = _time_kelly_mult(game_time_iso)
-    frac       = min(full_kelly * PAPER_KELLY_FRACTION * time_mult, PAPER_KELLY_CAP)
+    cap = PAPER_KELLY_CAP
+    if ticker.upper().startswith("KXMLBTB") and edge_pct >= TB_HIGH_EDGE_THRESHOLD:
+        cap = TB_HIGH_EDGE_CAP
+    frac       = min(full_kelly * PAPER_KELLY_FRACTION * time_mult, cap)
     return round(frac * balance, 2)
 
 
@@ -1029,7 +1051,7 @@ def _add_new_bets(edges: list) -> list:
             _gt_dt = _parse_ticker_start_time(e["ticker"])
             _game_time_iso = _gt_dt.isoformat() if _gt_dt else None
             shadow      = _is_shadow(e.get("ticker", "")) or e.get("sanity_shadow", False)
-            paper_stake = 0.0 if shadow else _paper_kelly_stake(e["edge_pct"], e["kalshi"], _game_time_iso)
+            paper_stake = 0.0 if shadow else _paper_kelly_stake(e["edge_pct"], e["kalshi"], _game_time_iso, e.get("ticker", ""))
 
             # ── Daily aggregate exposure gate (on TOP of per-bet Kelly) ──────
             # Per-bet sizing above is untouched. If funding this bet would push
@@ -1784,7 +1806,10 @@ def _get_performance(since: Optional[str] = None) -> dict:
                 time_mult  = _time_kelly_mult(b.get("game_time"))
         mtype      = _infer_mkt_type(b)
         clv_mult   = clv_mults.get(mtype, 1.0)
-        return min(full_kelly * KELLY_FRACTION * time_mult * clv_mult, KELLY_SINGLE_CAP)
+        cap = KELLY_SINGLE_CAP
+        if b.get("ticker", "").upper().startswith("KXMLBTB") and b.get("edge_pct", 0) >= TB_HIGH_EDGE_THRESHOLD:
+            cap = TB_HIGH_EDGE_CAP
+        return min(full_kelly * KELLY_FRACTION * time_mult * clv_mult, cap)
 
     def _kelly_pnl(b: dict) -> Optional[float]:
         """P&L as fraction-of-bankroll under CLV-adjusted quarter-Kelly sizing."""

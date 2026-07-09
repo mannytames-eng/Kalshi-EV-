@@ -5705,7 +5705,7 @@ async function fetchPaper() {
       <!-- 5. Record -->
       <div style="background:var(--surface);padding:14px 16px;text-align:center;">
         <div style="font-size:22px;font-weight:700;color:var(--green);">${d.won}W <span style="color:var(--red);">${d.lost}L</span></div>
-        <div style="font-size:11px;color:var(--muted);margin-top:1px;">${d.open} open · ${winRate != null ? winRate + '%' : '—'} win rate</div>
+        <div style="font-size:11px;color:var(--muted);margin-top:1px;">${d.open} open · ${d.win_rate != null ? d.win_rate + '%' : '—'} win rate</div>
         <div style="font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:0.06em;margin-top:2px;">Record</div>
       </div>
     </div>

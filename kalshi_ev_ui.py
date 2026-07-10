@@ -251,18 +251,24 @@ PAPER_KELLY_CAP      = 0.03     # max 3% of current balance per bet (validation-
 # Total Bases: the 2026-07-07 investigation found the model's win-rate gap vs.
 # expectation concentrates in HIGH raw-edge bets (n=23, gap=-24.3pp, p=0.018) —
 # a big "edge" on a TB longshot line is exactly where the Poisson-on-compound-
-# stat mismatch is most likely to overstate confidence. Cap high-edge TB bets
-# tighter than the general ceiling regardless of how large the reported edge
-# is; low-edge TB (no signal of a gap) is unaffected.
-# Gates on raw_edge_pct (pre-haircut), not edge_pct (post-haircut) — the
-# EV_HAIRCUT compresses edge_pct enough that gating on it almost never fires
-# where the signal actually lives. Retroactive check on 51 settled TB bets
-# (2026-07-08): gating on edge_pct >= 7 caught 2 bets; raw_edge_pct >= 7 caught
-# 9, matching the group the original investigation flagged (8L-1W in that
-# group — still just n=9, not confirmation the gap is real, only that this
-# threshold reaches the right bets if it is).
+# stat mismatch is most likely to overstate confidence. Gates on raw_edge_pct
+# (pre-haircut), not edge_pct (post-haircut) — the EV_HAIRCUT compresses
+# edge_pct enough that gating on it almost never fires where the signal
+# actually lives. Retroactive check on 51 settled TB bets (2026-07-08): gating
+# on edge_pct >= 7 caught 2 bets; raw_edge_pct >= 7 caught 9, matching the
+# group the original investigation flagged.
+#
+# 2026-07-08: started as a tighter stake cap (1.5% vs the general 3%) rather
+# than touching the probability estimate — flagged then as not resolving the
+# underlying question, just limiting the damage.
+# 2026-07-10: escalated to a full shadow ($0 stake, still tracked) for this
+# raw_edge_pct >= 7.0 slice specifically. A Kelly-vs-flat-betting counterfactual
+# on the full book showed this exact subgroup (n=9 now) at an 11.1% win rate
+# with Kelly staking MORE on its losses than its wins — the stake cap wasn't
+# enough, the edge-weighting itself was compounding the problem. Low-edge TB
+# (<7%) is unaffected: its win rate (41.3% vs 44.0% implied) isn't
+# significantly miscalibrated, so it keeps normal quarter-Kelly sizing.
 TB_HIGH_EDGE_THRESHOLD = 7.0     # pp, on raw_edge_pct — matches the original prop edge-floor design
-TB_HIGH_EDGE_CAP       = 0.015  # 1.5% of balance — half the general cap
 # Aggregate daily gate (on TOP of per-bet Kelly sizing — does not change it).
 # Rejects any new bet that would push today's committed Kelly stake above this
 # fraction of the starting bankroll. Resets at midnight Pacific. Guards against
@@ -914,24 +920,19 @@ def _compute_paper_balance() -> float:
 
 
 def _paper_kelly_stake(edge_pct: float, kalshi_price: float,
-                       game_time_iso: str | None = None, ticker: str = "",
-                       raw_edge_pct: float = 0.0) -> float:
+                       game_time_iso: str | None = None) -> float:
     """Calculate Kelly-sized paper stake against current portfolio balance.
 
     Sizing chain:
       full_kelly  = edge / (1 − kalshi_price)          ← raw Kelly fraction
       base        = full_kelly × PAPER_KELLY_FRACTION   ← quarter-Kelly
       calibrated  = base × _time_kelly_mult(game_time)  ← time-to-game discount
-      capped       = min(calibrated, cap)               ← 3% hard ceiling
-                                                            (1.5% for high-raw-edge Total Bases)
-      stake        = capped × portfolio_balance
+      capped      = min(calibrated, PAPER_KELLY_CAP)    ← 3% hard ceiling
+      stake       = capped × portfolio_balance
 
-    The high-edge TB cap gates on raw_edge_pct (pre-haircut), not edge_pct
-    (post-haircut) — the EV_HAIRCUT compresses edge_pct enough that gating on
-    it almost never fires where the actual signal lives (see 2026-07-08
-    retroactive check: gating on edge_pct >= 7 caught 2/51 settled bets;
-    raw_edge_pct >= 7 caught 9/51, matching the group the 2026-07-07
-    calibration investigation flagged).
+    High raw-edge Total Bases (>=7%) never reaches this function — it's
+    shadowed to $0 at the call site (see TB_HIGH_EDGE_THRESHOLD), so no
+    special-casing is needed here.
     """
     k = kalshi_price
     e = edge_pct / 100.0
@@ -940,10 +941,7 @@ def _paper_kelly_stake(edge_pct: float, kalshi_price: float,
     balance    = _compute_paper_balance()
     full_kelly = e / (1.0 - k)
     time_mult  = _time_kelly_mult(game_time_iso)
-    cap = PAPER_KELLY_CAP
-    if ticker.upper().startswith("KXMLBTB") and raw_edge_pct >= TB_HIGH_EDGE_THRESHOLD:
-        cap = TB_HIGH_EDGE_CAP
-    frac       = min(full_kelly * PAPER_KELLY_FRACTION * time_mult, cap)
+    frac       = min(full_kelly * PAPER_KELLY_FRACTION * time_mult, PAPER_KELLY_CAP)
     return round(frac * balance, 2)
 
 
@@ -1128,10 +1126,16 @@ def _add_new_bets(edges: list) -> list:
             # Resolve game_time for the time-adaptive Kelly multiplier
             _gt_dt = _parse_ticker_start_time(e["ticker"])
             _game_time_iso = _gt_dt.isoformat() if _gt_dt else None
-            shadow      = _is_shadow(e.get("ticker", "")) or e.get("sanity_shadow", False)
+            # High raw-edge Total Bases (>=7%) — shadowed 2026-07-10, see
+            # TB_HIGH_EDGE_THRESHOLD comment. Excluded from win rate/CLV/record
+            # like any other shadow bet, not just zero-staked.
+            _tb_high_edge = (
+                e.get("ticker", "").upper().startswith("KXMLBTB")
+                and round(e.get("raw_edge", 0) * 100, 1) >= TB_HIGH_EDGE_THRESHOLD
+            )
+            shadow      = _is_shadow(e.get("ticker", "")) or e.get("sanity_shadow", False) or _tb_high_edge
             paper_stake = 0.0 if shadow else _paper_kelly_stake(
-                e["edge_pct"], e["kalshi"], _game_time_iso, e.get("ticker", ""),
-                round(e.get("raw_edge", 0) * 100, 1),
+                e["edge_pct"], e["kalshi"], _game_time_iso,
             )
 
             # ── Daily aggregate exposure gate (on TOP of per-bet Kelly) ──────
@@ -1890,10 +1894,11 @@ def _get_performance(since: Optional[str] = None) -> dict:
                 time_mult  = _time_kelly_mult(b.get("game_time"))
         mtype      = _infer_mkt_type(b)
         clv_mult   = clv_mults.get(mtype, 1.0)
-        cap = KELLY_SINGLE_CAP
+        # High raw-edge TB is shadowed under current policy — mirror that here
+        # so this "what would current policy stake" column matches reality.
         if b.get("ticker", "").upper().startswith("KXMLBTB") and b.get("raw_edge_pct", 0) >= TB_HIGH_EDGE_THRESHOLD:
-            cap = TB_HIGH_EDGE_CAP
-        return min(full_kelly * KELLY_FRACTION * time_mult * clv_mult, cap)
+            return 0.0
+        return min(full_kelly * KELLY_FRACTION * time_mult * clv_mult, KELLY_SINGLE_CAP)
 
     def _kelly_pnl(b: dict) -> Optional[float]:
         """P&L as fraction-of-bankroll under CLV-adjusted quarter-Kelly sizing."""

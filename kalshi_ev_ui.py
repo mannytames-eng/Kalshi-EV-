@@ -46,13 +46,15 @@ sys.path.insert(0, BASE_DIR)
 from kalshi_ev_scanner import (
     scan_sport,
     scan_player_props,
+    scan_wnba_player_props,
     kalshi_get,
     fetch_game_scores,
     fetch_odds_index,
     validate_bet,
     MLB_SPREAD_STD, MLB_TOTAL_STD,
     NBA_SPREAD_STD, NBA_TOTAL_STD,
-    MLB_ABBR, NBA_ABBR,
+    WNBA_SPREAD_STD, WNBA_TOTAL_STD,
+    MLB_ABBR, NBA_ABBR, WNBA_ABBR,
     EDGE_THRESHOLD,
     _parse_ticker_start_time,
     _parse_ticker_date,
@@ -191,6 +193,42 @@ def _props_refresh_interval() -> int:
     if 13 <= h < 22:
         return 15 * 60       # Peak Trading: 15min (was 8min — see docstring)
     return 10 ** 9           # Sleep: OFF
+
+# ── WNBA scheduling (added 2026-07-10) ───────────────────────────────────────
+# WNBA runs a single evening window, not MLB's four-window day — the slate is
+# small (6 games on a typical day, verified against live Kalshi/Odds API data)
+# and concentrated in prime time. Observed tip-offs today: ~16:40-19:10 PDT;
+# 15:00-22:00 PDT gives buffer on both ends.
+#
+# Sized to fit inside the ~13,700/month headroom freed by the Peak Trading
+# slowdown (see _odds_refresh_interval() docstring), since WNBA has zero
+# track record and shouldn't risk pushing the whole scanner over its 100k/mo
+# Odds API budget. A first pass at 5min odds / 30min props left only a 1.1%
+# total-budget margin (98,880/100,000) against the combined MLB+WNBA total —
+# too thin given real day-to-day variance in game counts, so widened to
+# 6min/40min for a real buffer (~2,000-4,000/month depending on slate size):
+#   Odds  (2 credits/call,  6min): 7h × 10/hr × 2                =   140/day
+#   Props (3 credits/market × ~6 games, 40min): 7h × 1.5/hr × 18  =   157/day
+#   Total: ~297/day -> ~8,900/month (up to ~11,760/month on an 8-game slate)
+WNBA_WINDOW_START_H = 15   # 3pm PDT
+WNBA_WINDOW_END_H   = 22   # 10pm PDT
+
+def _wnba_odds_refresh_interval() -> int:
+    """Seconds until next WNBA Pinnacle odds refresh. Single evening window;
+    returns a very large number (effectively off) outside it."""
+    h = _pdt_hour()
+    if WNBA_WINDOW_START_H <= h < WNBA_WINDOW_END_H:
+        return 6 * 60
+    return 10 ** 9
+
+def _wnba_props_refresh_interval() -> int:
+    """Seconds between WNBA props scans. Same evening window as odds, slower
+    cadence since props cost 1.5x more per event than the 2-market MLB cost."""
+    h = _pdt_hour()
+    if WNBA_WINDOW_START_H <= h < WNBA_WINDOW_END_H:
+        return 40 * 60
+    return 10 ** 9
+
 REFRESH_SECONDS       = 30         # re-scan Kalshi every 30 sec   (0 credits)
 # Monthly credit math (20k budget):
 #   Odds refresh : 2 × 144/day × 30 =  8,640
@@ -303,9 +341,17 @@ print(f"  Loaded {len(_edge_price_history)} Pinnacle price entries from disk")
 _odds_cache_lock  = threading.Lock()
 _cached_mlb_index: Optional[dict] = None
 _cached_nba_index: Optional[dict] = None
+_cached_wnba_index: Optional[dict] = None
 _last_odds_refresh: float        = 0.0   # epoch seconds of last ATTEMPT (success or fail)
 _last_odds_cache_success: float  = 0.0   # epoch seconds of last SUCCESSFUL index population
 _odds_game_count: int            = 0     # number of Pinnacle matchups in the cached index
+
+# WNBA runs its own separate cache/scheduling — single evening window, not
+# MLB's four-window day. Added 2026-07-10.
+_last_wnba_odds_refresh: float   = 0.0
+_last_wnba_cache_success: float  = 0.0
+_wnba_game_count: int            = 0
+_last_wnba_props_scan: float     = 0.0
 
 # ── validate_bet result cache (saves 1 credit per click) ─────────────────────
 # validate_bet() calls fetch_book_odds() — 1 Odds API credit per call.
@@ -1203,12 +1249,12 @@ def _build_score_index() -> dict:
     """
     Fetch completed game scores (free, 0 credits) and return a lookup:
       norm(away + " @ " + home) → {home_score, away_score, total, margin}
-    Covers MLB and NBA.
+    Covers MLB, NBA, and WNBA.
     """
     import re
     def _n(s): return re.sub(r"[^a-z0-9]", "", s.lower())
     index = {}
-    for sport in ("baseball_mlb", "basketball_nba"):
+    for sport in ("baseball_mlb", "basketball_nba", "basketball_wnba"):
         try:
             games = fetch_game_scores(sport, days_from=3)
         except Exception:
@@ -1765,7 +1811,7 @@ def _get_performance(since: Optional[str] = None) -> dict:
 
     # Game lines only — exclude all props (MLB + NBA) from top-level pills.
     def _is_prop(b: dict) -> bool:
-        return _infer_mkt_type(b) in ("prop", "nba_prop")
+        return _infer_mkt_type(b) in ("prop", "nba_prop", "wnba_prop")
 
     # correlated=True bets are logged for the paper record but excluded from
     # win-rate and Kelly P&L stats — they share the same game outcome as their
@@ -2003,12 +2049,16 @@ def _get_performance(since: Optional[str] = None) -> dict:
         mtype  = _infer_mkt_type(b)
         if mtype == "nba_prop":
             return "NBA Props"
+        if mtype == "wnba_prop":
+            return "WNBA Props"
         if mtype == "prop":
             for prefix, label in _PROP_SERIES_LABELS.items():
                 if ticker.startswith(prefix):
                     return label
             return "MLB Props"
-        if ticker.startswith("KXNBA"):
+        if ticker.startswith("KXWNBA"):
+            sport = "WNBA"
+        elif ticker.startswith("KXNBA"):
             sport = "NBA"
         else:
             sport = "MLB"
@@ -2606,8 +2656,8 @@ def _alert_top10(newly_logged: list = None):
                 try:
                     from datetime import timedelta as _tda
                     exp_dt = datetime.fromisoformat(exp_str.replace("Z", "+00:00"))
-                    is_nba = ticker.upper().startswith("KXNBA")
-                    game_start = exp_dt - _tda(hours=4.0 if is_nba else 3.5)
+                    is_bball = "NBA" in ticker.upper()   # matches KXNBA* and KXWNBA*
+                    game_start = exp_dt - _tda(hours=4.0 if is_bball else 3.5)
                 except (ValueError, AttributeError):
                     pass
         if game_start and game_start < now_utc:
@@ -2877,9 +2927,9 @@ def _send_odds_stale_alert(minutes: float) -> None:
 
 def _run_odds_refresh():
     """
-    Fetch fresh Pinnacle odds (MLB only — NBA faded) and update the cached index.
-    MLB: spreads + totals + alternate_spreads + alternate_totals = 4 credits/call.
-    1-min peak / 10-min off-peak.  ~3,132 credits/day on 100k plan.
+    Fetch fresh Pinnacle odds (MLB — NBA faded, WNBA runs its own loop) and
+    update the cached index. MLB: spreads + totals = 2 credits/call (verified
+    against the live Odds API 2026-07-10 — no alternate lines requested).
     """
     global _cached_mlb_index, _cached_nba_index, _last_odds_refresh, \
            _last_odds_cache_success, _odds_game_count
@@ -2931,6 +2981,54 @@ def _background_odds_loop():
             print(f"  Odds refresh loop error: {exc}")
 
 
+def _run_wnba_odds_refresh():
+    """Fetch fresh Pinnacle WNBA odds and update the cached index. Separate
+    from _run_odds_refresh() because WNBA runs its own single-window schedule
+    (see _wnba_odds_refresh_interval()), not MLB's four-window day."""
+    global _cached_wnba_index, _last_wnba_odds_refresh, _last_wnba_cache_success, _wnba_game_count
+    print(f"\n  ── WNBA odds index refresh  {datetime.now().strftime('%H:%M:%S')} ──")
+    try:
+        wnba_idx, _ = fetch_odds_index(
+            "basketball_wnba", total_range=(130.0, 190.0), spread_limit=25.0
+        )
+        if wnba_idx is not None:
+            n_games = len(wnba_idx) // max(1, 2)
+            with _odds_cache_lock:
+                _cached_wnba_index        = wnba_idx
+                _last_wnba_cache_success  = time.time()
+                _wnba_game_count          = n_games
+            print(f"  WNBA index cached: {n_games} matchups")
+        else:
+            print("  WARNING: WNBA fetch_odds_index returned None — cache not updated")
+    except Exception as exc:
+        print(f"  ERROR refreshing WNBA odds index: {exc}")
+        if "401" in str(exc):
+            with _odds_cache_lock:
+                _cached_wnba_index = None
+            print("  WNBA odds cache cleared — will not scan until credits restore")
+    with _odds_cache_lock:
+        _last_wnba_odds_refresh = time.time()
+
+
+def _background_wnba_odds_loop():
+    """WNBA odds cache refresh — sleeps hard outside the evening window since
+    _wnba_odds_refresh_interval() returns 10**9 seconds when off."""
+    if os.environ.get("RAILWAY_ENVIRONMENT"):
+        time.sleep(10)
+    while True:
+        interval = _wnba_odds_refresh_interval()
+        if interval >= 10 ** 9:
+            # Outside the window — sleep in 30-min chunks so a mid-sleep
+            # restart (watchdog) doesn't leave us waiting a full "forever".
+            time.sleep(30 * 60)
+            continue
+        try:
+            _run_wnba_odds_refresh()
+        except Exception as exc:
+            print(f"  WNBA odds refresh loop error: {exc}")
+        time.sleep(interval)
+
+
 def _run_scan():
     """
     Main scan cycle.
@@ -2960,8 +3058,9 @@ def _run_scan():
         # 2 minutes — ~720 credits/day — with zero detection benefit over waiting
         # for the scheduled refresh (which runs within seconds of startup).
         with _odds_cache_lock:
-            mlb_idx = _cached_mlb_index
-            nba_idx = _cached_nba_index
+            mlb_idx  = _cached_mlb_index
+            nba_idx  = _cached_nba_index
+            wnba_idx = _cached_wnba_index
 
         if mlb_idx is None:
             print("  Odds cache cold — skipping scan cycle (background refresh in progress)")
@@ -2999,7 +3098,40 @@ def _run_scan():
         else:
             mlb_props, _fresh_prop_snap = [], {}
 
-        all_edges = sorted(mlb + nba + mlb_props, key=lambda x: x["edge"], reverse=True)
+        # WNBA — single evening window, own cache/cadence (added 2026-07-10).
+        # Cold cache (outside the window, or before first successful fetch)
+        # just means no WNBA edges this cycle — doesn't block MLB scanning.
+        if wnba_idx is not None:
+            try:
+                wnba, wnba_stats, _wnba_snapshot = scan_sport(
+                    label="WNBA — Spread & Totals",
+                    spread_series="KXWNBASPREAD",
+                    total_series="KXWNBATOTAL",
+                    ml_series=None,
+                    odds_sport="basketball_wnba",
+                    abbr_map=WNBA_ABBR,
+                    spread_std=WNBA_SPREAD_STD,
+                    total_std=WNBA_TOTAL_STD,
+                    game_index=wnba_idx,
+                )
+            except Exception as _wnba_exc:
+                print(f"  WNBA scan error: {_wnba_exc}")
+                wnba, wnba_stats = [], {}
+        else:
+            wnba, wnba_stats = [], {}
+
+        global _last_wnba_props_scan
+        if now_ts - _last_wnba_props_scan >= _wnba_props_refresh_interval():
+            try:
+                wnba_props, _fresh_wnba_prop_snap = scan_wnba_player_props()
+            except Exception as _wnba_prop_exc:
+                print(f"  WNBA props scan error: {_wnba_prop_exc}")
+                wnba_props, _fresh_wnba_prop_snap = [], {}
+            _last_wnba_props_scan = now_ts
+        else:
+            wnba_props, _fresh_wnba_prop_snap = [], {}
+
+        all_edges = sorted(mlb + nba + mlb_props + wnba + wnba_props, key=lambda x: x["edge"], reverse=True)
 
         # Deduplicate: keep only best edge per (matchup, mkt_type, side)
         edges = _best_edge_per_game(all_edges)
@@ -3358,6 +3490,16 @@ def _lookup_pin_prob_for_bet(bet: dict, game_idx: dict) -> Optional[float]:
     return None   # spread/moneyline pre-close not yet implemented
 
 
+def _sport_for_ticker(ticker: str) -> str:
+    """Map a Kalshi ticker prefix to its Odds API sport key."""
+    t = ticker.upper()
+    if t.startswith("KXWNBA"):
+        return "basketball_wnba"
+    if t.startswith("KXNBA"):
+        return "basketball_nba"
+    return "baseball_mlb"
+
+
 def _maybe_fetch_pre_close_pinnacle():
     """
     If any open bet is within PRE_CLOSE_WINDOW_MINUTES of gametime and hasn't had
@@ -3367,7 +3509,7 @@ def _maybe_fetch_pre_close_pinnacle():
     Costs 1 Odds API credit per sport needed (max 2). Thread-safe — skips if the
     regular odds loop is already fetching (data will be fresh enough).
     """
-    global _pre_close_early_done, _pre_close_final_done, _cached_mlb_index, _cached_nba_index
+    global _pre_close_early_done, _pre_close_final_done, _cached_mlb_index, _cached_nba_index, _cached_wnba_index
 
     now_utc = datetime.now(timezone.utc)
     with _bets_lock:
@@ -3414,7 +3556,7 @@ def _maybe_fetch_pre_close_pinnacle():
                 continue
 
         ticker = bet.get("ticker", "").upper()
-        sport  = "basketball_nba" if ticker.startswith("KXNBA") else "baseball_mlb"
+        sport  = _sport_for_ticker(ticker)
         sports_needed.add(sport)
         bets_to_refresh.append(bet)
 
@@ -3426,19 +3568,31 @@ def _maybe_fetch_pre_close_pinnacle():
         print("  Pre-close: odds lock held, skipping (regular refresh in progress)")
         return
 
+    # Odds API params per sport for the pre-close fetch (mirrors the regular
+    # per-sport refresh loops' filter ranges).
+    _PRE_CLOSE_FETCH_PARAMS = {
+        "baseball_mlb":    dict(total_range=(5.0, 14.0),    spread_limit=3.0),
+        "basketball_wnba": dict(total_range=(130.0, 190.0), spread_limit=25.0),
+        # basketball_nba intentionally excluded — NBA faded permanently for
+        # credit conservation (2026-05-26); no pre-close fetch for it.
+    }
+
     try:
-        # Fetch fresh Pinnacle data — MLB only (NBA removed for credit conservation)
         fresh_indices: dict = {}
         for sport in sports_needed:
-            if sport != "baseball_mlb":
-                continue   # NBA removed
+            params = _PRE_CLOSE_FETCH_PARAMS.get(sport)
+            if params is None:
+                continue   # NBA removed, or unrecognized sport
             try:
                 print(f"  Pre-close Pinnacle fetch: {sport} (closing line capture)")
-                idx, _ = fetch_odds_index("baseball_mlb", total_range=(5.0, 14.0), spread_limit=3.0)
+                idx, _ = fetch_odds_index(sport, **params)
                 if idx is not None:
                     fresh_indices[sport] = idx
                     with _odds_cache_lock:
-                        _cached_mlb_index = idx
+                        if sport == "baseball_mlb":
+                            _cached_mlb_index = idx
+                        elif sport == "basketball_wnba":
+                            _cached_wnba_index = idx
             except Exception as exc:
                 print(f"  Pre-close fetch error ({sport}): {exc}")
                 # On credit exhaustion, fall through — use last_pin_pct from history
@@ -3447,7 +3601,7 @@ def _maybe_fetch_pre_close_pinnacle():
         bets_updated = 0
         for bet in bets_to_refresh:
             ticker  = bet.get("ticker", "").upper()
-            sport   = "basketball_nba" if ticker.startswith("KXNBA") else "baseball_mlb"
+            sport   = _sport_for_ticker(ticker)
             game_idx = fresh_indices.get(sport)
 
             pin_prob = _lookup_pin_prob_for_bet(bet, game_idx) if game_idx else None
@@ -3578,8 +3732,8 @@ def _capture_clv_prices():
                     try:
                         from datetime import timedelta as _tdc
                         close_dt = datetime.fromisoformat(close_str.replace("Z", "+00:00"))
-                        is_nba   = bet["ticker"].upper().startswith("KXNBA")
-                        game_start = close_dt - _tdc(hours=4.0 if is_nba else 3.5)
+                        is_bball   = "NBA" in bet["ticker"].upper()   # matches KXNBA* and KXWNBA*
+                        game_start = close_dt - _tdc(hours=4.0 if is_bball else 3.5)
                     except (ValueError, AttributeError):
                         pass
             if game_start and datetime.now(timezone.utc) >= game_start:
@@ -4489,7 +4643,8 @@ function renderTable(edges) {
 function sportOf(e) {
   // Infer sport from matchup teams or ticker prefix
   const t = (e.ticker || '').toUpperCase();
-  if (t.startsWith('KXNBA') || t.startsWith('KXNBA')) return 'nba';
+  if (t.startsWith('KXWNBA')) return 'wnba';
+  if (t.startsWith('KXNBA')) return 'nba';
   if (t.startsWith('KXMLB')) return 'mlb';
   return 'mlb';
 }
@@ -4978,7 +5133,7 @@ function renderTop10() {
       : '—';
     const isProp = e.mkt_type === 'prop';
     const _sp = sportOf(e);
-    const sportColors = { mlb: ['#1a2d1a','#3fb950'], nba: ['#1a1f3a','#58a6ff'] };
+    const sportColors = { mlb: ['#1a2d1a','#3fb950'], nba: ['#1a1f3a','#58a6ff'], wnba: ['#3a1a2d','#e35b9c'] };
     const [sBg, sFg] = sportColors[_sp] || sportColors.mlb;
     const sportLabel = _sp.toUpperCase();
     const typeTag = isProp
@@ -5277,8 +5432,8 @@ function renderPerformance(d) {
     </p>`;
 
   // By-type breakdown table
-  const PROP_LABELS = new Set(['Strikeouts (K)', 'Hits', 'Total Bases', 'RBIs', 'MLB Props', 'NBA Props']);
-  const TYPE_ORDER  = ['MLB Total', 'MLB Spread', 'Strikeouts (K)', 'Hits', 'Total Bases', 'RBIs', 'MLB Props', 'NBA Props'];
+  const PROP_LABELS = new Set(['Strikeouts (K)', 'Hits', 'Total Bases', 'RBIs', 'MLB Props', 'NBA Props', 'WNBA Props']);
+  const TYPE_ORDER  = ['MLB Total', 'MLB Spread', 'Strikeouts (K)', 'Hits', 'Total Bases', 'RBIs', 'MLB Props', 'NBA Props', 'WNBA Total', 'WNBA Spread', 'WNBA Props'];
   if (d.by_type && d.by_type.length) {
     const sorted = [...d.by_type].sort((a, b) => {
       const ai = TYPE_ORDER.indexOf(a.label); const bi = TYPE_ORDER.indexOf(b.label);
@@ -6539,6 +6694,7 @@ if __name__ == "__main__":
         specs = [
             ("scan",        _background_loop),
             ("odds",        _background_odds_loop),
+            ("wnba-odds",   _background_wnba_odds_loop),
             ("resolution",  _background_resolution_loop),
             ("my-bets",     _background_my_bets_loop),
             ("clv-capture", _background_clv_capture_loop),

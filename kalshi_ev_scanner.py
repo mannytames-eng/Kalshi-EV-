@@ -106,6 +106,12 @@ NBA_SPREAD_STD = 12.0   # points
 NBA_TOTAL_STD  = 15.0   # points
 MLB_SPREAD_STD =  3.2   # runs (margin)
 MLB_TOTAL_STD  =  4.5   # runs (total)
+# WNBA: rough estimate scaled from NBA by average score ratio (~80/115 team
+# points) — not yet calibrated against settled bets. Revisit once WNBA has
+# enough resolved bets to check against, same caveat as MLB_SPREAD_STD being
+# static (see project memory on known gaps).
+WNBA_SPREAD_STD =  8.5   # points
+WNBA_TOTAL_STD  = 10.5   # points
 
 
 # ── Ticker date parser ───────────────────────────────────────────────────────
@@ -303,6 +309,20 @@ NBA_ABBR: Dict[str, str] = {
     "POR": "Portland Trail Blazers", "SAC": "Sacramento Kings",
     "SAS": "San Antonio Spurs",      "TOR": "Toronto Raptors",
     "UTA": "Utah Jazz",              "WAS": "Washington Wizards",
+}
+
+# Verified 2026-07-10 against live Kalshi tickers (KXWNBASPREAD/KXWNBATOTAL,
+# open + settled events) and live Odds API basketball_wnba event list — all
+# 15 abbreviations below are Kalshi's own team codes, cross-checked one by one.
+WNBA_ABBR: Dict[str, str] = {
+    "ATL":  "Atlanta Dream",         "CHI":  "Chicago Sky",
+    "CONN": "Connecticut Sun",       "DAL":  "Dallas Wings",
+    "GS":   "Golden State Valkyries","IND":  "Indiana Fever",
+    "LV":   "Las Vegas Aces",        "LA":   "Los Angeles Sparks",
+    "MIN":  "Minnesota Lynx",        "NY":   "New York Liberty",
+    "PHX":  "Phoenix Mercury",       "PDX":  "Portland Fire",
+    "SEA":  "Seattle Storm",         "TOR":  "Toronto Tempo",
+    "WSH":  "Washington Mystics",
 }
 
 MLB_ABBR: Dict[str, str] = {
@@ -2155,6 +2175,12 @@ def scan_sport(
 # biggest driver of Odds API credit usage.
 PLAYER_PROP_MARKETS = "pitcher_strikeouts,batter_total_bases"
 NBA_PLAYER_PROP_MARKETS = "player_points,player_assists,player_threes"
+# WNBA: Pinnacle carries points/rebounds/assists but NOT threes (verified
+# 2026-07-10 against the live Odds API — DK/FanDuel have player_threes,
+# Pinnacle doesn't). Pinnacle is the required sole fair-value anchor
+# (BOOK_WEIGHTS), so threes is omitted — a Pinnacle-less market would never
+# produce a valid fair probability anyway.
+WNBA_PLAYER_PROP_MARKETS = "player_points,player_rebounds,player_assists"
 
 MLB_PROP_SERIES: Dict[str, str] = {
     "KXMLBKS":  "pitcher_strikeouts",
@@ -2165,6 +2191,12 @@ NBA_PROP_SERIES: Dict[str, str] = {
     "KXNBAPTS": "player_points",
     "KXNBAAST": "player_assists",
     "KXNBA3PT": "player_threes",
+}
+
+WNBA_PROP_SERIES: Dict[str, str] = {
+    "KXWNBAPTS": "player_points",
+    "KXWNBAREB": "player_rebounds",
+    "KXWNBAAST": "player_assists",
 }
 
 
@@ -2716,6 +2748,21 @@ def scan_nba_player_props() -> List[dict]:
         prop_markets    = NBA_PLAYER_PROP_MARKETS,
         sport_label     = "NBA",
         mkt_type_label  = "nba_prop",
+        parse_event_fn  = _parse_nba_event,
+    )
+
+
+def scan_wnba_player_props() -> List[dict]:
+    """Scan Kalshi WNBA player-prop markets (points, rebounds, assists).
+    WNBA tickers use the same no-time-component format as NBA — reuse
+    _parse_nba_event for team-abbreviation splitting."""
+    return scan_player_props(
+        odds_sport      = "basketball_wnba",
+        abbr_map        = WNBA_ABBR,
+        prop_series     = WNBA_PROP_SERIES,
+        prop_markets    = WNBA_PLAYER_PROP_MARKETS,
+        sport_label     = "WNBA",
+        mkt_type_label  = "wnba_prop",
         parse_event_fn  = _parse_nba_event,
     )
 

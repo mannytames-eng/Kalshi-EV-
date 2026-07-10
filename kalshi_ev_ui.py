@@ -274,8 +274,10 @@ DAILY_EXPOSURE_CAP   = 0.15     # max 15% of bankroll committed per PT day
 # but staked at $0 and excluded from paper balance, Kelly P&L, and summary pills.
 # Move a ticker prefix here to validate a new market before committing real stakes.
 SHADOW_MARKETS: list[str] = [
-    # (empty) — add a ticker prefix here to validate a new market at $0 stake.
     # Home runs were retired 2026-06-24 (longshot de-vig overstated edge).
+    "KXWNBA",   # WNBA added 2026-07-10 — zero track record, shadow until it
+                # earns its own CLV evidence like MLB did. Covers spread/total/
+                # props (KXWNBASPREAD, KXWNBATOTAL, KXWNBAPTS, KXWNBAREB, KXWNBAAST).
 ]
 
 def _is_shadow(ticker: str) -> bool:

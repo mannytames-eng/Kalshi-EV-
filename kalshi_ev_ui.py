@@ -238,7 +238,6 @@ REFRESH_SECONDS       = 30         # re-scan Kalshi every 30 sec   (0 credits)
 #   Total                            = 11,040  (45% under 20k budget)
 HISTORY_FILE    = os.path.join(DATA_DIR, "ev_history.json")
 BETS_FILE       = os.path.join(DATA_DIR, "ev_bets.json")
-MY_BETS_FILE    = os.path.join(DATA_DIR, "my_bets.json")
 PIN_PRICES_FILE = os.path.join(DATA_DIR, "ev_pin_prices.json")
 MAX_HISTORY     = 500       # cap stored scan snapshots
 PERF_BANKROLL        = 1000.0    # bankroll for ROI % display
@@ -2261,175 +2260,6 @@ def _get_performance(since: Optional[str] = None) -> dict:
     }
 
 
-# ── My Bets tracker (actual bets placed by user) ──────────────────────────────
-import re as _re
-
-def _load_my_bets() -> list:
-    try:
-        with open(MY_BETS_FILE, "r") as f:
-            return json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError):
-        return []
-
-def _save_my_bets(bets: list):
-    try:
-        import tempfile, os as _os
-        fd, tmp = tempfile.mkstemp(dir=DATA_DIR, suffix=".tmp")
-        with _os.fdopen(fd, "w") as f:
-            json.dump(bets, f, indent=2)
-        _os.replace(tmp, MY_BETS_FILE)
-    except Exception as exc:
-        print(f"  WARNING: could not save my_bets: {exc}")
-
-_my_bets: list = _load_my_bets()
-_my_bets_lock = threading.Lock()
-
-# Cache for mark-to-market state — refreshed by background thread every 60s
-# so the /api/mybets endpoint never blocks on live Kalshi API calls.
-_my_bets_state_cache: Optional[dict] = None
-_my_bets_state_lock  = threading.Lock()
-
-
-def _refresh_my_bets_state():
-    """Fetch live Kalshi prices for open my_bets and update the cache."""
-    with _my_bets_lock:
-        bets = json.loads(json.dumps(_my_bets))   # deep copy
-
-    for b in bets:
-        b["current_price"] = None
-        b["unrealized_pnl"] = None
-        if b["status"] != "open":
-            continue
-        try:
-            time.sleep(0.15)
-            data = kalshi_get(f"/markets/{b['ticker']}")
-            mkt  = data.get("market", {})
-            bid_c = float(mkt.get("yes_bid") or 0)
-            ask_c = float(mkt.get("yes_ask") or 0)
-            if bid_c > 0 and ask_c > 0:
-                yes_mid = (bid_c + ask_c) / 200.0   # cents → decimal mid
-                cur = yes_mid if b["side"] == "YES" else 1.0 - yes_mid
-                entry = b["entry_price"]
-                contracts = b["contracts"]
-                b["current_price"]   = round(cur * 100, 1)
-                b["unrealized_pnl"]  = round((cur - entry) * contracts, 2)
-        except Exception:
-            pass
-
-    open_b    = [b for b in bets if b["status"] == "open"]
-    settled_b = [b for b in bets if b["status"] in ("won", "lost")]
-    total_in      = sum(b["amount_spent"] for b in bets)
-    realized_pnl  = sum(b["pnl"] for b in settled_b if b["pnl"] is not None)
-    unrealized_pnl= sum(b.get("unrealized_pnl") or 0 for b in open_b)
-
-    state = {
-        "bets":            bets,
-        "total_in":        round(total_in, 2),
-        "realized_pnl":    round(realized_pnl, 2),
-        "unrealized_pnl":  round(unrealized_pnl, 2),
-        "net_pnl":         round(realized_pnl + unrealized_pnl, 2),
-    }
-    with _my_bets_state_lock:
-        global _my_bets_state_cache
-        _my_bets_state_cache = state
-
-
-def _get_my_bets_state() -> dict:
-    """Return cached mark-to-market state (refreshed every 60s in background)."""
-    with _my_bets_state_lock:
-        cached = _my_bets_state_cache
-    if cached is not None:
-        return cached
-    # First call before cache is warm — compute synchronously once
-    _refresh_my_bets_state()
-    with _my_bets_state_lock:
-        return _my_bets_state_cache or {"bets": [], "total_in": 0, "realized_pnl": 0, "unrealized_pnl": 0, "net_pnl": 0}
-
-
-def _background_my_bets_loop():
-    """Refresh mark-to-market prices for open my_bets every 60s."""
-    while True:
-        try:
-            _refresh_my_bets_state()
-        except Exception as exc:
-            print(f"  My bets refresh error: {exc}")
-        time.sleep(60)
-
-
-def _settle_my_bets():
-    """Settle open my_bets via scores then Kalshi API."""
-    with _my_bets_lock:
-        open_bets = [b for b in _my_bets if b["status"] == "open"]
-    if not open_bets:
-        return
-
-    from datetime import timedelta as _td2
-    now_utc = datetime.now(timezone.utc)
-
-    score_index = _build_score_index()
-    resolved = 0
-
-    for bet in open_bets:
-        # Same game-over guard as _check_resolutions — prevent premature settlement
-        game_start = _parse_ticker_start_time(bet.get("ticker", ""))
-        if game_start:
-            if now_utc < game_start + _td2(hours=3.5):
-                continue
-        # Use dated key for score lookup to prevent cross-series contamination
-        import re as _re2
-        game_date = _parse_ticker_date(bet.get("ticker", ""))
-        mkey_base = _re.sub(r"[^a-z0-9]", "", bet["matchup"].replace(" @ ", "@").lower())
-        mkey_dated = mkey_base + "_" + game_date if game_date else None
-        game = (score_index.get(mkey_dated) if mkey_dated else None) or score_index.get(mkey_base)
-        # Reject if date doesn't match
-        if game and mkey_dated and game.get("game_date") and game_date:
-            if game["game_date"] != game_date:
-                game = None
-        settled = False
-
-        if game:
-            m = _re.search(r">(\d+\.?\d*)", bet["title"])
-            if m:
-                threshold = float(m.group(1))
-                over_wins = game["total"] > threshold
-                won = over_wins if bet["side"] == "YES" else not over_wins
-                pnl = round(bet["amount_spent"] * (1 - bet["entry_price"]) / bet["entry_price"], 2) if won else -bet["amount_spent"]
-                with _my_bets_lock:
-                    for b in _my_bets:
-                        if b["id"] == bet["id"]:
-                            b["status"] = "won" if won else "lost"
-                            b["pnl"] = pnl
-                            b["resolved_at"] = datetime.now(timezone.utc).isoformat()
-                            break
-                resolved += 1
-                settled = True
-
-        if not settled:
-            try:
-                time.sleep(0.2)
-                data = kalshi_get(f"/markets/{bet['ticker']}")
-                result = data.get("market", {}).get("result", "")
-                if result:
-                    won = (result == "yes" and bet["side"] == "YES") or \
-                          (result == "no"  and bet["side"] == "NO")
-                    pnl = round(bet["amount_spent"] * (1 - bet["entry_price"]) / bet["entry_price"], 2) if won else -bet["amount_spent"]
-                    with _my_bets_lock:
-                        for b in _my_bets:
-                            if b["id"] == bet["id"]:
-                                b["status"] = "won" if won else "lost"
-                                b["pnl"] = pnl
-                                b["resolved_at"] = datetime.now(timezone.utc).isoformat()
-                                break
-                    resolved += 1
-            except Exception:
-                pass
-
-    if resolved:
-        with _my_bets_lock:
-            _save_my_bets(_my_bets)
-        print(f"  My Bets: settled {resolved}")
-
-
 # ── Twilio SMS alerts ─────────────────────────────────────────────────────────
 _ALERT_MIN    = float(os.getenv("ALERT_MIN_EDGE", "0.020"))  # Discord alerts at ≥2.0% edge (matches EDGE_THRESHOLD)
 _BET_SIZE     = float(os.getenv("ALERT_BET_SIZE", "20"))
@@ -3858,7 +3688,6 @@ def _background_resolution_loop():
     while True:
         try:
             _check_resolutions()
-            _settle_my_bets()
         except Exception as exc:
             print(f"  Resolution loop error: {exc}")
         time.sleep(RESOLUTION_POLL_SECONDS)
@@ -4052,15 +3881,6 @@ HTML = """<!DOCTYPE html>
   .rank-num { color: var(--muted); font-weight: 700; width: 24px; display: inline-block; font-size: 11px; }
   #history-card canvas { display: block; width: 100% !important; height: 160px !important; }
   .chart-empty { padding: 20px; text-align: center; color: var(--muted); font-size: 12px; }
-  .mb-won  { color: #00e676; font-weight: 700; }
-  .mb-lost { color: var(--red); font-weight: 700; }
-  .mb-open { color: var(--muted); }
-  .mb-pnl-pos { color: #00e676; font-weight: 700; }
-  .mb-pnl-neg { color: var(--red); font-weight: 700; }
-  .mb-del { cursor:pointer; color:var(--muted); font-size:13px; padding:0 4px; }
-  .mb-del:hover { color:var(--red); }
-  .mb-track-btn { font-size:10px; background:#21262d; border:1px solid var(--border); border-radius:3px; color:var(--muted); padding:2px 6px; cursor:pointer; margin-left:5px; vertical-align:middle; }
-  .mb-track-btn:hover { color:var(--text); border-color:var(--muted); }
   .badge-stale { display:inline-block; font-size:9px; background:#2d1a1a; color:#f85149; padding:1px 5px; border-radius:3px; margin-left:5px; vertical-align:middle; }
   .badge-drift { font-size:10px; color:var(--muted); margin-left:4px; }
   .badge-unvalidated { display:inline-block; font-size:9px; background:#2d200a; color:#e3a53a; padding:1px 5px; border-radius:3px; margin-left:5px; vertical-align:middle; letter-spacing:0.03em; }
@@ -4220,40 +4040,6 @@ HTML = """<!DOCTYPE html>
 </div>
 
 
-
-
-<div id="mybets-card" class="card">
-  <div class="card-header" style="border-left:3px solid #f0c000;" onclick="toggleCard('mybets-body')">💰 My Bets — Real P&amp;L <span class="card-toggle" id="mybets-body-toggle">▾</span></div>
-  <div id="mybets-body" class="card-body">
-    <div id="mybets-stats" style="padding:8px 10px;border-bottom:1px solid var(--border);display:flex;gap:12px;flex-wrap:wrap;align-items:center;">
-      <span style="color:var(--muted);font-size:11px;">Add a bet you placed on Kalshi to track real P&amp;L.</span>
-    </div>
-    <div style="padding:8px 12px;border-bottom:1px solid var(--border);display:flex;gap:8px;flex-wrap:wrap;align-items:flex-end;">
-      <div style="display:flex;flex-direction:column;gap:3px;">
-        <label style="font-size:10px;color:var(--muted);text-transform:uppercase;">Market ticker</label>
-        <input id="mb-ticker" type="text" placeholder="KXMLBTOTAL-26APR05..." style="background:var(--surface);border:1px solid var(--border);border-radius:5px;color:var(--text);font-size:12px;padding:4px 8px;width:220px;">
-      </div>
-      <div style="display:flex;flex-direction:column;gap:3px;">
-        <label style="font-size:10px;color:var(--muted);text-transform:uppercase;">Side</label>
-        <select id="mb-side" style="background:var(--surface);border:1px solid var(--border);border-radius:5px;color:var(--text);font-size:12px;padding:4px 8px;">
-          <option value="YES">YES</option>
-          <option value="NO">NO</option>
-        </select>
-      </div>
-      <div style="display:flex;flex-direction:column;gap:3px;">
-        <label style="font-size:10px;color:var(--muted);text-transform:uppercase;">Price paid (¢)</label>
-        <input id="mb-price" type="number" min="1" max="99" placeholder="79" style="background:var(--surface);border:1px solid var(--border);border-radius:5px;color:var(--text);font-size:12px;padding:4px 8px;width:80px;">
-      </div>
-      <div style="display:flex;flex-direction:column;gap:3px;">
-        <label style="font-size:10px;color:var(--muted);text-transform:uppercase;">Amount ($)</label>
-        <input id="mb-amount" type="number" min="1" placeholder="25" style="background:var(--surface);border:1px solid var(--border);border-radius:5px;color:var(--text);font-size:12px;padding:4px 8px;width:80px;">
-      </div>
-      <button onclick="addMyBet()" style="background:#21262d;border:1px solid var(--border);border-radius:5px;color:var(--text);font-size:12px;padding:5px 14px;cursor:pointer;height:30px;">+ Track Bet</button>
-    </div>
-    <div id="mybets-table"><div class="empty">No bets tracked yet — add one above.</div></div>
-  </div>
-</div>
-
 <div id="scanner-history-card" class="card" style="border-color:#2a2a2a;background:#0f1117;opacity:0.88;">
   <div class="card-header" onclick="toggleCard('scanner-history-body')" style="border-left:3px solid #3d3d3d;color:#6e7681;">
     📋 Recent Scanner History (Past 24 Hours)
@@ -4335,22 +4121,6 @@ function edgeClass(pct) { return ''; }  // kept for compatibility, color now inl
 
 // Safely escape a string for use inside an HTML attribute value (data-*)
 function hesc(s) { return (s||'').replace(/&/g,'&amp;').replace(/"/g,'&quot;').replace(/</g,'&lt;'); }
-
-// Track button that reads data-attributes — avoids all JS string escaping issues
-function trackBetFromBtn(btn) {
-  trackBet(btn.dataset.ticker, btn.dataset.title, btn.dataset.matchup,
-           btn.dataset.side, btn.dataset.mkttype);
-}
-
-function trackBtn(e) {
-  return '<button class="mb-track-btn" '
-    + 'data-ticker="' + hesc(e.ticker)  + '" '
-    + 'data-title="'  + hesc(e.title)   + '" '
-    + 'data-matchup="'+ hesc(e.matchup) + '" '
-    + 'data-side="'   + hesc(e.side)    + '" '
-    + 'data-mkttype="'+ hesc(e.mkt_type||'') + '" '
-    + 'onclick="trackBetFromBtn(this)">Track</button>';
-}
 
 async function fetchHistory() {
   try {
@@ -4628,7 +4398,7 @@ function renderTable(edges) {
     rows += `
     <tr>
       <td class="matchup-inline">${mlbLogo(e.ticker)}${matchupHtml(e.matchup)}</td>
-      <td class="prop-col">${e.title}${kalshiLineBadge(e)}${newBadge}${staleBadge}${driftTxt}${trackBtn(e)}</td>
+      <td class="prop-col">${e.title}${kalshiLineBadge(e)}${newBadge}${staleBadge}${driftTxt}</td>
       <td class="num pin-line">${pinLineLabel(e)}</td>
       <td class="side-${e.side.toLowerCase()}">${e.side}</td>
       <td class="num">${pct(e.kalshi_pct)}</td>
@@ -5090,7 +4860,7 @@ function renderLiveEdges() {
 
     return `<tr>
       <td>${matchupHtml(e.matchup)}</td>
-      <td class="prop-col">${e.title}${sharpBadge}${ageBadge}${trackBtn(e)}</td>
+      <td class="prop-col">${e.title}${sharpBadge}${ageBadge}</td>
       <td class="side-${e.side.toLowerCase()}">${e.side}</td>
       <td class="num" style="color:${edgeColor(e.edge_pct)};font-weight:700;">+${pct(e.edge_pct)}</td>
       <td class="num">${fairAmерCell}</td>
@@ -5217,7 +4987,7 @@ function renderTop10() {
     return `<tr>
       <td><span class="rank-num">#${i+1}</span></td>
       <td>${matchupHtml(e.matchup)}</td>
-      <td class="prop-col">${typeTag}${e.title}${kalshiLineBadge(e)}${newBadge}${unvalidatedBadge}${consBadge10}${ageBadge}${trackBtn(e)}${tickerBadge}</td>
+      <td class="prop-col">${typeTag}${e.title}${kalshiLineBadge(e)}${newBadge}${unvalidatedBadge}${consBadge10}${ageBadge}${tickerBadge}</td>
       <td class="side-${e.side.toLowerCase()}">${e.side}</td>
       <td class="num" style="color:${edgeColor(e.edge_pct)};font-weight:700;">+${pct(e.edge_pct)}</td>
       <td class="num" title="${tip10}">${cAmerTxt} <span style="font-size:9px;color:var(--muted);">→</span> ${kAmerTxt}</td>
@@ -5744,46 +5514,6 @@ function renderPerformance(d) {
 }
 
 
-// ── My Bets ──────────────────────────────────────────────────────────────────
-function trackBet(ticker, title, matchup, side, mkt_type) {
-  document.getElementById('mb-ticker').value = ticker;
-  document.getElementById('mb-side').value = side;
-  document.getElementById('mb-ticker').dataset.title   = title;
-  document.getElementById('mb-ticker').dataset.matchup = matchup;
-  document.getElementById('mb-ticker').dataset.mkttype = mkt_type;
-  document.getElementById('mb-price').focus();
-  document.getElementById('mybets-body').classList.remove('collapsed');
-  document.getElementById('mybets-body-toggle').textContent = '▾';
-  document.getElementById('mybets-card').scrollIntoView({behavior:'smooth', block:'nearest'});
-}
-
-async function addMyBet() {
-  const ticker    = document.getElementById('mb-ticker').value.trim();
-  const side      = document.getElementById('mb-side').value;
-  const priceCent = parseFloat(document.getElementById('mb-price').value);
-  const amount    = parseFloat(document.getElementById('mb-amount').value);
-  if (!ticker || !priceCent || !amount) { alert('Fill in all fields'); return; }
-  const title   = document.getElementById('mb-ticker').dataset.title   || ticker;
-  const matchup = document.getElementById('mb-ticker').dataset.matchup || '';
-  const mkt_type= document.getElementById('mb-ticker').dataset.mkttype || '';
-  try {
-    await fetch('/api/mybets', {
-      method: 'POST',
-      headers: {'Content-Type':'application/json'},
-      body: JSON.stringify({ ticker, side, title, matchup, mkt_type,
-                             entry_price: priceCent / 100, amount_spent: amount })
-    });
-    document.getElementById('mb-price').value = '';
-    document.getElementById('mb-amount').value = '';
-    fetchMyBets();
-  } catch(e) { console.error(e); }
-}
-
-async function deleteMyBet(id) {
-  await fetch('/api/mybets/' + encodeURIComponent(id), { method: 'DELETE' });
-  fetchMyBets();
-}
-
 // ── Paper Portfolio ───────────────────────────────────────────────────────────
 async function fetchPaper() {
   try {
@@ -5986,65 +5716,6 @@ async function fetchPaper() {
   } catch(e) { console.error('paper fetch failed', e); }
 }
 
-async function fetchMyBets() {
-  try {
-    const r = await fetch('/api/mybets');
-    const d = await r.json();
-    renderMyBets(d);
-  } catch(e) { console.error(e); }
-}
-
-function renderMyBets(d) {
-  // Stats bar
-  const np = d.net_pnl;
-  const npClass = np > 0 ? 'mb-pnl-pos' : np < 0 ? 'mb-pnl-neg' : '';
-  const npSign  = np >= 0 ? '+' : '';
-  _setHTML('mybets-stats', `
-    <div class="stat-pill"><div class="label">Total In</div><div class="value">$${d.total_in.toFixed(2)}</div></div>
-    <div class="stat-pill"><div class="label">Realized P&amp;L</div><div class="value ${d.realized_pnl>=0?'mb-pnl-pos':'mb-pnl-neg'}">${d.realized_pnl>=0?'+':''}$${d.realized_pnl.toFixed(2)}</div></div>
-    <div class="stat-pill"><div class="label">Unrealized P&amp;L</div><div class="value ${d.unrealized_pnl>=0?'mb-pnl-pos':'mb-pnl-neg'}">${d.unrealized_pnl>=0?'+':''}$${d.unrealized_pnl.toFixed(2)}</div></div>
-    <div class="stat-pill"><div class="label">Net P&amp;L</div><div class="value ${npClass}">${npSign}$${np.toFixed(2)}</div></div>`);
-
-  if (!d.bets.length) {
-    _setHTML('mybets-table', '<div class="empty">No bets tracked yet — add one above.</div>');
-    return;
-  }
-  let rows = '';
-  for (const b of d.bets) {
-    const gameStartMs2 = b.game_time ? new Date(b.game_time).getTime() : null;
-    const isLive2 = b.status === 'open' && gameStartMs2 != null && Date.now() >= gameStartMs2;
-    const statusCls = b.status === 'won' ? 'mb-won' : b.status === 'lost' ? 'mb-lost' : 'mb-open';
-    const statusTxt = b.status === 'won' ? '✅ WON' : b.status === 'lost' ? '❌ LOST'
-      : isLive2 ? '<span style="color:#ff4444;font-weight:600;animation:pulse 1.5s infinite;">● LIVE</span>'
-      : '⏳ Open';
-    const pnlTxt = b.pnl != null
-      ? `<span class="${b.pnl>=0?'mb-pnl-pos':'mb-pnl-neg'}">${b.pnl>=0?'+':''}$${b.pnl.toFixed(2)}</span>`
-      : b.unrealized_pnl != null
-        ? `<span class="${b.unrealized_pnl>=0?'mb-pnl-pos':'mb-pnl-neg'}" title="Unrealized">${b.unrealized_pnl>=0?'+':''}$${b.unrealized_pnl.toFixed(2)}*</span>`
-        : '—';
-    const curTxt = b.current_price != null ? `${b.current_price}¢` : '—';
-    rows += `<tr>
-      <td class="prop-col">${b.title || b.ticker}</td>
-      <td class="side-${b.side.toLowerCase()}">${b.side}</td>
-      <td class="num">${Math.round(b.entry_price*100)}¢</td>
-      <td class="num">${b.contracts.toFixed(1)}</td>
-      <td class="num">$${b.amount_spent.toFixed(2)}</td>
-      <td class="num">${curTxt}</td>
-      <td class="${statusCls}">${statusTxt}</td>
-      <td class="num">${pnlTxt}</td>
-      <td><span class="mb-del" data-id="${hesc(b.id)}" onclick="deleteMyBet(this.dataset.id)">✕</span></td>
-    </tr>`;
-  }
-  _setHTML('mybets-table', `<table>
-    <thead><tr>
-      <th>Bet</th><th>Side</th><th class="num">Paid</th><th class="num">Contracts</th>
-      <th class="num">Invested</th><th class="num">Current</th><th>Status</th>
-      <th class="num">P&amp;L</th><th></th>
-    </tr></thead>
-    <tbody>${rows}</tbody>
-  </table>`);
-}
-
 // ── Scanner History (Past 24 Hours) ──────────────────────────────────────────
 async function fetchScannerHistory() {
   try {
@@ -6106,7 +5777,7 @@ function renderScannerHistory(bets) {
 
 // Resume refresh when tab becomes visible again
 document.addEventListener('visibilitychange', () => {
-  if (!document.hidden) { fetchData(); fetchMyBets(); }
+  if (!document.hidden) { fetchData(); }
 });
 
 // Initial load — default performance filter to clean-data start date (2026-04-07)
@@ -6120,11 +5791,9 @@ fetchData();
 fetchHistory();
 fetchPerformance();
 fetchPaper();
-fetchMyBets();
 fetchScannerHistory();
 setInterval(updateCountdown, 1000);
 setInterval(fetchPaper, 60 * 1000);   // refresh paper portfolio every 60s
-setInterval(fetchMyBets, 60 * 1000);   // refresh my bets every 60s (mark-to-market)
 setInterval(fetchScannerHistory, 5 * 60 * 1000);  // refresh history every 5 min
 </script>
 
@@ -6483,59 +6152,15 @@ class Handler(BaseHTTPRequestHandler):
             }
             self._send(200, "application/json", json.dumps(result).encode())
 
-        elif path == "/api/mybets":
-            payload = json.dumps(_get_my_bets_state()).encode()
-            self._send(200, "application/json", payload)
-
         else:
             self._send(404, "text/plain", b"Not found")
 
     def do_POST(self):
-        path = self.path.split("?")[0]
-        length = int(self.headers.get("Content-Length", 0))
-        body = json.loads(self.rfile.read(length)) if length else {}
-
-        if path == "/api/mybets":
-            ticker      = body.get("ticker", "")
-            side        = body.get("side", "YES")
-            entry_price = float(body.get("entry_price", 0.5))
-            amount_spent= float(body.get("amount_spent", 10))
-            contracts   = round(amount_spent / entry_price, 1) if entry_price > 0 else 0
-            bet_id      = f"{ticker}|{side}|{int(time.time())}"
-            new_bet = {
-                "id":           bet_id,
-                "ticker":       ticker,
-                "title":        body.get("title", ticker),
-                "matchup":      body.get("matchup", ""),
-                "side":         side,
-                "mkt_type":     body.get("mkt_type", ""),
-                "entry_price":  entry_price,
-                "amount_spent": amount_spent,
-                "contracts":    contracts,
-                "added_at":     datetime.now(timezone.utc).isoformat(),
-                "status":       "open",
-                "resolved_at":  None,
-                "pnl":          None,
-            }
-            with _my_bets_lock:
-                _my_bets.append(new_bet)
-                _save_my_bets(_my_bets)
-            self._send(200, "application/json", json.dumps({"ok": True}).encode())
-        else:
-            self._send(404, "text/plain", b"Not found")
+        self._send(404, "text/plain", b"Not found")
 
     def do_DELETE(self):
         path = self.path.split("?")[0]
-        if path.startswith("/api/mybets/"):
-            import urllib.parse
-            bet_id = urllib.parse.unquote(path[len("/api/mybets/"):])
-            with _my_bets_lock:
-                before = len(_my_bets)
-                _my_bets[:] = [b for b in _my_bets if b["id"] != bet_id]
-                if len(_my_bets) < before:
-                    _save_my_bets(_my_bets)
-            self._send(200, "application/json", json.dumps({"ok": True}).encode())
-        elif path.startswith("/api/admin/remove_bet/"):
+        if path.startswith("/api/admin/remove_bet/"):
             import urllib.parse
             bet_id = urllib.parse.unquote(path[len("/api/admin/remove_bet/"):])
             with _bets_lock:
@@ -6704,7 +6329,6 @@ if __name__ == "__main__":
             ("odds",        _background_odds_loop),
             ("wnba-odds",   _background_wnba_odds_loop),
             ("resolution",  _background_resolution_loop),
-            ("my-bets",     _background_my_bets_loop),
             ("clv-capture", _background_clv_capture_loop),
             ("wc-watcher",  _background_wc_watcher_loop),
         ]

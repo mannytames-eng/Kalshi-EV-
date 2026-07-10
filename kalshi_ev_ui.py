@@ -115,24 +115,33 @@ def _all_games_commenced() -> bool:
 def _odds_refresh_interval() -> int:
     """Return seconds until next Pinnacle odds refresh (PDT context-aware schedule).
 
-    Credit costs (MLB only — 4 markets per call):
-      MLB odds call: 4 credits (spreads+totals+alternate_spreads+alternate_totals)
+    Credit costs (MLB only — spreads+totals, no alternates):
+      MLB odds call: 2 credits/call (measured against the live Odds API 2026-07-10;
+      prior comment claiming 4 credits was wrong — no alternate lines are requested,
+      see fetch_book_odds() in kalshi_ev_scanner.py).
 
     Operating windows (PDT = UTC-7):
       Early Morning 06:00–09:00 PDT (3h): 90s  — overnight line gaps, Kalshi slow to reprice
       Discovery     09:00–13:00 PDT (4h):  3min — morning line-setting, lower cadence
-      Peak Trading  13:00–22:00 PDT (9h): 75s  — live game hours, fast line capture
+      Peak Trading  13:00–22:00 PDT (9h): 2min — live game hours, line capture
       Sleep         22:00–06:00 PDT (8h): 15min — overnight, minimal market movement
+
+    Peak slowed 75s -> 2min on 2026-07-10: CLV-by-window analysis showed Peak
+    bets carry the HIGHEST true CLV of any window (1.39pp, t=2.84, n=44) so the
+    window itself isn't low-value — but bet density was only 5.4 bets/window-hr
+    vs Discovery's 14.0 despite Peak's odds cadence running 2.4x faster than
+    Discovery's. That gap is redundant scanning, not edge capture; matching
+    Discovery's cadence removes the redundancy without touching bet quality.
 
     Game-slate short-circuit: if all MLB games have commenced during
     Peak Trading, automatically drops to Sleep rates to conserve credits.
 
     Odds credit budget:
-      Early Morning (40/hr ×  3h × 4):   480/day
-      Discovery     (20/hr ×  4h × 4):   320/day
-      Peak Trading  (48/hr ×  9h × 4): 1,728/day
-      Sleep          (4/hr ×  8h × 4):   128/day
-      Total odds: ~2,656/day
+      Early Morning (40/hr ×  3h × 2):   240/day
+      Discovery     (20/hr ×  4h × 2):   160/day
+      Peak Trading  (30/hr ×  9h × 2):   540/day
+      Sleep          (4/hr ×  8h × 2):    64/day
+      Total odds: ~1,004/day
     """
     h = _pdt_hour()
     if 13 <= h < 22 and _all_games_commenced():
@@ -142,29 +151,35 @@ def _odds_refresh_interval() -> int:
     if 9  <= h < 13:
         return  3 * 60       # Discovery: 3min
     if 13 <= h < 22:
-        return 75            # Peak Trading: 75s
+        return  2 * 60       # Peak Trading: 2min (was 75s — see docstring)
     return 15 * 60           # Sleep: 15min
 
 def _props_refresh_interval() -> int:
     """Return seconds between MLB props scans (PDT context-aware schedule).
 
     Discovery    09:00–13:00 PDT: 10min — pre-game lines forming
-    Peak Trading 13:00–22:00 PDT:  8min — lineups locked, scratches happen here
+    Peak Trading 13:00–22:00 PDT: 15min — lineups locked, scratches happen here
     Early Morning 06:00–09:00 PDT: 15min — pitcher scratches + overnight line gaps
     Sleep         22:00–06:00 PDT:  OFF  — no upcoming games, save credits
 
     Game-slate short-circuit: mirrors odds logic — props off when slate over.
 
-    Rationale: props markets (pitcher strikeouts, batter hits) are less liquid
+    Rationale: props markets (pitcher strikeouts, total bases) are less liquid
     than totals — Kalshi can lag Pinnacle by 15-30min after a lineup change or
-    pitcher scratch.  Scanning 3× more often catches those windows.
+    pitcher scratch. Faster-than-Discovery cadence catches those windows.
 
-    Props credit budget (~21 credits/scan: 1 event list + 10 games × 2 markets):
-      Early Morning (4/hr  ×  3h × 21):  252/day
-      Discovery     (6/hr  ×  4h × 21):  504/day  (was 7.5/hr at 10min)
-      Peak Trading  (7.5/hr × 9h × 21): 1,418/day
+    Peak slowed 8min -> 15min on 2026-07-10 alongside Hits/RBI removal — see
+    _odds_refresh_interval() docstring for the CLV-by-window rationale (Peak
+    props carry the sample's highest true CLV, 1.37pp, but were being scanned
+    at nearly Discovery's cadence for a fraction of the bet yield per hour).
+
+    Props credit budget (2 markets/event [K, TB only — Hits/RBI cut 2026-07-10],
+    2 credits/market, ~13 events/scan -> 52 credits/scan):
+      Early Morning (4/hr  ×  3h × 52):   624/day
+      Discovery     (6/hr  ×  4h × 52): 1,248/day
+      Peak Trading  (4/hr  ×  9h × 52): 1,872/day
       Sleep:                                0/day
-      Total props: ~2,174/day
+      Total props: ~3,744/day
     """
     h = _pdt_hour()
     if 13 <= h < 22 and _all_games_commenced():
@@ -174,7 +189,7 @@ def _props_refresh_interval() -> int:
     if 9  <= h < 13:
         return 10 * 60       # Discovery: 10min
     if 13 <= h < 22:
-        return  8 * 60       # Peak Trading: 8min
+        return 15 * 60       # Peak Trading: 15min (was 8min — see docstring)
     return 10 ** 9           # Sleep: OFF
 REFRESH_SECONDS       = 30         # re-scan Kalshi every 30 sec   (0 credits)
 # Monthly credit math (20k budget):

@@ -2149,14 +2149,16 @@ def scan_sport(
 # Home runs retired 2026-06-24: extreme-longshot market where the proportional
 # no-vig de-vig overstates the fair value, so apparent CLV was an artifact — 43
 # shadow bets ran -5.5pp vs expected. Not scanned (saves credits), not displayed.
-PLAYER_PROP_MARKETS = "pitcher_strikeouts,batter_hits,batter_total_bases,batter_rbis"
+# Hits and RBIs cut 2026-07-10: zero flagged bets in the full 170-bet sample
+# (106 K, 56 TB, 8 Total, 0 Hits, 0 RBI) — pure credit cost with no signal.
+# Also halves the per-event props cost (4 credits/event -> 2), the single
+# biggest driver of Odds API credit usage.
+PLAYER_PROP_MARKETS = "pitcher_strikeouts,batter_total_bases"
 NBA_PLAYER_PROP_MARKETS = "player_points,player_assists,player_threes"
 
 MLB_PROP_SERIES: Dict[str, str] = {
     "KXMLBKS":  "pitcher_strikeouts",
-    "KXMLBHIT": "batter_hits",
     "KXMLBTB":  "batter_total_bases",
-    "KXMLBRBI": "batter_rbis",
 }
 
 NBA_PROP_SERIES: Dict[str, str] = {

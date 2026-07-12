@@ -398,7 +398,8 @@ def kalshi_get(path: str, params: Optional[Dict] = None, _retries: int = 3) -> d
 def fetch_kalshi_events(series_ticker: str) -> List[dict]:
     events, cursor = [], None
     for _page in range(20):   # hard cap: 20 pages × 100 = 2000 events max
-        params: Dict = {"series_ticker": series_ticker, "status": "open", "limit": 100}
+        params: Dict = {"series_ticker": series_ticker, "status": "open", "limit": 100,
+                         "with_nested_markets": "true"}
         if cursor:
             params["cursor"] = cursor
         try:
@@ -1666,6 +1667,13 @@ def scan_sport(
 
             # Skip expired events
             exp_str = evt.get("expected_expiration_time") or evt.get("close_time") or ""
+            if not exp_str:
+                # NBA/WNBA tickers carry no embedded time, and the /events list
+                # endpoint doesn't surface expiration at the event level — only
+                # inside each nested market (see with_nested_markets above).
+                _nested_mkts = evt.get("markets") or []
+                if _nested_mkts:
+                    exp_str = _nested_mkts[0].get("expected_expiration_time") or _nested_mkts[0].get("close_time") or ""
             if exp_str:
                 try:
                     exp_dt = datetime.fromisoformat(exp_str.replace("Z", "+00:00"))
@@ -2414,6 +2422,10 @@ def scan_player_props(
         print(f"  [{series}] → {prop_type}: {len(evts)} event(s)")
         for evt in evts:
             exp_str = evt.get("expected_expiration_time") or evt.get("close_time") or ""
+            if not exp_str:
+                _nested_mkts = evt.get("markets") or []
+                if _nested_mkts:
+                    exp_str = _nested_mkts[0].get("expected_expiration_time") or _nested_mkts[0].get("close_time") or ""
             if exp_str:
                 try:
                     exp_dt = datetime.fromisoformat(exp_str.replace("Z", "+00:00"))

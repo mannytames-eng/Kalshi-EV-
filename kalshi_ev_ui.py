@@ -772,24 +772,123 @@ for _b in _bets:
         _data_fixed = True
         print(f"  Shadow-backfill: zeroed stake/pnl on {_b.get('id','?')}")
 
-# Fix: two bets got silently halved by the retroactive-resize migration below
-# (now removed) on the 2026-07-12 WNBA-fix deploys. That migration was a
-# one-time historical correction for the June 2026 time-Kelly-multiplier flip,
-# but re-applied its OLD <4h-to-game 0.50x bracket to brand-new bets created
-# under the CURRENT flat-1.0x _time_kelly_mult() policy, since new bets are
-# never stamped with _resize_version at creation — every restart re-caught
-# whatever had been flagged since the last one. Confirmed via /api/paper: both
-# stakes are exactly half of what a 1.0x multiplier produces for their edge/price.
-_halved_by_stale_migration = {
-    "KXMLBTB-26JUL121410ATHCWS-ATHCTHOMAS32-2|YES": 9.33,
-    "KXMLBKS-26JUL121435HOUTEX-TEXMGORE1-5|YES":    10.50,
+# Fix: bets silently halved by the retroactive-resize migration (now removed
+# above). That migration was a one-time historical correction for the June
+# 2026 time-Kelly-multiplier flip (_time_kelly_mult() -> flat 1.0x), but kept
+# running on every restart and re-applied its OLD <4h-to-game 0.50x bracket to
+# any bet without a _resize_version stamp -- which is every new bet, since
+# creation never sets that field. Every deploy re-caught whatever had been
+# flagged since the last one. Found by scanning the full book for stakes
+# exactly half of what a 1.0x recompute gives for that bet's edge/price;
+# excludes the 2026-07-08..10 Total Bases high-raw-edge bets, which were
+# legitimately capped at 1.5% (not a bug) before being escalated to full
+# shadow on 2026-07-10. 87 bets affected (85 settled + 2 caught mid-flight on
+# the 2026-07-12 WNBA-fix deploys, already corrected once while open).
+# Correcting these makes the paper track record $27.72 WORSE, not better --
+# confirms this is a genuine bug fix, not outcome tuning.
+_HALVED_BY_STALE_MIGRATION = {
+    "KXMLBKS-26JUL011235CWSBAL-CWSNSCHULTZ75-4|NO": (8.47, -8.47),
+    "KXMLBKS-26JUL011335DETNYY-DETTMELTON52-5|NO": (11.76, -11.76),
+    "KXMLBKS-26JUL011915STLATL-STLMMCGREEVY36-4|YES": (12.08, -12.08),
+    "KXMLBKS-26JUL012010CINMIL-MILSDROHAN73-5|NO": (12.9, -12.9),
+    "KXMLBKS-26JUL012040MIACOL-COLKFREELAND21-5|YES": (9.38, 16.68),
+    "KXMLBKS-26JUL031845PITWSH-PITMKELLER23-4|NO": (9.32, 13.41),
+    "KXMLBKS-26JUL051400CWSCLE-CLETBIBEE28-5|NO": (10.42, 15.63),
+    "KXMLBKS-26JUL061840NYYTB-NYYCSCHLITTLER31-7|YES": (10.16, 18.06),
+    "KXMLBKS-26JUL061845HOUWSH-WSHMMIKOLAS36-3|NO": (10.32, -10.32),
+    "KXMLBKS-26JUL072145TORSF-SFTMCDONALD72-5|YES": (17.91, -17.91),
+    "KXMLBKS-26JUL081835CHCBAL-CHCCREA53-5|YES": (7.94, -7.94),
+    "KXMLBKS-26JUL081840ATLPIT-ATLGHOLMES66-5|YES": (23.5, 23.5),
+    "KXMLBKS-26JUL091235ATLPIT-PITMKELLER23-4|NO": (9.65, 12.79),
+    "KXMLBKS-26JUL091410BOSCWS-CWSAKAY18-5|YES": (11.02, -11.02),
+    "KXMLBKS-26JUL092145COLSF-COLRFELTNER18-5|YES": (8.33, -8.33),
+    "KXMLBKS-26JUL111605NYYWSH-NYYCSCHLITTLER31-7|YES": (12.27, -12.27),
+    "KXMLBKS-26JUL111610BOSNYM-NYMFPERALTA51-6|YES": (11.5, 11.5),
+    "KXMLBKS-26JUL121335KCBAL-KCSLUGO67-5|YES": (11.5, 11.5),
+    "KXMLBKS-26JUL121435HOUTEX-TEXMGORE1-5|YES": (10.5, None),
+    "KXMLBKS-26JUN091835SEABAL-BALTROGERS28-6|YES": (12.93, -12.93),
+    "KXMLBKS-26JUN102040CHCCOL-COLMLORENZEN24-4|YES": (11.06, 11.98),
+    "KXMLBKS-26JUN121840MIAPIT-MIASALCANTARA22-5|NO": (15.43, -15.43),
+    "KXMLBKS-26JUN121915ATLNYM-ATLSSTRIDER99-6|NO": (8.77, 11.63),
+    "KXMLBKS-26JUN131507NYYTOR-NYYCSCHLITTLER31-6|YES": (8.62, 11.9),
+    "KXMLBKS-26JUN131610DETCLE-DETTSKUBAL29-6|NO": (10.5, 10.5),
+    "KXMLBKS-26JUN141337NYYTOR-NYYWWARREN98-5|YES": (13.02, -13.02),
+    "KXMLBKS-26JUN141340DETCLE-CLEGWILLIAMS32-8|YES": (14.58, -14.58),
+    "KXMLBKS-26JUN141410HOUKC-HOUSARRIGHETTI41-5|NO": (14.09, -14.09),
+    "KXMLBKS-26JUN141410HOUKC-KCSKOLEK32-4|YES": (16.33, 15.69),
+    "KXMLBKS-26JUN141920TEXBOS-BOSCEARLY71-6|YES": (14.06, -14.06),
+    "KXMLBKS-26JUN161845TORBOS-BOSPTOLLE70-6|YES": (10.27, 13.07),
+    "KXMLBKS-26JUN171845TORBOS-BOSJBENNETT64-4|YES": (11.25, 16.88),
+    "KXMLBKS-26JUN171915SFATL-ATLJRITCHIE60-4|NO": (11.61, -11.61),
+    "KXMLBKS-26JUN181410CLEMIL-MILSDROHAN73-6|YES": (10.1, -10.1),
+    "KXMLBKS-26JUN181610BALSEA-BALSBAZ34-6|YES": (9.05, 12.5),
+    "KXMLBKS-26JUN191840CWSDET-DETTSKUBAL29-7|NO": (11.73, -11.73),
+    "KXMLBKS-26JUN192040PITCOL-COLKFREELAND21-5|YES": (13.71, 22.37),
+    "KXMLBKS-26JUN211340CWSDET-DETKMONTERO54-4|YES": (17.0, -17.0),
+    "KXMLBKS-26JUN211340SFMIA-MIARGUSTO65-4|YES": (13.3, 11.79),
+    "KXMLBKS-26JUN211340SFMIA-SFLWEBB62-6|YES": (12.5, -12.5),
+    "KXMLBKS-26JUN211340WSHTB-TBNMARTINEZ28-5|YES": (9.77, 17.37),
+    "KXMLBKS-26JUN211410CLEHOU-CLESCECCONI44-5|YES": (10.32, -10.32),
+    "KXMLBKS-26JUN211435SDTEX-TEXNEOVALDI17-6|NO": (12.04, -12.04),
+    "KXMLBKS-26JUN241840KCTB-KCNCAMERON65-5|YES": (13.21, 14.9),
+    "KXMLBKS-26JUN251235SEAPIT-PITBCHANDLER36-6|YES": (8.47, -8.47),
+    "KXMLBKS-26JUN251235SEAPIT-SEABMILLER50-6|NO": (12.0, -12.0),
+    "KXMLBKS-26JUN261910NYYBOS-BOSPTOLLE70-6|YES": (15.2, 15.82),
+    "KXMLBKS-26JUN271507TEXTOR-TORDCEASE84-9|YES": (10.48, 17.1),
+    "KXMLBKS-26JUN272040LADSD-LADYYAMAMOTO18-6|NO": (8.61, 13.47),
+    "KXMLBKS-26JUN281340HOUDET-DETJFLAHERTY9-6|YES": (9.43, 10.63),
+    "KXMLBKS-26JUN281340HOUDET-HOUHBROWN58-7|YES": (14.77, -14.77),
+    "KXMLBKS-26JUN281410COLMIN-COLRFELTNER18-5|YES": (8.47, -8.47),
+    "KXMLBKS-26JUN292005SDCHC-SDGCANNING17-4|NO": (13.93, 21.79),
+    "KXMLBKS-26JUN301905DETNYY-NYYCSCHLITTLER31-8|YES": (9.65, -9.65),
+    "KXMLBKS-26JUN302005SDCHC-SDJSEARS38-5|YES": (8.47, -8.47),
+    "KXMLBKS-26JUN302140LAASEA-LAAJSORIANO59-6|NO": (13.94, -13.94),
+    "KXMLBTB-26JUL011420SDCHC-CHCPCROWARMSTRONG4-2|YES": (14.58, 13.46),
+    "KXMLBTB-26JUL021235PITPHI-PHITTURNER7-2|YES": (12.04, -12.04),
+    "KXMLBTB-26JUL031605STLCHC-STLJWALKER18-2|NO": (22.96, -22.96),
+    "KXMLBTB-26JUL032140MIAATH-MIAGCONINE18-2|YES": (14.06, -14.06),
+    "KXMLBTB-26JUL041335MINNYY-NYYCBELLINGER35-2|YES": (11.36, 13.88),
+    "KXMLBTB-26JUL051920SDLAD-LADMBETTS50-2|YES": (11.11, -11.11),
+    "KXMLBTB-26JUL072210COLLAD-LADMMUNCY13-2|YES": (13.16, -13.16),
+    "KXMLBTB-26JUL091335CHCBAL-CHCPCROWARMSTRONG4-2|NO": (15.22, -15.22),
+    "KXMLBTB-26JUL121410ATHCWS-ATHCTHOMAS32-2|YES": (9.33, -9.33),
+    "KXMLBTB-26JUN171240NYMCIN-NYMBBICHETTE19-2|YES": (11.0, 11.0),
+    "KXMLBTB-26JUN171240NYMCIN-NYMMSEMIEN10-2|YES": (8.47, 12.19),
+    "KXMLBTB-26JUN171240NYMCIN-NYMMVIENTOS27-2|YES": (9.32, -9.32),
+    "KXMLBTB-26JUN171305KCWSH-KCBWITT7-2|YES": (10.64, -10.64),
+    "KXMLBTB-26JUN181905CWSNYY-CWSJPEREZ70-2|YES": (24.63, -24.63),
+    "KXMLBTB-26JUN192145MINAZ-AZJLAWLAR10-2|YES": (9.23, 17.14),
+    "KXMLBTB-26JUN201335CINNYY-NYYPGOLDSCHMIDT48-2|YES": (11.79, 13.3),
+    "KXMLBTB-26JUN202210BALLAD-LADFFREEMAN5-2|YES": (8.47, -8.47),
+    "KXMLBTB-26JUN211435SDTEX-TEXJJUNG6-2|YES": (9.91, 13.69),
+    "KXMLBTB-26JUN211920NYMPHI-PHIABOHM28-2|YES": (13.16, -13.16),
+    "KXMLBTB-26JUN221910CHCNYM-NYMFALVAREZ4-2|YES": (18.65, 31.76),
+    "KXMLBTB-26JUN222138BALLAA-BALCMAYO16-2|YES": (10.0, 15.0),
+    "KXMLBTB-26JUN231607HOUTOR-HOUJALTUVE27-2|YES": (8.75, 13.12),
+    "KXMLBTB-26JUN261907TEXTOR-TEXBNIMMO24-2|YES": (9.32, 13.41),
+    "KXMLBTB-26JUN262015MIASTL-MIAGCONINE18-2|YES": (16.38, -16.38),
+    "KXMLBTB-26JUN281340AZTB-AZIVARGAS6-2|YES": (20.29, -20.29),
+    "KXMLBTB-26JUN281415MIASTL-MIAOLOPEZ6-2|YES": (12.02, -12.02),
+    "KXMLBTB-26JUN292010MINHOU-HOUJALTUVE27-2|YES": (12.1, -12.1),
+    "KXMLBTB-26JUN301915STLATL-ATLDBALDWIN30-2|YES": (12.05, -12.05),
+    "KXMLBTB-26JUN302140LADATH-LADFFREEMAN5-2|NO": (14.89, -14.89),
+    "KXMLBTOTAL-26JUN201610MILATL-8|YES": (9.38, -9.38),
+    "KXMLBTOTAL-26JUN301905DETNYY-8|YES": (11.16, 14.2),
 }
+
 for _b in _bets:
-    _correct = _halved_by_stale_migration.get(_b.get("id"))
-    if _correct is not None and _b.get("status") == "open" and _b.get("paper_stake") != _correct:
-        _b["paper_stake"] = _correct
-        _data_fixed = True
-        print(f"  Restored stake halved by stale resize migration: {_b['id']} -> ${_correct}")
+    _fix = _HALVED_BY_STALE_MIGRATION.get(_b.get("id"))
+    if _fix is None:
+        continue
+    _correct_stake, _correct_pnl = _fix
+    if _b.get("paper_stake") == _correct_stake:
+        continue   # already fixed in a previous deploy
+    _b["paper_stake"] = _correct_stake
+    if _correct_pnl is not None and _b.get("status") in ("won", "lost"):
+        _b["pnl"]       = _correct_pnl
+        _b["paper_pnl"] = _correct_pnl
+    _data_fixed = True
+    print(f"  Restored stake halved by stale resize migration: {_b['id']} -> ${_correct_stake}")
 
 # ── Same-player dedup — SETTLED BETS ARE FROZEN ──────────────────────────────
 # Settled bets keep the classification they had when recorded; we never rewrite

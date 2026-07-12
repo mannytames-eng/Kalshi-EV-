@@ -3385,6 +3385,7 @@ _odds_refresh_lock = threading.Lock()  # prevents concurrent Pinnacle fetches ac
 
 
 def _norm_matchup(s: str) -> str:
+    import re
     return re.sub(r"[^a-z0-9]", "", s.lower())
 
 

@@ -135,19 +135,23 @@ def _odds_refresh_interval() -> int:
     Discovery's. That gap is redundant scanning, not edge capture; matching
     Discovery's cadence removes the redundancy without touching bet quality.
 
-    Game-slate short-circuit: if all MLB games have commenced during
-    Peak Trading, automatically drops to Sleep rates to conserve credits.
+    Game-slate short-circuit: if all MLB games have commenced — or there are
+    none scheduled at all today (rainout, All-Star break) — automatically
+    drops to Sleep rates to conserve credits. Checked across the whole day,
+    not just Peak Trading, so a fully dark day (e.g. the 2026-07-13..16
+    All-Star break) doesn't keep polling at Early Morning/Discovery cadence
+    for games that don't exist.
 
     Odds credit budget:
       Early Morning (40/hr ×  3h × 2):   240/day
       Discovery     (20/hr ×  4h × 2):   160/day
       Peak Trading  (30/hr ×  9h × 2):   540/day
       Sleep          (4/hr ×  8h × 2):    64/day
-      Total odds: ~1,004/day
+      Total odds: ~1,004/day  (less on any day the short-circuit fires early)
     """
     h = _pdt_hour()
-    if 13 <= h < 22 and _all_games_commenced():
-        return 15 * 60       # Slate over — drop to Sleep rates early
+    if _all_games_commenced():
+        return 15 * 60       # Slate over, or no games today at all — Sleep rate
     if 6  <= h <  9:
         return 90            # Early Morning: 90s — best window for overnight line gaps
     if 9  <= h < 13:
@@ -164,7 +168,9 @@ def _props_refresh_interval() -> int:
     Early Morning 06:00–09:00 PDT: 15min — pitcher scratches + overnight line gaps
     Sleep         22:00–06:00 PDT:  OFF  — no upcoming games, save credits
 
-    Game-slate short-circuit: mirrors odds logic — props off when slate over.
+    Game-slate short-circuit: mirrors odds logic — props off when slate over,
+    checked across the whole day so a fully dark day (rainout, All-Star break)
+    doesn't keep scanning Early Morning/Discovery for games that don't exist.
 
     Rationale: props markets (pitcher strikeouts, total bases) are less liquid
     than totals — Kalshi can lag Pinnacle by 15-30min after a lineup change or
@@ -184,8 +190,8 @@ def _props_refresh_interval() -> int:
       Total props: ~3,744/day
     """
     h = _pdt_hour()
-    if 13 <= h < 22 and _all_games_commenced():
-        return 10 ** 9       # Slate over — props off
+    if _all_games_commenced():
+        return 10 ** 9       # Slate over, or no games today at all — props off
     if 6  <= h <  9:
         return 15 * 60       # Early Morning: 15min — starter scratches post overnight
     if 9  <= h < 13:
@@ -213,18 +219,43 @@ def _props_refresh_interval() -> int:
 WNBA_WINDOW_START_H = 15   # 3pm PDT
 WNBA_WINDOW_END_H   = 22   # 10pm PDT
 
+def _all_wnba_games_commenced() -> bool:
+    """Return True when a confirmed fetch shows zero WNBA games today — either
+    the day's slate has fully tipped off, or none are scheduled at all (e.g.
+    the WNBA's own All-Star break, 2026-07-23..27). Mirrors _all_games_commenced()
+    for MLB. Deliberately date-agnostic — reacts to the real game count instead
+    of hardcoding break dates, so it self-corrects the day play resumes."""
+    with _odds_cache_lock:
+        return _last_wnba_cache_success > 0 and _wnba_game_count == 0
+
 def _wnba_odds_refresh_interval() -> int:
     """Seconds until next WNBA Pinnacle odds refresh. Single evening window;
-    returns a very large number (effectively off) outside it."""
+    returns a very large number (effectively off) outside it.
+
+    Zero-game short-circuit: if the last fetch (within the window) confirmed
+    no WNBA games today, slow to a 30min check instead of going fully silent —
+    unlike MLB's odds loop, WNBA's background loop skips the fetch entirely
+    when the interval is >= 10**9 (see _background_wnba_odds_loop), so a fully
+    "off" return here would never re-check and could get stuck past the break."""
     h = _pdt_hour()
-    if WNBA_WINDOW_START_H <= h < WNBA_WINDOW_END_H:
-        return 6 * 60
-    return 10 ** 9
+    if not (WNBA_WINDOW_START_H <= h < WNBA_WINDOW_END_H):
+        return 10 ** 9
+    if _all_wnba_games_commenced():
+        return 30 * 60
+    return 6 * 60
 
 def _wnba_props_refresh_interval() -> int:
     """Seconds between WNBA props scans. Same evening window as odds, slower
-    cadence since props cost 1.5x more per event than the 2-market MLB cost."""
+    cadence since props cost 1.5x more per event than the 2-market MLB cost.
+
+    Zero-game short-circuit: safe to go fully off here (unlike the odds
+    function above) — this is polled inline from the always-running main
+    scan loop, not a dedicated skip-the-fetch background thread, so it
+    re-opens on its own the next cycle after the odds refresh above detects
+    play has resumed."""
     h = _pdt_hour()
+    if _all_wnba_games_commenced():
+        return 10 ** 9
     if WNBA_WINDOW_START_H <= h < WNBA_WINDOW_END_H:
         return 40 * 60
     return 10 ** 9

@@ -4205,9 +4205,9 @@ HTML = """<!DOCTYPE html>
 
 
 <div id="history-card" class="card">
-  <div class="card-header" onclick="toggleCard('history-body')">Portfolio ROI <span class="card-toggle" id="history-body-toggle">▾</span></div>
+  <div class="card-header" onclick="toggleCard('history-body')">Portfolio ROI — Flat Units <span style="font-size:10px;font-weight:400;color:var(--muted);margin-left:6px;">$1 on every bet · no Kelly sizing</span> <span class="card-toggle" id="history-body-toggle">▾</span></div>
   <div id="history-body" class="card-body" style="padding:16px 12px 12px;">
-    <div class="chart-empty">Loading ROI chart…</div>
+    <div class="chart-empty">Loading units chart…</div>
   </div>
 </div>
 
@@ -4316,7 +4316,7 @@ function renderRoiChart(points) {
   const cW = W - PAD.left - PAD.right;
   const cH = H - PAD.top - PAD.bottom;
 
-  const rois   = points.map(p => p.roi);
+  const rois   = points.map(p => p.units);   // y-axis now = cumulative flat units
   const minR   = Math.min(...rois, 0);
   const maxR   = Math.max(...rois, 0);
   const span   = maxR - minR || 1;
@@ -4333,12 +4333,12 @@ function renderRoiChart(points) {
   const fillId = 'roi-fill';
 
   // polyline points
-  const pts = points.map((p, i) => toX(i).toFixed(1) + ',' + toY(p.roi).toFixed(1)).join(' ');
+  const pts = points.map((p, i) => toX(i).toFixed(1) + ',' + toY(p.units).toFixed(1)).join(' ');
 
   // closed area polygon (go to baseline then back)
   const baseY = toY(0).toFixed(1);
   const areaPath = 'M ' + toX(0).toFixed(1) + ',' + baseY
-    + ' ' + points.map((p, i) => 'L ' + toX(i).toFixed(1) + ',' + toY(p.roi).toFixed(1)).join(' ')
+    + ' ' + points.map((p, i) => 'L ' + toX(i).toFixed(1) + ',' + toY(p.units).toFixed(1)).join(' ')
     + ' L ' + toX(points.length - 1).toFixed(1) + ',' + baseY + ' Z';
 
   // Y-axis ticks (5 ticks)
@@ -4375,8 +4375,8 @@ function renderRoiChart(points) {
   ${zeroLine}
   <path d="${areaPath}" fill="url(#${fillId})"/>
   <polyline points="${pts}" fill="none" stroke="${stroke}" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>
-  ${points.map((p, i) => `<circle cx="${toX(i).toFixed(1)}" cy="${toY(p.roi).toFixed(1)}" r="3" fill="${stroke}" class="roi-dot" data-idx="${i}" style="cursor:pointer"/>`).join('')}
-  ${yTicks.map(t => `<text x="${PAD.left - 6}" y="${(t.y + 4).toFixed(1)}" text-anchor="end" fill="#8b949e" font-size="10">${(t.v >= 0 ? '+' : '') + t.v.toFixed(1)}%</text>`).join('')}
+  ${points.map((p, i) => `<circle cx="${toX(i).toFixed(1)}" cy="${toY(p.units).toFixed(1)}" r="3" fill="${stroke}" class="roi-dot" data-idx="${i}" style="cursor:pointer"/>`).join('')}
+  ${yTicks.map(t => `<text x="${PAD.left - 6}" y="${(t.y + 4).toFixed(1)}" text-anchor="end" fill="#8b949e" font-size="10">${(t.v >= 0 ? '+' : '') + t.v.toFixed(1)}u</text>`).join('')}
   ${xLabels.map(l => `<text x="${l.x.toFixed(1)}" y="${H - 6}" text-anchor="middle" fill="#8b949e" font-size="10">${l.label}</text>`).join('')}
 </svg>
 <div id="roi-tooltip" style="display:none;position:absolute;background:#161b22;border:1px solid #30363d;border-radius:6px;padding:8px 10px;font-size:12px;color:#e6edf3;pointer-events:none;z-index:10;white-space:nowrap;"></div>`;
@@ -4392,13 +4392,13 @@ function renderRoiChart(points) {
       const tip = document.getElementById('roi-tooltip');
       let html = '';
       if (!p.result) {
-        html = '<b>Start</b><br>Balance: $1,000.00 &nbsp;|&nbsp; ROI: +0.00%';
+        html = '<b>Start</b><br>Cumulative: +0.00u &nbsp;|&nbsp; ROI: +0.00%';
       } else {
         const icon = p.result === 'won' ? '✓' : '✗';
-        const sign = p.pnl >= 0 ? '+' : '';
+        const us   = p.unit_pnl >= 0 ? '+' : '';
         html = `<b>${p.matchup || p.title || ''}</b><br>`
-          + `${icon} ${p.result.toUpperCase()}  ${sign}$${p.pnl.toFixed(2)}<br>`
-          + `Balance: $${p.balance.toFixed(2)} &nbsp;|&nbsp; ROI: ${p.roi >= 0 ? '+' : ''}${p.roi.toFixed(2)}%`;
+          + `${icon} ${p.result.toUpperCase()}  ${us}${p.unit_pnl.toFixed(2)}u<br>`
+          + `Cumulative: ${p.units >= 0 ? '+' : ''}${p.units.toFixed(2)}u &nbsp;|&nbsp; ROI: ${p.units_roi >= 0 ? '+' : ''}${p.units_roi.toFixed(2)}%`;
       }
       tip.innerHTML = html;
       const rect = el.getBoundingClientRect();
@@ -5728,18 +5728,28 @@ async function fetchPaper() {
     const clvColor  = pinData ? (pinData.avg_clv >= 0 ? 'var(--green)' : 'var(--red)') : 'var(--muted)';
     const clvLabel  = pinData ? `Avg CLV — PIN (${pinData.count} bets)` : 'Avg CLV — PIN';
 
-    // Kelly P&L — use the compounding paper balance so this matches the ROI
-    // chart at the bottom exactly (perf.total_kelly_pct is a separate non-
-    // compounding calc and was showing a different number).
-    const kellyPct  = (d.start_balance && d.balance != null)
-      ? (d.balance - d.start_balance) / d.start_balance * 100
-      : perf.total_kelly_pct;
-    const kellyColor = kellyPct == null ? 'var(--muted)' : kellyPct >= 0 ? 'var(--green)' : 'var(--red)';
-    const kellyTxt  = kellyPct == null ? '—' : `${kellyPct >= 0 ? '+' : ''}${kellyPct.toFixed(2)}%`;
+    // Kelly P&L (% bank) — the sizing-model diagnostic, kept as a SECONDARY tile.
+    // Uses perf.total_kelly_pct (sum of per-bet Kelly fractions). The old
+    // compounding-bankroll "ROI" tile (balance-vs-start) was removed 2026-07-14:
+    // it compounded on an imaginary bankroll with too many degrees of freedom to
+    // mean anything at this sample. Flat Units is the primary metric now, and the
+    // Portfolio ROI chart is units-based.
+    const kellyBankPct   = perf.total_kelly_pct;
+    const kellyBankColor = kellyBankPct == null ? 'var(--muted)' : kellyBankPct >= 0 ? 'var(--green)' : 'var(--red)';
+    const kellyBankTxt   = kellyBankPct == null ? '—' : `${kellyBankPct >= 0 ? '+' : ''}${kellyBankPct.toFixed(2)}%`;
 
     // ── Primary KPI bar ────────────────────────────────────────────────────
     let html = `
-    <div style="padding:5px 12px;background:#0d1117;border-bottom:1px solid var(--border);font-size:9px;color:var(--muted);text-transform:uppercase;letter-spacing:0.08em;font-weight:600;">Edge signals — how we judge the model</div>
+    <!-- HERO: Flat Units — the primary "is the edge real" metric. Largest sample,
+         no Kelly sizing distortion. Promoted to hero 2026-07-14. -->
+    <div style="padding:18px 16px 16px;background:var(--surface);border-bottom:1px solid var(--border);text-align:center;">
+      <div style="font-size:9px;color:var(--muted);text-transform:uppercase;letter-spacing:0.09em;font-weight:600;margin-bottom:5px;">Primary metric — is the edge real</div>
+      <div style="font-size:46px;font-weight:800;color:${unitsColor};letter-spacing:-1.5px;line-height:1;">${unitsTxt}</div>
+      <div style="font-size:13px;color:${unitsColor};opacity:0.75;margin-top:4px;">${unitsSubTxt}</div>
+      <div style="font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:0.07em;margin-top:6px;" title="$1 flat stake on every bet — removes all Kelly sizing noise. Largest sample of our metrics and no sizing-model distortion: the primary read on whether the edge is real.">Flat Units (${settled} settled)</div>
+      <div style="font-size:10px;color:var(--muted);opacity:0.75;margin-top:2px;">profit if every bet were $1</div>
+    </div>
+    <div style="padding:5px 12px;background:#0d1117;border-bottom:1px solid var(--border);font-size:9px;color:var(--muted);text-transform:uppercase;letter-spacing:0.08em;font-weight:600;">Supporting edge signals</div>
     <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:1px;background:var(--border);border-bottom:1px solid var(--border);">
       <!-- 1. Avg CLV — the TRUE closing-line value: how far Kalshi's line moved
            toward us from entry to close (bet-side). The most reliable signal. -->
@@ -5776,13 +5786,6 @@ async function fetchPaper() {
         <div style="font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:0.06em;margin-top:3px;" title="Actual win rate minus Kalshi-implied win probability, restricted to the 2-4% edge bucket (the only one with a meaningful sample). Positive = beating the market.">Win Rate vs Implied</div>
         <div style="font-size:9px;color:var(--muted);opacity:0.75;margin-top:2px;line-height:1.2;">2–4% edge bucket${coreN != null ? ' (' + coreN + ' bets)' : ''}</div>
       </div>
-      <!-- 4. Flat Units -->
-      <div style="background:var(--surface);padding:14px 16px;text-align:center;">
-        <div style="font-size:24px;font-weight:800;color:${unitsColor};letter-spacing:-0.5px;">${unitsTxt}</div>
-        <div style="font-size:11px;color:${unitsColor};opacity:0.7;margin-top:1px;">${unitsSubTxt}</div>
-        <div style="font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:0.06em;margin-top:3px;" title="$1 flat stake on every bet — removes all Kelly sizing noise. Best single measure of pick quality.">Flat Units (${settled} settled)</div>
-        <div style="font-size:9px;color:var(--muted);opacity:0.75;margin-top:2px;line-height:1.2;">profit if every bet were $1</div>
-      </div>
       <!-- 5. Record -->
       <div style="background:var(--surface);padding:14px 16px;text-align:center;">
         <div style="font-size:22px;font-weight:700;color:var(--green);">${d.won}W <span style="color:var(--red);">${d.lost}L</span></div>
@@ -5790,14 +5793,15 @@ async function fetchPaper() {
         <div style="font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:0.06em;margin-top:2px;">Record</div>
       </div>
     </div>
-    <div style="padding:5px 12px;background:#0d1117;border-bottom:1px solid var(--border);font-size:9px;color:var(--muted);text-transform:uppercase;letter-spacing:0.08em;font-weight:600;">Deployment preview — simulated sizing, not an edge metric</div>
+    <div style="padding:5px 12px;background:#0d1117;border-bottom:1px solid var(--border);font-size:9px;color:var(--muted);text-transform:uppercase;letter-spacing:0.08em;font-weight:600;">Sizing-model diagnostic — not an edge metric</div>
     <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:1px;background:var(--border);border-bottom:1px solid var(--border);opacity:0.82;">
-      <!-- 6. Kelly P&L (secondary) -->
+      <!-- Kelly P&L (% bank) — SECONDARY sizing diagnostic (kept 2026-07-14).
+           The old compounding-bankroll "ROI" tile (+4.81%) was removed. -->
       <div style="background:var(--surface);padding:14px 16px;text-align:center;">
-        <div style="font-size:22px;font-weight:700;color:${kellyColor};">${kellyTxt}</div>
+        <div style="font-size:22px;font-weight:700;color:${kellyBankColor};">${kellyBankTxt}</div>
         <div style="font-size:11px;color:var(--muted);margin-top:1px;">simulated, quarter-Kelly</div>
-        <div style="font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:0.06em;margin-top:3px;" title="Return on the simulated paper bankroll (compounding, quarter-Kelly sizing) — matches the ROI chart below. Secondary: reflects staking decisions, not model quality, and is noise at this sample. Judge by the edge signals above.">ROI</div>
-        <div style="font-size:9px;color:var(--muted);opacity:0.75;margin-top:2px;line-height:1.2;">noisy at this sample — don't judge by this</div>
+        <div style="font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:0.06em;margin-top:3px;" title="Total Kelly P&amp;L as % of bankroll (sum of per-bet Kelly fractions). A sizing-model diagnostic, not an edge metric — noise at this sample. Judge the edge by Flat Units and CLV above.">Kelly P&amp;L (% bank)</div>
+        <div style="font-size:9px;color:var(--muted);opacity:0.75;margin-top:2px;line-height:1.2;">secondary — noisy at this sample</div>
       </div>
     </div>
     <div style="padding:6px 12px;border-bottom:1px solid var(--border);background:#0d1117;">
@@ -6081,20 +6085,36 @@ class Handler(BaseHTTPRequestHandler):
                 ]
             settled.sort(key=lambda b: b.get("resolved_at") or b.get("flagged_at", ""))
             balance = PAPER_START_BALANCE
+            units_cum = 0.0     # cumulative FLAT units ($1 staked on every bet)
+            n_flat    = 0
             points = [{"date": PAPER_START_DATE, "roi": 0.0, "balance": balance,
+                       "units": 0.0, "units_roi": 0.0, "unit_pnl": None,
                        "matchup": None, "result": None, "pnl": None}]
             for b in settled:
                 balance = round(balance + b["paper_pnl"], 2)
                 roi = round((balance - PAPER_START_BALANCE) / PAPER_START_BALANCE * 100, 2)
+                # Flat-units P&L: $1 on every bet. Win pays profit (1-k)/k at the
+                # entry price k; loss = -1 unit. This is the sizing-model-free
+                # curve. Portfolio ROI is now units-based (2026-07-14) — it no
+                # longer plots the compounding quarter-Kelly bankroll. units_roi =
+                # flat-units P&L / (n settled × $1 flat stake).
+                _k = b.get("kalshi_price") or 0
+                unit_pnl = ((1 - _k) / _k) if (b["status"] == "won" and _k > 0) else -1.0
+                units_cum += unit_pnl
+                n_flat    += 1
+                units_roi = round(units_cum / n_flat * 100, 2)
                 points.append({
-                    "date":    (b.get("resolved_at") or b.get("flagged_at", ""))[:10],
-                    "roi":     roi,
-                    "balance": balance,
-                    "matchup": b.get("matchup", ""),
-                    "title":   b.get("title", ""),
-                    "side":    b.get("side", ""),
-                    "result":  b["status"],
-                    "pnl":     round(b["paper_pnl"], 2),
+                    "date":      (b.get("resolved_at") or b.get("flagged_at", ""))[:10],
+                    "roi":       roi,
+                    "balance":   balance,
+                    "units":     round(units_cum, 3),
+                    "units_roi": units_roi,
+                    "unit_pnl":  round(unit_pnl, 3),
+                    "matchup":   b.get("matchup", ""),
+                    "title":     b.get("title", ""),
+                    "side":      b.get("side", ""),
+                    "result":    b["status"],
+                    "pnl":       round(b["paper_pnl"], 2),
                 })
             self._send(200, "application/json", json.dumps(points).encode())
 

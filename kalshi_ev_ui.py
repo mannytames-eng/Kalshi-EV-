@@ -316,6 +316,19 @@ PAPER_KELLY_CAP      = 0.03     # max 3% of current balance per bet (validation-
 # (<7%) is unaffected: its win rate (41.3% vs 44.0% implied) isn't
 # significantly miscalibrated, so it keeps normal quarter-Kelly sizing.
 TB_HIGH_EDGE_THRESHOLD = 7.0     # pp, on raw_edge_pct — matches the original prop edge-floor design
+# TB calibration band (2026-07-14 diagnostic, n=57). TB was the best CLV market
+# yet the worst P&L (20-37). Four diagnostics found the fault is the baseline
+# win-prob ESTIMATE, not edge detection: the reliability curve was ~calibrated
+# for side model-fair in [0.35,0.45) (err -2.9pp) but badly OVERCONFIDENT at
+# [0.45,0.55) (-16.7pp) and [0.55,1) (-23.5pp) — overconfidence grows with model
+# confidence. Interim patch: shadow (log, don't bet) TB whose side model-fair is
+# at/above this ceiling — stop betting the overconfident tail — while keeping the
+# calibrated lower band. This is a single threshold, NOT a fitted per-bucket
+# curve (that approach was rejected as overfit at this n). Deliberately does NOT
+# touch the Poisson-from-line pricing or the de-vig method — that's the proper
+# fix, done separately. TB-only; Strikeouts et al. untouched. On the pre-fix 57
+# this ceiling would have shadowed ~68% (39/57) of TB volume.
+TB_CAL_FAIR_CEILING = 0.45       # shadow TB bets with side model-fair >= this (overconfident tail)
 # Aggregate daily gate (on TOP of per-bet Kelly sizing — does not change it).
 # Rejects any new bet that would push today's committed Kelly stake above this
 # fraction of the starting bankroll. Resets at midnight Pacific. Guards against
@@ -1237,14 +1250,26 @@ def _add_new_bets(edges: list) -> list:
             # Resolve game_time for the time-adaptive Kelly multiplier
             _gt_dt = _parse_ticker_start_time(e["ticker"])
             _game_time_iso = _gt_dt.isoformat() if _gt_dt else None
+            _tb_ticker = e.get("ticker", "").upper().startswith("KXMLBTB")
             # High raw-edge Total Bases (>=7%) — shadowed 2026-07-10, see
             # TB_HIGH_EDGE_THRESHOLD comment. Excluded from win rate/CLV/record
             # like any other shadow bet, not just zero-staked.
             _tb_high_edge = (
-                e.get("ticker", "").upper().startswith("KXMLBTB")
+                _tb_ticker
                 and round(e.get("raw_edge", 0) * 100, 1) >= TB_HIGH_EDGE_THRESHOLD
             )
-            shadow      = _is_shadow(e.get("ticker", "")) or e.get("sanity_shadow", False) or _tb_high_edge
+            # Overconfident-tail Total Bases — shadowed 2026-07-14 (see
+            # TB_CAL_FAIR_CEILING). Stop betting TB whose side model-fair is
+            # at/above the ceiling; the calibrated lower band still bets. Applied
+            # here at bet-creation only (forward-only) — the stored pre-fix 57 are
+            # untouched, per the freeze-settled-bets rule.
+            _tb_overconfident = (
+                _tb_ticker
+                and e.get("fair") is not None
+                and e.get("fair") >= TB_CAL_FAIR_CEILING
+            )
+            shadow      = (_is_shadow(e.get("ticker", "")) or e.get("sanity_shadow", False)
+                           or _tb_high_edge or _tb_overconfident)
             paper_stake = 0.0 if shadow else _paper_kelly_stake(
                 e["edge_pct"], e["kalshi"], _game_time_iso,
             )
@@ -1318,6 +1343,11 @@ def _add_new_bets(edges: list) -> list:
                 "shadow":             shadow,                 # True = tracked but $0 stake, excluded from balance
                 "daily_capped":       daily_capped,          # True = skipped (daily exposure cap), $0 stake
                 "time_mult_applied":  _time_kelly_mult(_game_time_iso),  # time-Kelly mult used at placement (1.0 since 2026-06-23)
+                # TB-only cohort tag (2026-07-14): marks TB bets placed AFTER the
+                # calibration patch so they never blend with the pre-fix 57 in
+                # analysis. None for non-TB. Within post-fix TB, the shadow flag +
+                # fair split staked (calibrated band) from shadowed (overconfident tail).
+                "tb_cohort":          ("post_fix_20260714" if _tb_ticker else None),
             }
 
             _bets.append(new_bet)
@@ -1766,6 +1796,32 @@ def _check_resolutions():
             mkt = data.get("market", {})
             result = mkt.get("result", "")
             if not result:
+                continue
+            # Kalshi settled this market to something other than a clean yes/no —
+            # e.g. a fair-market-price VOID (batter scratched / no plate appearance,
+            # per TB rules_secondary; also walkovers etc. on other markets). Before
+            # 2026-07-14 this fell through to `status="lost"` below and silently
+            # booked a void as a loss. Log it as a void instead: no win/loss, no
+            # P&L, stake freed (every aggregation keys on status in won/lost/open),
+            # and fire a Discord heads-up so it doesn't pass unnoticed.
+            if result not in ("yes", "no"):
+                with _bets_lock:
+                    for b in _bets:
+                        if b["id"] == bet["id"]:
+                            b["status"]      = "void"
+                            b["resolved_at"] = datetime.now(timezone.utc).isoformat()
+                            b["resolved_by"] = "kalshi_void"
+                            b["pnl"]         = 0.0
+                            b["paper_pnl"]   = 0.0
+                            b["void_result"] = result   # audit: what Kalshi returned
+                            break
+                try:
+                    send_discord(None, f"↩️ **Void settle** `{bet['ticker']}` — Kalshi "
+                                       f"result={result!r}; logged as void (no P&L, stake "
+                                       f"freed), not a loss. Verify against Kalshi.")
+                except Exception:
+                    pass
+                resolved += 1
                 continue
             side_won = (result == "yes" and bet["side"] == "YES") or \
                        (result == "no"  and bet["side"] == "NO")
@@ -5485,6 +5541,7 @@ function renderPerformance(d) {
     const isLive = b.status === 'open' && gameStartMs != null && now >= gameStartMs;
     const rClass = b.status === 'won' ? 'result-won' : b.status === 'lost' ? 'result-lost' : 'result-open';
     const rLabel = b.status === 'won' ? '✓ WON' : b.status === 'lost' ? '✗ LOST'
+      : b.status === 'void' ? '<span style="color:var(--muted);font-weight:600;" title="Kalshi voided this market (e.g. player scratch / no plate appearance) — settled at fair price, no P&amp;L">↩ VOID</span>'
       : isLive ? '<span style="color:#ff4444;font-weight:600;animation:pulse 1.5s infinite;">● LIVE</span>'
       : '…';
     // Kelly bet size as % of bankroll (dollar amount in tooltip)

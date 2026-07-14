@@ -219,6 +219,19 @@ def _props_refresh_interval() -> int:
 WNBA_WINDOW_START_H = 15   # 3pm PDT
 WNBA_WINDOW_END_H   = 22   # 10pm PDT
 
+# ── WNBA scanning — PAUSED 2026-07-14 ─────────────────────────────────────────
+# Three days of live scanning (2026-07-10 to -13) found zero player-prop edges;
+# root cause was Pinnacle posting only one line per player with no alternates
+# for basketball props, so it could only match Kalshi's multi-rung ladder by
+# luck (~5-6 of 18 players/scan). A DraftKings+FanDuel retail-consensus
+# fallback was drafted to work around that but scrapped before shipping.
+# Single kill switch: turns off odds refresh + props scan with zero Odds API
+# credit spend, code stays in place for a possible future revisit. Does NOT
+# touch the one already-open WNBA bet (Sparks @ Dream total) — that still
+# settles normally via the existing pre-close CLV pipeline; this only stops
+# looking for new edges.
+WNBA_SCANNING_ENABLED = False
+
 def _all_wnba_games_commenced() -> bool:
     """Return True when a confirmed fetch shows zero WNBA games today — either
     the day's slate has fully tipped off, or none are scheduled at all (e.g.
@@ -237,6 +250,8 @@ def _wnba_odds_refresh_interval() -> int:
     unlike MLB's odds loop, WNBA's background loop skips the fetch entirely
     when the interval is >= 10**9 (see _background_wnba_odds_loop), so a fully
     "off" return here would never re-check and could get stuck past the break."""
+    if not WNBA_SCANNING_ENABLED:
+        return 10 ** 9
     h = _pdt_hour()
     if not (WNBA_WINDOW_START_H <= h < WNBA_WINDOW_END_H):
         return 10 ** 9
@@ -253,6 +268,8 @@ def _wnba_props_refresh_interval() -> int:
     scan loop, not a dedicated skip-the-fetch background thread, so it
     re-opens on its own the next cycle after the odds refresh above detects
     play has resumed."""
+    if not WNBA_SCANNING_ENABLED:
+        return 10 ** 9
     h = _pdt_hour()
     if _all_wnba_games_commenced():
         return 10 ** 9
@@ -3033,7 +3050,11 @@ def _run_scan():
         # WNBA — single evening window, own cache/cadence (added 2026-07-10).
         # Cold cache (outside the window, or before first successful fetch)
         # just means no WNBA edges this cycle — doesn't block MLB scanning.
-        if wnba_idx is not None:
+        # WNBA_SCANNING_ENABLED check is a belt-and-suspenders guard: the
+        # pre-close CLV fetch (for the one already-open WNBA bet) can still
+        # repopulate _cached_wnba_index as a side effect even while scanning
+        # is paused, so "wnba_idx is not None" alone isn't a reliable off switch.
+        if WNBA_SCANNING_ENABLED and wnba_idx is not None:
             try:
                 wnba, wnba_stats, _wnba_snapshot = scan_sport(
                     label="WNBA — Spread & Totals",

@@ -5742,10 +5742,10 @@ async function fetchPaper() {
     let html = `
     <!-- HERO: Flat Units — the primary "is the edge real" metric. Largest sample,
          no Kelly sizing distortion. Promoted to hero 2026-07-14. -->
-    <div style="padding:18px 16px 16px;background:var(--surface);border-bottom:1px solid var(--border);text-align:center;">
-      <div style="font-size:9px;color:var(--muted);text-transform:uppercase;letter-spacing:0.09em;font-weight:600;margin-bottom:5px;">Primary metric — is the edge real</div>
-      <div style="font-size:46px;font-weight:800;color:${unitsColor};letter-spacing:-1.5px;line-height:1;">${unitsTxt}</div>
-      <div style="font-size:13px;color:${unitsColor};opacity:0.75;margin-top:4px;">${unitsSubTxt}</div>
+    <div style="padding:11px 16px 12px;background:var(--surface);border-bottom:1px solid var(--border);text-align:center;">
+      <div style="font-size:9px;color:var(--muted);text-transform:uppercase;letter-spacing:0.09em;font-weight:600;margin-bottom:2px;">Primary metric — is the edge real</div>
+      <div style="font-size:30px;font-weight:800;color:${unitsColor};letter-spacing:-0.8px;line-height:1.05;">${unitsTxt}</div>
+      <div style="font-size:12px;color:${unitsColor};opacity:0.75;margin-top:2px;">${unitsSubTxt}</div>
       <div style="font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:0.07em;margin-top:6px;" title="$1 flat stake on every bet — removes all Kelly sizing noise. Largest sample of our metrics and no sizing-model distortion: the primary read on whether the edge is real.">Flat Units (${settled} settled)</div>
       <div style="font-size:10px;color:var(--muted);opacity:0.75;margin-top:2px;">profit if every bet were $1</div>
     </div>

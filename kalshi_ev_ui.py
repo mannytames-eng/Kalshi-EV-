@@ -2282,7 +2282,7 @@ def _get_performance(since: Optional[str] = None) -> dict:
         if label not in by_type:
             by_type[label] = {"won": 0, "lost": 0, "shadow_won": 0, "shadow_lost": 0,
                                "units": [], "kelly": [], "clv": [], "pin_drifts": [],
-                               "fairs": [], "shadow": is_shad}
+                               "kalshi_implied": [], "shadow": is_shad}
         # pin drift per bet = closing_pin_pct - pin_prob_at_flag (true CLV)
         _pin_at_flag  = b.get("pin_prob_at_flag")
         _closing_pin  = b.get("closing_pin_pct")
@@ -2305,13 +2305,14 @@ def _get_performance(since: Optional[str] = None) -> dict:
         else:
             by_type[label]["lost"] += 1
             by_type[label]["units"].append(-1.0)
-        # Expected win rate = average model-implied win probability (side-specific
-        # `fair`) over the SAME live bets that produce win_rate. Comparing the two
-        # is the calibration check surfaced per market type (actual << expected =
-        # overconfident model, e.g. Total Bases).
-        _fair_v = b.get("fair")
-        if _fair_v is not None:
-            by_type[label]["fairs"].append(_fair_v)
+        # Expected win rate = average KALSHI-implied win probability (the side
+        # price we PAID) over the same live bets that produce win_rate. This is
+        # the break-even rate: Win Rate above it = beating the market price we
+        # paid, which is exactly what drives flat units. (Kalshi-implied, not the
+        # Pinnacle model fair — those differ by the edge we captured at entry.)
+        _ki_v = b.get("kalshi_price")
+        if _ki_v is not None:
+            by_type[label]["kalshi_implied"].append(_ki_v)
         if kp is not None:
             by_type[label]["kelly"].append(kp)
         if _pin_drift_v is not None:
@@ -2335,8 +2336,8 @@ def _get_performance(since: Optional[str] = None) -> dict:
         avg_pin_drift_t = round(sum(d["pin_drifts"]) / len(d["pin_drifts"]), 2) if d["pin_drifts"] else None
         # Total flat units ($1 on every bet) for this market type
         total_units_t   = round(sum(d["units"]), 2) if d["units"] else None
-        # Expected win rate — avg model-implied win prob for this type's live bets
-        expected_wr_t   = round(sum(d["fairs"]) / len(d["fairs"]) * 100, 1) if d["fairs"] else None
+        # Expected win rate — avg KALSHI-implied win prob (price paid = break-even)
+        expected_wr_t   = round(sum(d["kalshi_implied"]) / len(d["kalshi_implied"]) * 100, 1) if d["kalshi_implied"] else None
         type_breakdown.append({
             "label":             label,
             "won":               d["won"],
@@ -5449,8 +5450,8 @@ function renderPerformance(d) {
       const ewr    = t.expected_win_rate;
       const expGap = (ewr != null && t.win_rate != null && !insuf && !isShadowRow) ? (t.win_rate - ewr) : null;
       const expTitle = expGap != null
-        ? `Model expected ${ewr}% wins; actual ${t.win_rate}% (${expGap >= 0 ? '+' : ''}${expGap.toFixed(1)}pp). Actual well below expected = model overconfident on this type.`
-        : 'Average model-implied win probability for this market type (what the model predicted at flag time).';
+        ? `Kalshi-implied ${ewr}% (avg price paid = break-even); actual ${t.win_rate}% (${expGap >= 0 ? '+' : ''}${expGap.toFixed(1)}pp). Win Rate above this = beating the market price you paid, which drives flat units.`
+        : 'Average Kalshi-implied win probability for this market type — the price you paid, i.e. the break-even win rate.';
       const expCell = ewr != null
         ? `<span style="color:var(--muted);" title="${expTitle}">${ewr}%</span>`
         : '—';
@@ -5490,7 +5491,7 @@ function renderPerformance(d) {
         <thead><tr>
           <th>Market Type</th><th class="num">Won</th><th class="num">Lost</th>
           <th class="num">Win Rate</th>
-          <th class="num" title="Average model-implied win probability for this market type — what the model predicted at flag time. Compare to Win Rate: actual well below expected = model overconfident on this type (e.g. Total Bases).">Expected</th>
+          <th class="num" title="Average Kalshi-implied win probability for this market type — the price you paid, i.e. the break-even win rate. Win Rate ABOVE this = beating the market price you paid (what drives flat units); below = losing to the price.">Expected</th>
           <th class="num" title="Kelly P&amp;L as % of bankroll (hover for dollar amount)">Kelly P&amp;L (% bank)</th>
           <th class="num" title="Total flat units — net profit per market type if you'd staked $1 on every bet. Bet-size-agnostic pick quality.">Total Units</th>
         </tr></thead>

@@ -543,10 +543,125 @@ def american_to_implied(odds: float) -> float:
 
 
 def no_vig_prob(odds_a: float, odds_b: float) -> Tuple[float, float]:
-    """Return (p_a, p_b) after removing bookmaker vig."""
+    """Return (p_a, p_b) after removing bookmaker vig — PROPORTIONAL method.
+
+    Divides each side's raw implied probability by their sum, implicitly
+    assuming the book spreads margin evenly across both sides. This is what
+    LIVE pricing uses. It carries a favorite-longshot bias (overstates the
+    longshot, understates the favorite; worst on lopsided lines) — the reason
+    shin_devig_prob / power_devig_prob exist below.
+    """
     pa = american_to_implied(odds_a)
     pb = american_to_implied(odds_b)
     total = pa + pb
+    return pa / total, pb / total
+
+
+# ── Alternative de-vig methods — NOT wired into live pricing ──────────────────
+# Added 2026-07-14 for the forward-capture de-vig study. Live pricing still uses
+# no_vig_prob (proportional). These exist so the OFFLINE backtest (and a possible
+# future go-live) can recompute fair value under Shin / power de-vig from the raw
+# odds we now capture per bet (see devig_inputs). Do NOT call these from the
+# scan/pricing path — the whole point of the study is to keep proportional live
+# and compare methods out-of-sample before changing anything.
+def shin_devig_prob(odds_a: float, odds_b: float, _iters: int = 60) -> Tuple[float, float]:
+    """Shin's method: models the overround as the book pricing against informed
+    money (fraction z), solved by bisection so sum(p_i) = 1:
+        p_i(z) = [sqrt(z^2 + 4(1-z)*pi_i^2/S) - z] / (2(1-z)),  S = sum(pi_i).
+    Shrinks the longshot side and inflates the favorite vs proportional,
+    correcting the favorite-longshot bias; ~identical to proportional at a
+    coin-flip line. Falls back to proportional if there's no overround (S<=1)
+    or the bisection can't bracket a root (a real failure mode on 2-outcome
+    markets — Shin was built for multi-runner books; flagged, not hidden)."""
+    pi_a = american_to_implied(odds_a)
+    pi_b = american_to_implied(odds_b)
+    S = pi_a + pi_b
+    if S <= 1.0:
+        return no_vig_prob(odds_a, odds_b)
+
+    def p_i(pi: float, z: float) -> float:
+        if z >= 1.0 - 1e-12:
+            return (pi * pi) / S
+        return (math.sqrt(z * z + 4.0 * (1.0 - z) * (pi * pi) / S) - z) / (2.0 * (1.0 - z))
+
+    def f(z: float) -> float:
+        return p_i(pi_a, z) + p_i(pi_b, z) - 1.0
+
+    lo, hi = 0.0, 1.0 - 1e-9
+    f_lo, f_hi = f(lo), f(hi)
+    if f_lo * f_hi > 0:
+        return no_vig_prob(odds_a, odds_b)   # no bracketed root — bail to proportional
+    for _ in range(_iters):
+        mid = (lo + hi) / 2.0
+        f_mid = f(mid)
+        if f_lo * f_mid <= 0:
+            hi, f_hi = mid, f_mid
+        else:
+            lo, f_lo = mid, f_mid
+    pa, pb = p_i(pi_a, (lo + hi) / 2.0), p_i(pi_b, (lo + hi) / 2.0)
+    total = pa + pb
+    if total <= 0:
+        return no_vig_prob(odds_a, odds_b)
+    return pa / total, pb / total
+
+
+def shin_z(odds_a: float, odds_b: float, _iters: int = 60) -> Optional[float]:
+    """Return the fitted Shin z (informed-money fraction) for a two-way line, or
+    None if it can't be bracketed. Exposed for the instability audit — z near 0
+    means ~no correction (Shin ≈ proportional); z<0 or undefined is the 2-outcome
+    failure mode we want to count rather than silently swallow."""
+    pi_a = american_to_implied(odds_a)
+    pi_b = american_to_implied(odds_b)
+    S = pi_a + pi_b
+    if S <= 1.0:
+        return 0.0
+
+    def p_i(pi: float, z: float) -> float:
+        if z >= 1.0 - 1e-12:
+            return (pi * pi) / S
+        return (math.sqrt(z * z + 4.0 * (1.0 - z) * (pi * pi) / S) - z) / (2.0 * (1.0 - z))
+
+    def f(z: float) -> float:
+        return p_i(pi_a, z) + p_i(pi_b, z) - 1.0
+
+    lo, hi = 0.0, 1.0 - 1e-9
+    f_lo, f_hi = f(lo), f(hi)
+    if f_lo * f_hi > 0:
+        return None
+    for _ in range(_iters):
+        mid = (lo + hi) / 2.0
+        f_mid = f(mid)
+        if f_lo * f_mid <= 0:
+            hi, f_hi = mid, f_mid
+        else:
+            lo, f_lo = mid, f_mid
+    return (lo + hi) / 2.0
+
+
+def power_devig_prob(odds_a: float, odds_b: float, _iters: int = 80) -> Tuple[float, float]:
+    """Power (logarithmic) method: find exponent k with pi_a^k + pi_b^k = 1, then
+    p_i = pi_i^k. Also de-biases lopsided lines (favorite-longshot) but has no
+    'z' parameter and no sqrt/near-singular term, so it can't blow up the way
+    Shin can on 2-outcome markets — the lower-numerical-risk comparison. Since
+    each pi<1, the sum is monotone decreasing in k, so a unique k>=1 exists
+    whenever S>1; solved by bisection."""
+    pi_a = american_to_implied(odds_a)
+    pi_b = american_to_implied(odds_b)
+    S = pi_a + pi_b
+    if S <= 1.0 or pi_a <= 0 or pi_b <= 0:
+        return no_vig_prob(odds_a, odds_b)
+    lo, hi = 1.0, 50.0
+    for _ in range(_iters):
+        k = (lo + hi) / 2.0
+        if pi_a ** k + pi_b ** k > 1.0:
+            lo = k
+        else:
+            hi = k
+    k = (lo + hi) / 2.0
+    pa, pb = pi_a ** k, pi_b ** k
+    total = pa + pb
+    if total <= 0:
+        return no_vig_prob(odds_a, odds_b)
     return pa / total, pb / total
 
 
@@ -2354,6 +2469,15 @@ def build_all_player_props(
                         "books_used":        list(book_probs.keys()),
                         "books_detail":      book_probs,
                         "per_book_lambdas":  per_book_lambdas,
+                        # RAW per-book over/under American odds at this line — the
+                        # lossy-lost input for the de-vig study. Carried into the
+                        # edge's devig_inputs (TB-only at that stage) so Shin/power
+                        # fair can be recomputed offline. Live pricing unaffected.
+                        "raw_odds":          {
+                            bk: {"over": be.get("over_price"), "under": be.get("under_price")}
+                            for bk, be in book_entries.items()
+                            if be.get("over_price") is not None and be.get("under_price") is not None
+                        },
                     }
 
                 if not line_entries:
@@ -2720,6 +2844,19 @@ def scan_player_props(
             "books_used":           matched.get("books_used", []),
             "books_detail":         books_detail,
             "per_book_novig":       prop_per_book,
+            # De-vig study (2026-07-14): TB-ONLY per user directive — Strikeouts
+            # left as-is (Shin ≈ proportional on K's centered lines, ~0.1pp, so
+            # capturing K adds nothing). For TB (lopsided, favorite-longshot
+            # suspect) capture the raw per-book over/under odds at the matched
+            # Pinnacle line + line + prop_type. With the Kalshi threshold (in the
+            # ticker) this replays the full pipeline offline under proportional/
+            # Shin/power for an out-of-sample calibration comparison. Live TB fair
+            # above is still proportional — capture is observability only.
+            "devig_inputs":         (
+                {"line": matched["line"], "prop_type": prop_type,
+                 "raw_odds": matched.get("raw_odds", {})}
+                if prop_type == "batter_total_bases" else None
+            ),
             "consensus_yes":        prop_cons_yes,
             "consensus_no":         prop_cons_no,
             "consensus_yes_american": prob_to_american(prop_cons_yes),

@@ -1373,6 +1373,14 @@ def _add_new_bets(edges: list) -> list:
                 # analysis. None for non-TB. Within post-fix TB, the shadow flag +
                 # fair split staked (calibrated band) from shadowed (overconfident tail).
                 "tb_cohort":          ("post_fix_20260714" if _tb_ticker else None),
+                # De-vig study forward-capture (2026-07-14): raw per-book over/under
+                # odds at flag time — the lossy-lost input needed to backtest
+                # proportional vs Shin vs power de-vig OUT-OF-SAMPLE as bets settle.
+                # TB-ONLY (per user directive): the scanner populates this only for
+                # batter_total_bases; None for Strikeouts and everything else, which
+                # are left as-is (Shin≈proportional on K's centered lines). Live
+                # pricing unchanged (still proportional) — observability only.
+                "devig_inputs":       e.get("devig_inputs"),
             }
 
             _bets.append(new_bet)

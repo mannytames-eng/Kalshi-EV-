@@ -649,6 +649,31 @@ for _b in _bets:
         _data_fixed = True
         print("  Resolved Mitchell NO as WON (under 3.5 assists TOR@CLE Apr 29)")
 
+# --- 2026-07-14: three Strikeout bets that Kalshi settled with result="scalar"
+#     (not yes/no) were booked as LOSSES by the pre-void-fix resolver (which
+#     treated any non-yes/no result as a loss). Confirmed mis-bookings by the
+#     Strikeout settlement audit; the void-fix shipped earlier today now handles
+#     this class going forward, but these three settled before it went live.
+#     User-authorized retroactive correction (explicit override of the usual
+#     freeze-settled-bets rule for this specific bug): re-log as VOID — no
+#     win/loss, no P&L, stake freed — matching the forward void-fix's fields.
+#     Idempotent: the status=="lost" gate stops it re-firing once voided.
+_scalar_void_ids = {
+    "KXMLBKS-26JUN211420TORCHC-CHCSIMANAGA18-5|NO",
+    "KXMLBKS-26JUN171845TORBOS-TORMSCHERZER31-4|YES",
+    "KXMLBKS-26JUN141340DETCLE-CLEGWILLIAMS32-8|YES",
+}
+for _b in _bets:
+    if _b.get("id") in _scalar_void_ids and _b.get("status") == "lost":
+        _b["status"]      = "void"
+        _b["resolved_by"] = "kalshi_void"
+        _b["pnl"]         = 0.0
+        _b["paper_pnl"]   = 0.0
+        _b["void_result"] = "scalar"
+        _b["_note"]       = "Retroactive void 2026-07-14: Kalshi result=scalar, mis-booked as loss by the pre-void-fix resolver."
+        _data_fixed = True
+        print(f"  Voided scalar-settled bet {_b['id']} (was lost → void, stake freed)")
+
 for _b in _bets:
     # TB @ PIT: paper_pnl was set incorrectly via manual_correction
     if _b.get("id") == "KXMLBTOTAL-26APR181605TBPIT-8|YES" and _b.get("paper_pnl") != 25.03:

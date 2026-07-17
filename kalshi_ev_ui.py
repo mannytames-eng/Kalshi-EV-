@@ -2543,7 +2543,14 @@ def _get_performance(since: Optional[str] = None) -> dict:
 
 
 # ── Twilio SMS alerts ─────────────────────────────────────────────────────────
-_ALERT_MIN    = float(os.getenv("ALERT_MIN_EDGE", "0.020"))  # Discord alerts at ≥2.0% edge (matches EDGE_THRESHOLD)
+# Hardcoded to EDGE_THRESHOLD, not independently configurable. Was previously
+# `float(os.getenv("ALERT_MIN_EDGE", "0.020"))` — a stale Railway env var
+# (ALERT_MIN_EDGE=0.03) silently overrode the 0.02 default, so every bet
+# flagged/staked between 2.0-2.9% edge was going out with NO Discord alert
+# (confirmed live 2026-07-17: 9 of the last 10 non-shadow bets sat in that
+# gap). The env var is now ignored entirely so this class of drift can't
+# recur — _ALERT_MIN can only ever equal the real bet-flagging threshold.
+_ALERT_MIN    = EDGE_THRESHOLD    # Discord alerts at >= the actual bet-flagging threshold, always in sync
 _BET_SIZE     = float(os.getenv("ALERT_BET_SIZE", "20"))
 
 # ── Discord webhook alert config ───────────────────────────────────────────────
@@ -2732,9 +2739,14 @@ def _alert_top10(newly_logged: list = None):
 
     min_edge = _ALERT_MIN
 
-    # Primary: bets logged this cycle
+    # Primary: bets logged this cycle. Excludes shadow bets ($0 stake, not a
+    # real position) — the retry safety net below already excluded them; this
+    # path didn't, so a shadow bet (TB overconfident-tail, WNBA, MLB
+    # moneyline) clearing edge threshold could fire a "new bet" alert for a
+    # position that was never actually staked. Fixed 2026-07-17 for consistency.
     this_cycle = sorted(
-        [b for b in (newly_logged or []) if b.get("edge_pct", 0) >= min_edge * 100],
+        [b for b in (newly_logged or [])
+         if b.get("edge_pct", 0) >= min_edge * 100 and not b.get("shadow")],
         key=lambda x: x.get("edge_pct", 0), reverse=True,
     )
 

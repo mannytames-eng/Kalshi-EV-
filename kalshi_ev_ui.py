@@ -219,18 +219,31 @@ def _props_refresh_interval() -> int:
 WNBA_WINDOW_START_H = 15   # 3pm PDT
 WNBA_WINDOW_END_H   = 22   # 10pm PDT
 
-# ── WNBA scanning — PAUSED 2026-07-14 ─────────────────────────────────────────
+# ── WNBA scanning — paused 2026-07-14, GAME LINES resumed 2026-07-17 ─────────
 # Three days of live scanning (2026-07-10 to -13) found zero player-prop edges;
 # root cause was Pinnacle posting only one line per player with no alternates
 # for basketball props, so it could only match Kalshi's multi-rung ladder by
 # luck (~5-6 of 18 players/scan). A DraftKings+FanDuel retail-consensus
-# fallback was drafted to work around that but scrapped before shipping.
-# Single kill switch: turns off odds refresh + props scan with zero Odds API
-# credit spend, code stays in place for a possible future revisit. Does NOT
-# touch the one already-open WNBA bet (Sparks @ Dream total) — that still
-# settles normally via the existing pre-close CLV pipeline; this only stops
-# looking for new edges.
-WNBA_SCANNING_ENABLED = False
+# fallback was drafted to work around that but scrapped before shipping. That
+# root cause is UNCHANGED — props stay off via the separate flag below.
+#
+# WNBA_SCANNING_ENABLED now gates spread/total (KXWNBASPREAD/KXWNBATOTAL) only
+# — those match on a direct Pinnacle line the same way MLB spread/total do and
+# never showed the prop-ladder matching failure. Re-enabled 2026-07-17 in
+# SHADOW MODE (KXWNBA is in SHADOW_MARKETS below) — tracked, $0 staked, earns
+# its own CLV evidence before real capital, since WNBA game lines have zero
+# prior track record of their own (the paused run was prop-heavy).
+#
+# WNBA_PROPS_ENABLED stays False — deliberately NOT re-enabled alongside game
+# lines. Nothing has fixed the Pinnacle thin-line problem; flipping it back on
+# would very likely just repeat the 3-day zero-edge result and burn Odds API
+# credits for a known outcome. Flip only after a real fix (e.g. the scrapped
+# DK/FD retail-consensus fallback, redesigned) ships.
+#
+# Neither flag touches the one already-open WNBA bet (Sparks @ Dream total) —
+# that still settles normally via the existing pre-close CLV pipeline.
+WNBA_SCANNING_ENABLED = True
+WNBA_PROPS_ENABLED    = False
 
 def _all_wnba_games_commenced() -> bool:
     """Return True when a confirmed fetch shows zero WNBA games today — either
@@ -263,12 +276,17 @@ def _wnba_props_refresh_interval() -> int:
     """Seconds between WNBA props scans. Same evening window as odds, slower
     cadence since props cost 1.5x more per event than the 2-market MLB cost.
 
+    Gated on WNBA_PROPS_ENABLED specifically (not just WNBA_SCANNING_ENABLED)
+    — game lines resumed 2026-07-17 but props stay off; the Pinnacle thin-line
+    problem that caused the original pause is unfixed. See WNBA_SCANNING_ENABLED
+    comment above.
+
     Zero-game short-circuit: safe to go fully off here (unlike the odds
     function above) — this is polled inline from the always-running main
     scan loop, not a dedicated skip-the-fetch background thread, so it
     re-opens on its own the next cycle after the odds refresh above detects
     play has resumed."""
-    if not WNBA_SCANNING_ENABLED:
+    if not WNBA_SCANNING_ENABLED or not WNBA_PROPS_ENABLED:
         return 10 ** 9
     h = _pdt_hour()
     if _all_wnba_games_commenced():

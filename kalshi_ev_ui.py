@@ -750,6 +750,44 @@ for _b in _bets:
         _b["clv_source"] = "kalshi"
         _data_fixed = True
 
+# --- WNBA CLV bug retroactive correction (2026-07-17) ---
+# closing_yes_pct was captured from LIVE in-game Kalshi prices, not a real
+# pre-game closing line, because WNBA tickers don't encode start time and
+# game_time was stored as None on every WNBA bet — this silently broke the
+# CLV freeze-trigger (see _capture_clv_prices / commence_time root-cause fix,
+# same commit). Re-derived from Kalshi's own 1-min candlestick history: the
+# last stable pre-tipoff price immediately before the in-game price break.
+# WSHTOR verified against the real commence_time from the Odds API (23:02:59Z
+# — matches the break starting 23:04:00Z exactly); LAATL's date fell outside
+# the Odds API's lookback window, so it's confirmed via the price-behavior
+# regime change itself (flat ~52-56c through 23:07, breaks at 23:12). The true
+# PINNACLE closing value was never captured for either bet (same root-cause
+# bug, Pinnacle side) and is NOT recoverable — the Odds API has no historical-
+# odds endpoint — so CLV is recomputed Kalshi-only (entry vs corrected close,
+# same instrument); clv_source relabeled "kalshi" (was misleadingly "pin").
+# Both bets side=NO: clv = entry_yes - close_yes. Shadow bets, $0 staked —
+# correction affects the CLV evidence pool only, not P&L.
+_wnba_clv_fix = {
+    # id: (corrected closing_yes_pct, corrected clv)
+    "KXWNBATOTAL-26JUL14WSHTOR-171|NO": (54.0, 1.0),   # was 12.0 / +43.0 (in-game collapse)
+    "KXWNBATOTAL-26JUL13LAATL-180|NO":  (55.0, 0.0),   # was 90.0 / -35.0 (in-game spike)
+}
+for _b in _bets:
+    _fix = _wnba_clv_fix.get(_b.get("id", ""))
+    if _fix and _b.get("clv") != _fix[1]:
+        _cy, _clv = _fix
+        _ek = (_b.get("kalshi_price") or 0) * 100
+        _b["closing_yes_pct"] = _cy
+        _b["clv"]             = _clv
+        _b["clv_pct"]         = round((_clv / _ek) * 100, 2) if _ek else None
+        _b["clv_source"]      = "kalshi"
+        _b["_note"]           = ("Retroactive correction 2026-07-17: closing_yes_pct was an "
+                                  "in-game price (CLV freeze-trigger broken by missing "
+                                  "game_time), re-derived from Kalshi candlestick history at "
+                                  "the true pre-tipoff price.")
+        _data_fixed = True
+        print(f"  Corrected WNBA CLV bug: {_b['id']} closing_yes_pct -> {_cy}, clv -> {_clv:+.1f}")
+
 # --- Systemic fix: upgrade clv_source="kalshi" → "pin_entry" for any bet
 #     that has pin_prob_at_flag but no true Pinnacle close captured yet ---
 for _b in _bets:
@@ -1375,8 +1413,17 @@ def _add_new_bets(edges: list) -> list:
                 "pin_line_at_flag":   e.get("pin_line"),      # Pinnacle line at detection (e.g. 8.0)
                 "kalshi_line_at_flag": e.get("kalshi_line"),  # Kalshi threshold at detection (e.g. 8.5)
                 "flagged_at":         datetime.now(timezone.utc).isoformat(),
-                "game_time":          _parse_ticker_start_time(e["ticker"]).isoformat()
-                                      if _parse_ticker_start_time(e["ticker"]) else None,
+                # Prefer the ticker-parsed start time (MLB — precise to the minute).
+                # Falls back to the edge's commence_time (Pinnacle-sourced) for
+                # sports whose ticker omits start time entirely (WNBA/NBA) — was
+                # always None for those before 2026-07-17, which broke the CLV
+                # freeze-trigger fallback chain (see _capture_clv_prices) and let
+                # closing_yes_pct keep updating through the live game. Root-cause
+                # fix: populate game_time reliably so that existing fallback logic
+                # (which already prefers bet.get("game_time")) works as designed.
+                "game_time":          (_parse_ticker_start_time(e["ticker"]).isoformat()
+                                      if _parse_ticker_start_time(e["ticker"])
+                                      else e.get("commence_time")),
                 "status":             "open",
                 "resolved_at":        None,
                 "pnl":                None,
@@ -3853,6 +3900,23 @@ def _capture_clv_prices():
             # reflecting a near-decided outcome, not a true closing line.
             # This is a backstop for the game_start guard above.
             if yes_close_pct >= 92.0 or yes_close_pct <= 8.0:
+                continue
+
+            # Second backstop, added 2026-07-17: reject implausibly large
+            # single-cycle jumps, not just absolute extremes. Two real WNBA
+            # bets (Mystics@Tempo 55->12, Sparks@Atlanta 55->90) both landed
+            # JUST inside the 8-92 bound above while still swinging 35-43pp in
+            # one capture — a jump that size between ~2-min polls is almost
+            # certainly a live score-driven move, not genuine pre-game drift,
+            # even when the absolute level isn't extreme. This guard is
+            # independent of (and redundant with) the game_time/commence_time
+            # root-cause fix — it's a safety net for any future case where
+            # game_start still can't be resolved reliably.
+            _prev_close = bet.get("closing_yes_pct")
+            if _prev_close is not None and abs(yes_close_pct - _prev_close) > 20.0:
+                print(f"  CLV capture: rejected implausible jump for {bet['ticker']} "
+                      f"({_prev_close}->{yes_close_pct}, {abs(yes_close_pct-_prev_close):.1f}pp in one cycle) "
+                      f"— likely in-game, not a closing-line move")
                 continue
 
             # True CLV: compare entry Kalshi price to the last known Pinnacle

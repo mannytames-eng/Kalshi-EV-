@@ -1039,6 +1039,13 @@ def build_consensus_game_index(
         # Key by team+date to handle doubleheaders / same-day games.
         # Also store a bare-team fallback for any code that doesn't have the date.
         info["_game_date"] = game_date   # embed date so _find_game can cross-check
+        # Raw Pinnacle commence_time (ISO, UTC) — the only reliable per-game start
+        # time for sports whose Kalshi ticker omits it (NBA/WNBA; MLB's ticker
+        # already encodes start time via _parse_ticker_start_time and doesn't need
+        # this). Was computed above (ct_str) just to filter/date-key, then
+        # discarded — now persisted so bet-creation can use it as a game_time
+        # fallback instead of leaving game_time=None. See WNBA CLV fix 2026-07-17.
+        info["commence_time"] = ct_str or None
         for team in [home, away]:
             nteam = _norm(team)
             if game_date:
@@ -2255,6 +2262,9 @@ def scan_sport(
                     "is_valid_consensus":   True,                 # always True here — invalids were discarded above
                     "consensus_reason":     consensus_reason,     # e.g. "Confirmed by Pinnacle + DraftKings"
                     "kalshi_price_ts":      now_utc.isoformat(),
+                    # Reliable game start (Pinnacle commence_time) for sports whose
+                    # ticker doesn't encode it (WNBA/NBA) — see game_index fix above.
+                    "commence_time":        game_info.get("commence_time") if game_info else None,
                 })
 
     if no_price_count:

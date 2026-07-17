@@ -463,16 +463,22 @@ def kalshi_prices(mkt: dict) -> Optional[Tuple[float, float]]:
 
 
 # ── The Odds API — multi-book ─────────────────────────────────────────────────
-def fetch_book_odds(sport: str) -> Tuple[List[dict], str]:
+def fetch_book_odds(sport: str, include_h2h: bool = False) -> Tuple[List[dict], str]:
     """
-    Fetch h2h / spreads / totals from Pinnacle only (1 credit per call).
+    Fetch spreads / totals (+ h2h if requested) from Pinnacle only.
     Only sharp-book data is used for fair-value — DK/FanDuel have 0 weight.
+
+    h2h was removed 2026-06 (not used for fair-value, saved ~1 credit/call) and
+    is now opt-in via include_h2h — MLB moneyline (2026-07) needs it for h2h
+    consensus; other callers (WNBA, etc.) default False so they don't pick up
+    the extra ~1 credit/call.
     """
     sharp_books = ",".join(k for k, w in BOOK_WEIGHTS.items() if w > 0)
+    markets = "h2h,spreads,totals" if include_h2h else "spreads,totals"
     r = requests.get(f"{ODDS_BASE}/sports/{sport}/odds", params={
         "apiKey":     ODDS_API_KEY,
         "bookmakers": sharp_books,
-        "markets":    "spreads,totals",   # h2h removed — not used for fair-value, saves ~1 credit/call
+        "markets":    markets,
         "oddsFormat": "american",
     }, timeout=15)
     r.raise_for_status()
@@ -1061,14 +1067,25 @@ def _apply_correlation_control(
 ) -> List[dict]:
     """
     Limit to max_per_group bets per (matchup, mkt_type) group.
+
+    Moneyline is hard-capped at 1 regardless of max_per_group. A spread/total
+    group can legitimately hold 2 different Kalshi thresholds on the same
+    line — but moneyline's two "different" edges (Team A YES, Team B YES) are
+    mutually exclusive outcomes of the SAME game on two SEPARATE ticker
+    markets (no shared-ticker relationship for the existing same-ticker
+    reversal guard to catch). Funding both is a guaranteed-bad double bet, not
+    a hedge. Added 2026-07-14 alongside the MLB moneyline (KXMLBGAME) wiring.
+
     Input should already be sorted by adj. edge descending.
     """
     group_counts: Dict[tuple, int] = {}
     result = []
     for e in edges:
-        key = (e.get("matchup", ""), e.get("mkt_type", ""))
+        mtype = e.get("mkt_type", "")
+        key = (e.get("matchup", ""), mtype)
+        cap = 1 if mtype == "moneyline" else max_per_group
         cnt = group_counts.get(key, 0)
-        if cnt < max_per_group:
+        if cnt < cap:
             group_counts[key] = cnt + 1
             result.append(e)
     return result
@@ -1580,8 +1597,15 @@ def _parse_moneyline_team(
     """
     Parse which team a moneyline Kalshi market refers to from its title.
     Returns the full team name (matching away_name or home_name) or None.
+
+    Prefers yes_sub_title over title. On KXMLBGAME, `title` is the SHARED
+    game-level string ("St. Louis vs Arizona Winner?") — identical across both
+    team markets in an event — while `yes_sub_title` is the team-specific field
+    ("St. Louis" / "Arizona"). Using title first would resolve BOTH markets to
+    whichever team's name appears first in the word-scan fallback, misassigning
+    one of the two. Confirmed live 2026-07-14 against a real KXMLBGAME event.
     """
-    title = (market.get("title") or market.get("yes_sub_title") or "").lower()
+    title = (market.get("yes_sub_title") or market.get("title") or "").lower()
     for name in [away_name, home_name]:
         if name is None:
             continue
@@ -1670,16 +1694,17 @@ def fetch_odds_index(
     odds_sport: str,
     total_range: Tuple[float, float] = (0, 9999),
     spread_limit: float = 99,
+    include_h2h: bool = False,
 ) -> Tuple[Optional[Dict], str]:
     """
     Fetch book odds and build the consensus game index.
-    Costs exactly 1 Odds API credit per call.
+    Costs exactly 1 Odds API credit per call (+1 more if include_h2h=True).
 
     Intended for the slow 30-min refresh loop so the fast 2-min Kalshi
     scan can reuse the cached result without spending credits.
     """
     try:
-        games, remaining = fetch_book_odds(odds_sport)
+        games, remaining = fetch_book_odds(odds_sport, include_h2h=include_h2h)
         index = build_consensus_game_index(games, total_range, spread_limit)
         n = len(index) // max(1, 2)
         print(f"  Odds index refreshed [{odds_sport}]: {n} matchups  "
@@ -1701,6 +1726,7 @@ def scan_sport(
     total_std: float,
     game_index: Optional[Dict] = None,   # pass cached index to skip Odds API call
     ml_series: str = "",                 # Kalshi moneyline series (optional)
+    include_h2h: bool = False,           # fetch h2h for moneyline fair value (fallback-fetch path only; live path passes h2h via the cached game_index)
 ) -> List[dict]:
     """
     Scan one sport's Kalshi spread, total, and optionally moneyline markets
@@ -1725,7 +1751,8 @@ def scan_sport(
         try:
             if "baseball" in odds_sport:
                 game_index, remaining = fetch_odds_index(
-                    odds_sport, total_range=(5.0, 14.0), spread_limit=3.0
+                    odds_sport, total_range=(5.0, 14.0), spread_limit=3.0,
+                    include_h2h=include_h2h,
                 )
             else:
                 game_index, remaining = fetch_odds_index(

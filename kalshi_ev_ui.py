@@ -344,6 +344,10 @@ SHADOW_MARKETS: list[str] = [
     "KXWNBA",   # WNBA added 2026-07-10 — zero track record, shadow until it
                 # earns its own CLV evidence like MLB did. Covers spread/total/
                 # props (KXWNBASPREAD, KXWNBATOTAL, KXWNBAPTS, KXWNBAREB, KXWNBAAST).
+    "KXMLBGAME",  # MLB moneyline added 2026-07-14 — real series (KXMLBML never
+                  # resolved), h2h fetch + team-parsing + same-game-double-bet
+                  # guard newly wired. Zero track record; shadow until it earns
+                  # its own CLV evidence like WNBA/TB did.
 ]
 
 def _is_shadow(ticker: str) -> bool:
@@ -2987,7 +2991,8 @@ def _run_odds_refresh():
 
     try:
         mlb_idx, _ = fetch_odds_index(
-            "baseball_mlb", total_range=(5.0, 14.0), spread_limit=3.0
+            "baseball_mlb", total_range=(5.0, 14.0), spread_limit=3.0,
+            include_h2h=True,   # moneyline (KXMLBGAME), shadow mode — 2026-07-14
         )
         if mlb_idx is not None:
             n_games = len(mlb_idx) // max(1, 2)
@@ -3118,12 +3123,16 @@ def _run_scan():
                 _state["scanning"] = False
             return
 
-        # MLB spreads + totals — ML removed (not used for fair-value)
+        # MLB spreads + totals + moneyline (KXMLBGAME, shadow mode — 2026-07-14).
+        # KXMLBML (the old guess) never resolved on Kalshi; KXMLBGAME is the
+        # real per-game moneyline series, confirmed live. Shadowed via
+        # SHADOW_MARKETS until it earns its own CLV track record, same pattern
+        # as WNBA/TB.
         mlb, mlb_stats, mlb_snapshot = scan_sport(
-            label="MLB — Spread & Totals",
+            label="MLB — Spread, Totals & Moneyline",
             spread_series="KXMLBSPREAD",
             total_series="KXMLBTOTAL",
-            ml_series=None,
+            ml_series="KXMLBGAME",
             odds_sport="baseball_mlb",
             abbr_map=MLB_ABBR,
             spread_std=MLB_SPREAD_STD,

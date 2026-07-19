@@ -886,6 +886,28 @@ for _b in _bets:
         _b.pop("correlation_reason", None)
         _data_fixed = True
 
+# Fix: Jesús Luzardo 7+ Ks (Jul 18) — ticker-encoded game time (20:05 UTC) was
+# a full hour later than the real MLB-scheduled start (19:05 UTC, verified
+# against statsapi.mlb.com's own game feed). The CLV freeze mechanism trusts
+# the ticker time as its "stop treating this as pre-game" boundary, so it kept
+# polling and overwriting closing_yes_pct for an extra hour into the actual
+# live game before finally freezing — the recorded close (75c, up from a 53c
+# entry) is real Kalshi price data, but it reflects the market reacting to
+# Luzardo's actual in-game strikeouts, not a genuine pre-game closing line.
+# Scoped 2026-07-19 across all 181 settled MLB prop bets with a parseable
+# ticker time: this is the only one with a >=15min ticker-vs-real-schedule
+# mismatch (one other candidate, JR Ritchie, was a false positive from a
+# doubleheader / same-day-two-games disambiguation bug in the scoping script
+# itself, not a real production issue) — isolated case, not systemic, so
+# tagging this one bet rather than building broader ticker-vs-schedule
+# cross-checking. Win/loss and P&L are untouched (correctly won, +$10.79) —
+# only the CLV fields are unreliable here.
+_luzardo_corrupt_id = "KXMLBKS-26JUL181605NYMPHI-PHIJLUZARDO44-7|YES"
+for _b in _bets:
+    if _b.get("id") == _luzardo_corrupt_id and _b.get("clv_source") != "corrupted_utc":
+        _b["clv_source"] = "corrupted_utc"
+        _data_fixed = True
+
 # Fix: Josh Lowe 2+ TB (Jul 8), still open at deploy time — resize to the new
 # TB_HIGH_EDGE_CAP (1.5%) now that the high-edge TB cap has shipped. Was staked
 # at the general 3% cap ($24.64 off a lower live balance); recomputed here on

@@ -891,21 +891,29 @@ for _b in _bets:
 # against statsapi.mlb.com's own game feed). The CLV freeze mechanism trusts
 # the ticker time as its "stop treating this as pre-game" boundary, so it kept
 # polling and overwriting closing_yes_pct for an extra hour into the actual
-# live game before finally freezing — the recorded close (75c, up from a 53c
-# entry) is real Kalshi price data, but it reflects the market reacting to
-# Luzardo's actual in-game strikeouts, not a genuine pre-game closing line.
-# Scoped 2026-07-19 across all 181 settled MLB prop bets with a parseable
-# ticker time: this is the only one with a >=15min ticker-vs-real-schedule
-# mismatch (one other candidate, JR Ritchie, was a false positive from a
-# doubleheader / same-day-two-games disambiguation bug in the scoping script
-# itself, not a real production issue) — isolated case, not systemic, so
-# tagging this one bet rather than building broader ticker-vs-schedule
-# cross-checking. Win/loss and P&L are untouched (correctly won, +$10.79) —
-# only the CLV fields are unreliable here.
-_luzardo_corrupt_id = "KXMLBKS-26JUL181605NYMPHI-PHIJLUZARDO44-7|YES"
+# live game before finally freezing at 20:05 UTC — the previously-recorded
+# close (75c) is real Kalshi price data, but it reflects the market reacting
+# to Luzardo's actual in-game strikeouts, not a genuine pre-game closing line.
+# Corrected (not just excluded) using Kalshi's own public candlestick history
+# for this settled market: price was flat in the 53-55c band the entire
+# pre-game window, sitting at yes_ask=53c (bid=52c) right at the REAL game
+# start (19:05 UTC) — essentially unchanged from the 53c entry. Live-game
+# volatility (52->38->75c on heavy volume) only starts after 19:11 UTC,
+# confirming the 75c figure was captured well into the game. Scoped
+# 2026-07-19 across all 181 settled MLB prop bets with a parseable ticker
+# time: this is the only one with a >=15min ticker-vs-real-schedule mismatch
+# (one other candidate, JR Ritchie, was a false positive from a doubleheader
+# disambiguation bug in the scoping script itself) — isolated, not systemic.
+# Win/loss and P&L untouched (correctly won, +$10.79); only closing_yes_pct
+# and the derived true-CLV figure needed correcting. closing_pin_pct is left
+# as-is (57.1, the last legitimate pre-game Pinnacle reading) — no verified
+# historical Pinnacle price exists to improve on it the way Kalshi's
+# candlesticks did for the Kalshi side.
+_luzardo_fix_id = "KXMLBKS-26JUL181605NYMPHI-PHIJLUZARDO44-7|YES"
 for _b in _bets:
-    if _b.get("id") == _luzardo_corrupt_id and _b.get("clv_source") != "corrupted_utc":
-        _b["clv_source"] = "corrupted_utc"
+    if _b.get("id") == _luzardo_fix_id and _b.get("closing_yes_pct") != 53.0:
+        _b["clv_source"] = "pin"
+        _b["closing_yes_pct"] = 53.0   # verified via Kalshi candlesticks: yes_ask at 19:05 UTC (real game start)
         _data_fixed = True
 
 # Fix: Josh Lowe 2+ TB (Jul 8), still open at deploy time — resize to the new

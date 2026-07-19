@@ -866,6 +866,26 @@ for _b in _bets:
         _b.pop("correlation_reason", None)
         _data_fixed = True
 
+# Fix: Tarik Skubal 9+ Ks (Jul 18) — same bug that hit Grant Holmes above, same
+# root cause: the reversal logic in _add_new_bets() correctly demoted the stale
+# NO (flagged 15:02 UTC) and promoted the fresh YES (flagged 17:52 UTC, Pinnacle
+# moved 42.1%->49.2% toward YES between flags), but a server restart re-ran the
+# "highest Kalshi price wins" open-bet dedup block below, which has no awareness
+# of the reversal and flipped it back (NO was priced higher, 53c vs 45c). Root
+# cause fixed below (that block now skips bets a reversal already decided); this
+# restores the two open Skubal bets to the reversal logic's original call.
+_skubal_stale_id = "KXMLBKS-26JUL182207DETLAA-DETTSKUBAL29-9|NO"
+_skubal_fresh_id  = "KXMLBKS-26JUL182207DETLAA-DETTSKUBAL29-9|YES"
+for _b in _bets:
+    if _b.get("id") == _skubal_stale_id and not _b.get("correlated"):
+        _b["correlated"] = True
+        _b["correlation_reason"] = "Superseded by opposite-side edge on the same market — Pinnacle reversed toward YES after this bet was flagged"
+        _data_fixed = True
+    if _b.get("id") == _skubal_fresh_id and _b.get("correlated"):
+        _b["correlated"] = False
+        _b.pop("correlation_reason", None)
+        _data_fixed = True
+
 # Fix: Josh Lowe 2+ TB (Jul 8), still open at deploy time — resize to the new
 # TB_HIGH_EDGE_CAP (1.5%) now that the high-edge TB cap has shipped. Was staked
 # at the general 3% cap ($24.64 off a lower live balance); recomputed here on
@@ -1042,6 +1062,16 @@ if not any(_b.get("_settled_revert") == _REVERT_VERSION
         print(f"  Settled revert: restored {_rev} same-player bet(s) to original (first-flagged) classification")
 
 # Ongoing: most-probable (highest price) line on OPEN bets only — settled frozen.
+# Root-cause fix (2026-07-19): this block runs on every server restart and was
+# silently overwriting decisions already made by the same-ticker-opposite-side
+# reversal logic in _add_new_bets() — which is Pinnacle-aware (it knows which
+# direction the line actually moved) vs this block's blunt "higher price wins"
+# heuristic. Hit Grant Holmes and then Tarik Skubal the same way: reversal logic
+# correctly demoted a stale bet with a reason attached, then this block flipped
+# it back on the next restart, leaving the reason text describing a decision
+# that was no longer in effect. Skip any group where a bet already carries a
+# correlation_reason — that means the reversal logic already adjudicated this
+# slot with better information than price alone, so defer to it.
 _open_pp = _dd_corr(list)
 for _b in _bets:
     if (_b.get("mkt_type") != "prop" or _b.get("shadow") or _b.get("status") != "open"):
@@ -1051,6 +1081,8 @@ _dedup_count = 0
 for _grp in _open_pp.values():
     if len(_grp) < 2:
         continue
+    if any(_b.get("correlation_reason") for _b in _grp):
+        continue   # reversal logic already decided this slot -- defer to it
     _grp.sort(key=lambda x: -(x.get("kalshi_price") or 0))   # highest price kept
     if _grp[0].get("correlated"):
         _grp[0]["correlated"] = False; _dedup_count += 1

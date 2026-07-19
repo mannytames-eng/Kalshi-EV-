@@ -1450,6 +1450,16 @@ def _add_new_bets(edges: list) -> list:
                 # are left as-is (Shin≈proportional on K's centered lines). Live
                 # pricing unchanged (still proportional) — observability only.
                 "devig_inputs":       e.get("devig_inputs"),
+                # Negative Binomial overdispersion diagnostic (2026-07-19),
+                # TB-only — see fit_neg_binom_two_point in kalshi_ev_scanner.py.
+                # nb_fair is a parallel fair-value estimate computed from a
+                # dispersion parameter fit off Pinnacle's own two independently
+                # -posted TB lines; None when a fit wasn't available. Not used
+                # for edge_pct/fair/staking anywhere — same forward-capture,
+                # decide-later pattern as devig_inputs above. Compare against
+                # `fair` and realized outcomes once enough bets accumulate.
+                "nb_fair":            e.get("nb_fair"),
+                "nb_fit_params":      e.get("nb_fit_params"),
             }
 
             _bets.append(new_bet)

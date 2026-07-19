@@ -1429,6 +1429,150 @@ def poisson_lambda_from_line(line: float, over_prob: float) -> Optional[float]:
     return lam
 
 
+# ── Negative Binomial model (diagnostic — Total Bases overdispersion check) ──
+# TB is a compound stat (1B/2B/3B/HR summed across at-bats), not a single count
+# process — the live Poisson model implicitly assumes variance == mean, which
+# a compound-hit-type process is unlikely to satisfy. The 2026-07-14 reliability
+# curve found overconfidence growing with the model's own claimed probability
+# (+4.2pp / +15.6pp / +18.3pp across increasing fair bands) — exactly the
+# signature of an underestimated tail from a too-thin (Poisson) distribution.
+#
+# Pinnacle posts multiple lines per TB player (e.g. over 0.5 and over 1.5).
+# The live model independently Poisson-fits a lambda from each line; if the
+# true distribution were Poisson, those lambdas would agree. The functions
+# below use a SECOND observed line as an extra degree of freedom to fit a
+# dispersion parameter directly from market data, instead of assuming
+# Poisson's variance=mean. This is diagnostic-only (see fit_neg_binom_two_point
+# callers) — it does not change live pricing, edges, or staking.
+def neg_binom_pmf(k: int, mu: float, r: float) -> float:
+    """PMF of the Negative Binomial parametrized by mean (mu) and dispersion
+    (r). As r -> infinity this converges to Poisson(mu); smaller r means a
+    fatter (overdispersed) right tail relative to Poisson at the same mean."""
+    if mu <= 0 or r <= 0 or k < 0:
+        return 0.0
+    p = r / (r + mu)
+    log_pmf = (math.lgamma(k + r) - math.lgamma(r) - math.lgamma(k + 1)
+               + r * math.log(p) + k * math.log(1.0 - p))
+    return math.exp(log_pmf)
+
+
+def neg_binom_cdf(n: int, mu: float, r: float) -> float:
+    return sum(neg_binom_pmf(i, mu, r) for i in range(max(0, int(n)) + 1))
+
+
+def _nb_mu_from_line(line: float, over_prob: float, r: float) -> Optional[float]:
+    """For a fixed dispersion r, invert: find mu such that P(X > floor(line))
+    = over_prob. Mirrors poisson_lambda_from_line's bisection with r held
+    constant instead of assuming the Poisson r -> infinity limit."""
+    if not (0.05 < over_prob < 0.95):
+        return None
+    k = int(line)
+    target_cdf = 1.0 - over_prob
+    lo, hi = 0.001, max(line * 8 + 10, 30)
+    for _ in range(80):
+        mid = (lo + hi) / 2
+        if neg_binom_cdf(k, mid, r) > target_cdf:
+            lo = mid
+        else:
+            hi = mid
+    mu = (lo + hi) / 2
+    return mu if mu > 0.05 else None
+
+
+def fit_neg_binom_two_point(
+    line1: float, over_prob1: float, line2: float, over_prob2: float,
+) -> Optional[Tuple[float, float]]:
+    """
+    Fit Negative Binomial (mu, r) from two independently-posted lines for the
+    same player/prop (e.g. Pinnacle's 0.5 and 1.5 total-base lines).
+
+    For a candidate dispersion r, solve for the mu that exactly matches the
+    lower line (inner bisection, same monotonicity as poisson_lambda_from_line
+    for fixed r), then compare the resulting fit's implied probability at the
+    higher line against its actual market value. The implied-hi-prob curve as
+    a function of r is NOT globally monotonic (verified empirically — it can
+    have an interior maximum before decaying toward the Poisson limit at large
+    r, rather than decreasing monotonically all the way to the max-overdispersion
+    end), so this scans a log-spaced grid of r from the Poisson-like end
+    inward to find the first sign change (bracketing the least-overdispersed
+    root when more than one exists), then bisects within that bracket.
+
+    Returns None on degenerate/inconsistent inputs (out-of-range over_probs,
+    a higher line whose over_prob isn't lower than the lower line's, or no
+    sign change found on the grid) — callers must fall back to the live
+    Poisson pricing in that case.
+    """
+    if line2 == line1:
+        return None
+    lo_line, lo_p, hi_line, hi_p = (
+        (line1, over_prob1, line2, over_prob2) if line1 < line2
+        else (line2, over_prob2, line1, over_prob1)
+    )
+    if not (0.05 < lo_p < 0.95) or not (0.05 < hi_p < 0.95):
+        return None
+    if hi_p >= lo_p:
+        return None   # higher line must have lower over-prob for a sane distribution
+
+    def _implied_hi_prob(r: float) -> Optional[float]:
+        mu = _nb_mu_from_line(lo_line, lo_p, r)
+        if mu is None:
+            return None
+        return 1.0 - neg_binom_cdf(int(hi_line), mu, r)
+
+    R_POISSON_LIKE  = 500.0   # large r ~ Poisson limit
+    R_MAX_OVERDISP  = 0.02    # small r ~ heaviest searched overdispersion
+
+    n_grid = 60
+    log_hi, log_lo = math.log10(R_POISSON_LIKE), math.log10(R_MAX_OVERDISP)
+    r_grid = [10 ** (log_hi + t * (log_lo - log_hi) / n_grid) for t in range(n_grid + 1)]
+
+    bracket = None
+    prev_r, prev_val = None, None
+    for r in r_grid:
+        val = _implied_hi_prob(r)
+        if val is None:
+            prev_r, prev_val = r, val
+            continue
+        if prev_val is not None and (prev_val - hi_p) * (val - hi_p) <= 0:
+            bracket = (prev_r, r, prev_val)
+            break
+        prev_r, prev_val = r, val
+    if bracket is None:
+        return None   # no sign change on the grid -- target not reachable this way
+
+    r_lo, r_hi, val_lo = bracket
+    for _ in range(50):
+        r_mid = (r_lo + r_hi) / 2
+        val_mid = _implied_hi_prob(r_mid)
+        if val_mid is None:
+            return None
+        if (val_lo - hi_p) * (val_mid - hi_p) <= 0:
+            r_hi = r_mid
+        else:
+            r_lo, val_lo = r_mid, val_mid
+    r_fit  = (r_lo + r_hi) / 2
+    mu_fit = _nb_mu_from_line(lo_line, lo_p, r_fit)
+    if mu_fit is None:
+        return None
+
+    # Sanity gate: when the market's two lines are consistent with near-Poisson
+    # data, the grid scan can still find a technically-valid but SPURIOUS root
+    # far down in the heavy-overdispersion region (verified empirically: exact
+    # synthetic Poisson data fit to mu=30, r=0.1 instead of correctly finding
+    # no signal). The mean estimate shouldn't swing wildly just because the
+    # dispersion search widened — bound mu_fit to the naive single-line
+    # Poisson lambda from the same lo_line; a large deviation means we've
+    # locked onto that spurious secondary crossing, not a real overdispersion
+    # signal, so reject it and fall back to Poisson.
+    naive_lambda = poisson_lambda_from_line(lo_line, lo_p)
+    if naive_lambda is None:
+        return None
+    if not (0.5 * naive_lambda <= mu_fit <= 2.0 * naive_lambda):
+        return None
+
+    return (mu_fit, r_fit)
+
+
 def fair_spread_prob(threshold: float, mean_margin: float, std: float) -> float:
     return 1 - norm_cdf(threshold, mu=mean_margin, sigma=std)
 
@@ -2529,8 +2673,23 @@ def build_all_player_props(
                         key=lambda L: abs(line_entries[L]["over_prob"] - 0.5),
                     )
 
+                # ── TB-only: Negative Binomial overdispersion diagnostic ────────
+                # Uses the independently-priced lines above (each already fit to
+                # its own Poisson lambda) as two data points to fit a dispersion
+                # parameter directly from the market. Diagnostic only -- not read
+                # by any live pricing path; see fit_neg_binom_two_point docstring.
+                nb_fit = None
+                if mtype == "batter_total_bases" and len(line_entries) >= 2:
+                    _sorted_lines = sorted(line_entries.keys())
+                    _lo_L, _hi_L = _sorted_lines[0], _sorted_lines[-1]
+                    nb_fit = fit_neg_binom_two_point(
+                        _lo_L, line_entries[_lo_L]["over_prob"],
+                        _hi_L, line_entries[_hi_L]["over_prob"],
+                    )
+
                 entry = dict(line_entries[main_line])   # default = main line
                 entry["lines"] = line_entries           # all lines (incl. alternates)
+                entry["nb_fit"] = nb_fit                # (mu, r) diagnostic fit, or None
                 player_lookup.setdefault(player_key, {})[mtype] = entry
 
         fetched += 1
@@ -2694,6 +2853,10 @@ def scan_player_props(
         matched = _find_player_in_title(search_title, prop_sublookup)
         if matched is None:
             continue
+        # Captured before any reassignment below -- the per-line dicts matched
+        # onto in the exact-alternate-line-match step don't carry nb_fit
+        # (only the top-level entry from build_all_player_props does).
+        _nb_fit = matched.get("nb_fit")
 
         # ── Exact alternate-line match ───────────────────────────────────────
         # If Pinnacle posts a real line at the Kalshi threshold (incl. alternate
@@ -2747,6 +2910,20 @@ def scan_player_props(
 
         fair_over  = 1.0 - poisson_cdf(t_int, lam)
         fair_under = 1.0 - fair_over
+
+        # ── TB-only: parallel Negative Binomial fair value (diagnostic) ─────
+        # Computed alongside the live Poisson fair_over above but NEVER used
+        # for fair/edge/raw_edge below -- those stay Poisson-only. Purely for
+        # forward comparison against realized outcomes once enough bets
+        # accumulate, same "capture now, decide later" pattern as the 2026-
+        # 07-15 de-vig study. None when no 2-line fit was available (see
+        # fit_neg_binom_two_point) or this isn't a TB prop.
+        nb_fair_over  = None
+        nb_fair_under = None
+        if _nb_fit is not None:
+            _nb_mu, _nb_r = _nb_fit
+            nb_fair_over  = 1.0 - neg_binom_cdf(t_int, _nb_mu, _nb_r)
+            nb_fair_under = 1.0 - nb_fair_over
 
         # ── Prop lambda sanity check ─────────────────────────────────────────
         # Convert each retail book's lambda to the same Kalshi threshold and
@@ -2823,8 +3000,10 @@ def scan_player_props(
 
         if yes_adj >= no_adj:
             side, k_side, f_side, raw_edge, adj_edge = "YES", yes_ask,     fair_over,  yes_raw, yes_adj
+            nb_f_side = nb_fair_over
         else:
             side, k_side, f_side, raw_edge, adj_edge = "NO",  1 - yes_bid, fair_under, no_raw,  no_adj
+            nb_f_side = nb_fair_under
 
         # Price floor — same rule as game-line scanner
         if k_side < MIN_KALSHI_PRICE:
@@ -2893,6 +3072,19 @@ def scan_player_props(
                 {"line": matched["line"], "prop_type": prop_type,
                  "raw_odds": matched.get("raw_odds", {})}
                 if prop_type == "batter_total_bases" else None
+            ),
+            # Negative Binomial overdispersion diagnostic (2026-07-19), TB-only.
+            # Parallel fair value computed from a dispersion parameter fit off
+            # Pinnacle's own two independently-posted lines -- NOT used for
+            # fair/edge/raw_edge/staking above, which stay Poisson-only. None
+            # when fewer than 2 usable lines were posted or the two-line fit
+            # found no reliable overdispersion signal (see
+            # fit_neg_binom_two_point). Compare against realized outcomes once
+            # enough bets accumulate before ever wiring this into live pricing.
+            "nb_fair":              round(nb_f_side, 4) if nb_f_side is not None else None,
+            "nb_fit_params":        (
+                {"mu": round(_nb_fit[0], 4), "r": round(_nb_fit[1], 4)}
+                if _nb_fit is not None else None
             ),
             "consensus_yes":        prop_cons_yes,
             "consensus_no":         prop_cons_no,

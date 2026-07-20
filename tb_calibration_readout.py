@@ -130,6 +130,64 @@ def main():
                    else "calibrated within noise")
         print(f"  Post-fix funded n={n}: gap {(k/n-claimed)*100:+.1f}pp, p={pv:.3f} → {verdict}")
 
+    recal_readiness(tb)
+
+
+# Gates for wiring an over-haircut recalibration (see design notes in the repo).
+MIN_FIT_N = 50     # min settled overs to fit even a 1-parameter constant haircut
+PLATT_N   = 100    # settled overs before a 2-param logistic/curve fit is worth it
+
+
+def recal_readiness(tb):
+    """Is there enough data to estimate the over-side haircut and wire recal?
+
+    Pricing (`fair`) is UNCHANGED across the 2026-07-14 staking fix (that fix only
+    shadowed bets; de-vig/NB stayed unwired). So ALL settled overs are on the same
+    pricing and pool for estimating the over bias — this is the recal sample, and
+    it includes shadowed overs (they carry real outcomes)."""
+    overs = [b for b in tb if b.get("side") == "YES"
+             and b.get("status") in ("won", "lost") and side_fair(b) is not None]
+    print("\n── RECALIBRATION READINESS (over-haircut) ──")
+    n = len(overs)
+    if n == 0:
+        print("  no settled overs yet"); return
+    k = sum(b["status"] == "won" for b in overs)
+    claimed = sum(side_fair(b) for b in overs) / n
+    real = k / n
+    gap = real - claimed                    # negative = overconfident
+    se = math.sqrt(real * (1 - real) / n) if 0 < real < 1 else float("nan")
+    lo, hi = gap - 1.96 * se, gap + 1.96 * se
+    excl0 = (hi < 0) or (lo > 0)
+    print(f"  settled overs n={n} (pooled, all cohorts — same pricing):")
+    print(f"  claimed {claimed*100:.1f}%  realized {real*100:.1f}%  gap {gap*100:+.1f}pp "
+          f"[95% CI {lo*100:+.1f},{hi*100:+.1f}]  => est. haircut ~{-gap*100:.1f}pp")
+    # stationarity: is the bias stable enough to pool pre+post?
+    def cohort_gap(coh):
+        s = [b for b in overs if cohort(b) == coh]
+        if not s:
+            return None, 0
+        kk = sum(b["status"] == "won" for b in s)
+        return kk / len(s) - sum(side_fair(b) for b in s) / len(s), len(s)
+    gp, np_ = cohort_gap("pre")
+    gq, nq_ = cohort_gap("post")
+    if gp is not None and gq is not None:
+        drift = "consistent (poolable)" if abs(gp - gq) < 0.06 else "DIVERGING — use rolling window"
+        print(f"  stationarity: pre {gp*100:+.1f}pp (n={np_}) vs post {gq*100:+.1f}pp (n={nq_}) → {drift}")
+    # the gate
+    if n >= MIN_FIT_N and excl0:
+        print(f"  >>> READY: n>={MIN_FIT_N} and CI excludes 0. Fit the constant over-haircut,")
+        print(f"      validate walk-forward, then wire it UNWIRED-first. Curve/Platt at n>={PLATT_N}.")
+    else:
+        need = int((1.96 / abs(gap)) ** 2 * real * (1 - real)) if gap else 999999
+        more = max(0, need - n)
+        why = []
+        if n < MIN_FIT_N:
+            why.append(f"n={n}<{MIN_FIT_N}")
+        if not excl0:
+            why.append("CI still spans 0")
+        print(f"  >>> NOT READY ({', '.join(why)}). At the current gap, ~{need} overs total "
+              f"(~{more} more) makes the CI exclude 0.")
+
 
 if __name__ == "__main__":
     main()

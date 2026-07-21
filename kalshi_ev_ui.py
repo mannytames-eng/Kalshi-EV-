@@ -229,10 +229,10 @@ WNBA_WINDOW_END_H   = 22   # 10pm PDT
 #
 # WNBA_SCANNING_ENABLED now gates spread/total (KXWNBASPREAD/KXWNBATOTAL) only
 # — those match on a direct Pinnacle line the same way MLB spread/total do and
-# never showed the prop-ladder matching failure. Re-enabled 2026-07-17 in
-# SHADOW MODE (KXWNBA is in SHADOW_MARKETS below) — tracked, $0 staked, earns
-# its own CLV evidence before real capital, since WNBA game lines have zero
-# prior track record of their own (the paused run was prop-heavy).
+# never showed the prop-ladder matching failure. Re-enabled 2026-07-17 in shadow
+# mode, then UN-shadowed 2026-07-20 (user call) — WNBA now funds and grows a real
+# track record with live stakes instead of shadow-first (KXWNBA removed from
+# SHADOW_MARKETS below).
 #
 # WNBA_PROPS_ENABLED stays False — deliberately NOT re-enabled alongside game
 # lines. Nothing has fixed the Pinnacle thin-line problem; flipping it back on
@@ -359,9 +359,10 @@ DAILY_EXPOSURE_CAP   = 0.15     # max 15% of bankroll committed per PT day
 # Move a ticker prefix here to validate a new market before committing real stakes.
 SHADOW_MARKETS: list[str] = [
     # Home runs were retired 2026-06-24 (longshot de-vig overstated edge).
-    "KXWNBA",   # WNBA added 2026-07-10 — zero track record, shadow until it
-                # earns its own CLV evidence like MLB did. Covers spread/total/
-                # props (KXWNBASPREAD, KXWNBATOTAL, KXWNBAPTS, KXWNBAREB, KXWNBAAST).
+    # KXWNBA UN-shadowed 2026-07-20 (user call) — now funds; growing a real
+    # track record with live stakes rather than shadow-first. Historical WNBA
+    # bets keep their stored shadow=True (forward-only); only bets flagged after
+    # this change are staked.
     "KXMLBGAME",  # MLB moneyline added 2026-07-14 — real series (KXMLBML never
                   # resolved), h2h fetch + team-parsing + same-game-double-bet
                   # guard newly wired. Zero track record; shadow until it earns

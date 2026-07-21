@@ -1334,7 +1334,8 @@ def _add_new_bets(edges: list) -> list:
             # on a prop carries far more variance than 3% on a total or spread,
             # so we require a 7% minimum before logging or staking.
             # Game lines (total, spread) remain at the global 3% floor.
-            if e.get("mkt_type") == "prop" and e.get("edge_pct", 0) < EDGE_THRESHOLD * 100:
+            if (e.get("mkt_type") == "prop" and e.get("edge_pct", 0) < EDGE_THRESHOLD * 100
+                    and not e.get("tb_no_experiment")):
                 print(f"  PASS (prop <{EDGE_THRESHOLD*100:.0f}%): {e.get('title','')} "
                       f"{e.get('side','')} edge={e.get('edge_pct',0):.1f}% — skipped")
                 continue
@@ -1418,8 +1419,17 @@ def _add_new_bets(edges: list) -> list:
                 and e.get("fair") is not None
                 and e.get("fair") >= TB_CAL_FAIR_CEILING
             )
+            # 2026-07-20: shadow the ENTIRE Total Bases market — deliberate strategy
+            # call (TB overs are a phantom-vig artifact, not a real edge; the "CLV"
+            # is paper-only vs an over-shaded Pinnacle line). Forward-only at
+            # bet-creation; the settled record is untouched. KXMLBTB is deliberately
+            # NOT added to SHADOW_MARKETS (that check is by ticker prefix and would
+            # retroactively pull historical funded TB out of the live stats). This
+            # also $0-stakes the TB NO-side experiment bets, which is intended — we
+            # track the under side risk-free while testing whether it beats price.
+            _tb_shadow_all = _tb_ticker
             shadow      = (_is_shadow(e.get("ticker", "")) or e.get("sanity_shadow", False)
-                           or _tb_high_edge or _tb_overconfident)
+                           or _tb_high_edge or _tb_overconfident or _tb_shadow_all)
             _cal_mult = _stake_mults.get(_calib_bucket(e), 1.0)
             paper_stake = 0.0 if shadow else round(_paper_kelly_stake(
                 e["edge_pct"], e["kalshi"], _game_time_iso,
@@ -1501,6 +1511,7 @@ def _add_new_bets(edges: list) -> list:
                 "paper_pnl":          None,                  # set on resolution
                 "correlated":         is_correlated,         # excluded from win-rate/Kelly stats
                 "shadow":             shadow,                 # True = tracked but $0 stake, excluded from balance
+                "tb_no_experiment":   bool(e.get("tb_no_experiment")),  # flagged below global threshold for the TB under-side test
                 "daily_capped":       daily_capped,          # True = skipped (daily exposure cap), $0 stake
                 "time_mult_applied":  _time_kelly_mult(_game_time_iso),  # time-Kelly mult used at placement (1.0 since 2026-06-23)
                 # TB-only cohort tag (2026-07-14): marks TB bets placed AFTER the

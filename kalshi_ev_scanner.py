@@ -59,6 +59,11 @@ ODDS_BASE   = "https://api.the-odds-api.com/v4"
 # A raw gap of 3% becomes ~0.9% true EV — still positive but thin.
 KALSHI_FEE_RATE    = 0.07    # Kalshi profit fee (7% of winnings) — update if tier changes
 EDGE_THRESHOLD     = 0.020   # ≥2.0% fee+haircut-adjusted EV to flag
+# TB NO-side experiment (2026-07-20): Total Bases is fully shadowed ($0 stake),
+# so flag the UNDER (NO) side at this lower threshold to build a risk-free sample
+# and test whether NO/under bets beat their price. Data-only; global threshold
+# and all other markets are unchanged. Tune up if it flags too much noise.
+TB_NO_EXPERIMENT_THRESHOLD = 0.005
 MAX_EDGE           = 0.20    # reject edges >20% — almost certainly a stale line
 EV_HAIRCUT         = 0.05    # model-uncertainty discount (5%)
 TOP_BETS_PER_CYCLE = 50      # surface up to 50 qualifying bets per scan
@@ -2973,7 +2978,13 @@ def scan_player_props(
                 "fair": round(fair_under, 4), "edge_pct": round(no_adj * 100, 1),
             }
 
-        if best_adj < EDGE_THRESHOLD:
+        # TB NO-side experiment: let a slight UNDER edge through even below the
+        # global threshold (TB is fully shadowed downstream, so this only builds a
+        # risk-free sample — see TB_NO_EXPERIMENT_THRESHOLD).
+        _tb_no_exp = (_snap_ticker.upper().startswith("KXMLBTB")
+                      and no_adj >= TB_NO_EXPERIMENT_THRESHOLD)
+
+        if best_adj < EDGE_THRESHOLD and not _tb_no_exp:
             continue
         if best_adj > PROP_MAX_EDGE:   # 15% cap — tighter than game-line MAX_EDGE (20%); very large prop edges are almost always a mismatch
             print(
@@ -2998,7 +3009,11 @@ def scan_player_props(
             )
             continue
 
-        if yes_adj >= no_adj:
+        if _tb_no_exp:
+            # experiment: force the UNDER side regardless of which side scored best
+            side, k_side, f_side, raw_edge, adj_edge = "NO",  1 - yes_bid, fair_under, no_raw,  no_adj
+            nb_f_side = nb_fair_under
+        elif yes_adj >= no_adj:
             side, k_side, f_side, raw_edge, adj_edge = "YES", yes_ask,     fair_over,  yes_raw, yes_adj
             nb_f_side = nb_fair_over
         else:
@@ -3053,6 +3068,7 @@ def scan_player_props(
             "fair":                 round(f_side, 4),
             "raw_edge":             round(raw_edge, 4),
             "edge":                 round(adj_edge, 4),
+            "tb_no_experiment":     _tb_no_exp,   # flagged below global threshold for the TB under-side test
             "confidence":           confidence,
             "mkt_type":             mkt_type_label,
             "pin_line":             matched["line"],

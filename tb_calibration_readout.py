@@ -28,10 +28,10 @@ def load(argv):
 
 
 def side_fair(b):
-    f = b.get("fair")
-    if f is None:
-        return None
-    return f if b.get("side") == "YES" else 1.0 - f
+    # Stored `fair` is ALREADY the bet-side fair — the scanner sets f_side =
+    # fair_under for NO bets (kalshi_ev_scanner.py). Return it directly; do NOT
+    # 1-flip for NO (that double-flips and mis-scores every NO bet's calibration).
+    return b.get("fair")
 
 
 def cohort(b):

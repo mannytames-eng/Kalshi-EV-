@@ -2161,8 +2161,9 @@ def _get_clv_multipliers() -> dict:
     for bucket, bets in by_bucket.items():
         if len(bets) < _CALIB_PENALTY_MIN_SAMPLE:
             continue
-        claimed  = sum((b["fair"] if b["side"] == "YES" else 1.0 - b["fair"])
-                       for b in bets) / len(bets)
+        # stored `fair` is already the bet-side fair (scanner sets f_side=fair_under
+        # for NO), so use it directly — do NOT 1-flip for NO.
+        claimed  = sum(b["fair"] for b in bets) / len(bets)
         realized = sum(1 for b in bets if b["status"] == "won") / len(bets)
         multipliers[bucket] = 0.5 if (realized - claimed) <= -_CALIB_PENALTY_GAP else 1.0
 

@@ -131,6 +131,7 @@ def main():
         print(f"  Post-fix funded n={n}: gap {(k/n-claimed)*100:+.1f}pp, p={pv:.3f} → {verdict}")
 
     recal_readiness(tb)
+    no_experiment_readout(tb)
 
 
 # Gates for wiring an over-haircut recalibration (see design notes in the repo).
@@ -187,6 +188,64 @@ def recal_readiness(tb):
             why.append("CI still spans 0")
         print(f"  >>> NOT READY ({', '.join(why)}). At the current gap, ~{need} overs total "
               f"(~{more} more) makes the CI exclude 0.")
+
+
+NO_EXP_TARGET_N = 30   # settled tagged bets before the under-side test has power
+NO_EXP_MIN_RATE = 3    # tagged bets/week below which the sample is "stalling"
+
+
+def no_experiment_readout(tb):
+    """TB NO-side experiment (live 2026-07-20): are under bets more profitable
+    than their price implies? For settled TB NO bets, net = win − price − taker
+    fee per contract; >0 means the under beat its price. Also tracks the tagged
+    below-threshold sample and warns if it's accumulating too slowly to conclude."""
+    import datetime as _dt
+    import statistics as _st
+    TAKER = 0.07
+    def fee(c): return TAKER * c * (1 - c)
+
+    no_settled = [b for b in tb if b.get("side") == "NO"
+                  and b.get("status") in ("won", "lost") and b.get("kalshi_price") is not None]
+    print("\n── TB NO-SIDE EXPERIMENT (does the under beat its price?) ──")
+    if not no_settled:
+        print("  no settled TB NO bets yet"); return
+
+    n = len(no_settled)
+    k = sum(b["status"] == "won" for b in no_settled)
+    price = sum(b["kalshi_price"] for b in no_settled) / n     # avg NO cost = implied win prob
+    real = k / n
+    nets = [(1 if b["status"] == "won" else 0) - b["kalshi_price"] - fee(b["kalshi_price"])
+            for b in no_settled]
+    nm = _st.mean(nets)
+    se = _st.pstdev(nets) / math.sqrt(n) if n > 1 else float("nan")
+    lo_n, hi_n = nm - 1.96 * se, nm + 1.96 * se
+    verdict = ("PROFITABLE (net>0, CI excludes 0)" if lo_n > 0
+               else "unprofitable (net<0, CI excludes 0)" if hi_n < 0
+               else "inconclusive (CI spans 0)")
+    print(f"  all settled TB NO: n={n}  avg price {price*100:.1f}%  realized {real*100:.1f}%")
+    print(f"  net after taker fee: {nm*100:+.2f}c/contract  [95% CI {lo_n*100:+.2f},{hi_n*100:+.2f}] → {verdict}")
+
+    # tagged below-threshold experiment subset + accumulation rate
+    tagged_settled = [b for b in no_settled if b.get("tb_no_experiment")]
+    tagged_open    = [b for b in tb if b.get("side") == "NO"
+                      and b.get("tb_no_experiment") and b.get("status") == "open"]
+    today = _dt.date.today()
+    def fdate(b):
+        try: return _dt.date.fromisoformat(b.get("flagged_at", "")[:10])
+        except Exception: return None
+    last7 = sum(1 for b in (tagged_settled + tagged_open)
+                if (d := fdate(b)) and 0 <= (today - d).days <= 7)
+    ne = len(tagged_settled)
+    print(f"  tagged experiment (flagged <2% since 2026-07-20): {ne} settled + "
+          f"{len(tagged_open)} open;  {last7} flagged in last 7d")
+    if ne >= NO_EXP_TARGET_N:
+        print(f"  >>> READY: n={ne}>={NO_EXP_TARGET_N} — trust the net/verdict above.")
+    elif last7 < NO_EXP_MIN_RATE:
+        print(f"  >>> STALLING: ~{last7}/wk, only {ne}/{NO_EXP_TARGET_N} settled. Lower "
+              f"TB_NO_EXPERIMENT_THRESHOLD (now 0.005; go <0 to capture every TB under).")
+    else:
+        wks = (NO_EXP_TARGET_N - ne) / max(last7, 1)
+        print(f"  building: ~{wks:.0f} more weeks to n={NO_EXP_TARGET_N} at the current rate.")
 
 
 if __name__ == "__main__":

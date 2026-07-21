@@ -1314,6 +1314,9 @@ def _add_new_bets(edges: list) -> list:
         # bets in this cycle add to it so the daily cap holds within one scan too.
         _committed_today = _todays_committed_exposure()
         _daily_cap_dollars = DAILY_EXPOSURE_CAP * PAPER_START_BALANCE
+        # Per-bucket calibration multipliers (0.5x for markets running
+        # overconfident, e.g. TB) — computed once, applied to each new stake.
+        _stake_mults = _get_clv_multipliers()
         added = 0
         for e in edges:
             # Skip edges already invalidated by Pinnacle line movement
@@ -1417,9 +1420,10 @@ def _add_new_bets(edges: list) -> list:
             )
             shadow      = (_is_shadow(e.get("ticker", "")) or e.get("sanity_shadow", False)
                            or _tb_high_edge or _tb_overconfident)
-            paper_stake = 0.0 if shadow else _paper_kelly_stake(
+            _cal_mult = _stake_mults.get(_calib_bucket(e), 1.0)
+            paper_stake = 0.0 if shadow else round(_paper_kelly_stake(
                 e["edge_pct"], e["kalshi"], _game_time_iso,
-            )
+            ) * _cal_mult, 2)
 
             # ── Daily aggregate exposure gate (on TOP of per-bet Kelly) ──────
             # Per-bet sizing above is untouched. If funding this bet would push
@@ -2091,42 +2095,65 @@ def _infer_mkt_type(b: dict) -> str:
     return ""
 
 
-# Minimum number of CLV data points before we apply a penalty multiplier.
-# Prevents over-reacting to a small sample of resolved bets.
-_CLV_PENALTY_MIN_SAMPLE = 10   # lowered from 40 — props have fewer bets, 40 was unreachable
+# Calibration penalty: min settled bets in a bucket before it can apply, and the
+# overconfidence gap (realized win rate below the model's claimed win prob) that
+# triggers a half-stake. Calibration is noisy, so require a real sample.
+_CALIB_PENALTY_MIN_SAMPLE = 20
+_CALIB_PENALTY_GAP        = 0.05   # halve stake if realized runs >=5pp under claimed
+
+
+def _calib_bucket(b: dict) -> str:
+    """Sizing bucket for the calibration penalty: the Kalshi series prefix
+    (KXMLBKS, KXMLBTB, KXMLBTOTAL, ...) so props are split by stat type instead
+    of lumped as one 'prop'. Without this, TB's overconfidence is diluted by the
+    calibrated strikeout book and never triggers a penalty. Falls back to the
+    coarse market type for anything without a series ticker."""
+    ticker = b.get("ticker", "")
+    if ticker:
+        return ticker.split("-")[0].upper()
+    return _infer_mkt_type(b) or "other"
 
 
 def _get_clv_multipliers() -> dict:
-    """
-    Compute per-market-type Kelly confidence multipliers from CLV history.
+    """Per-bucket Kelly confidence multipliers from CALIBRATION history.
+
+    Gated on calibration since 2026-07-20, NOT CLV. CLV (in either form) does not
+    separate good markets from bad — Total Bases carries strongly positive CLV
+    yet loses money and runs ~11pp overconfident. Calibration is the signal that
+    distinguishes them: realized win rate vs. the win prob the model claimed.
+    (Function name + the persisted `clv_mult_applied` field keep the 'clv' label
+    only to avoid a schema/JS rename; the logic is calibration.)
 
     Logic:
-      • Group all settled bets that have CLV data by raw market type.
-      • If a type has ≥ _CLV_PENALTY_MIN_SAMPLE data points AND avg CLV < 0,
-        that type gets a 0.5x multiplier (half Kelly) until CLV recovers.
-      • All other types return 1.0 (full quarter-Kelly).
+      • Group settled bets (incl. shadow — they carry real outcomes) by
+        _calib_bucket, needing a model fair to score.
+      • gap = realized win rate − mean claimed win prob (side model-fair).
+      • Bucket with ≥ _CALIB_PENALTY_MIN_SAMPLE bets AND gap ≤ −_CALIB_PENALTY_GAP
+        (systematically overconfident) → 0.5x until it recovers; else 1.0x.
+      • Asymmetric by design: under-sizing a fine market is cheap, full-sizing a
+        miscalibrated one is not — so penalize on the point estimate, not on full
+        statistical significance.
 
-    Returns dict like {"total": 1.0, "spread": 1.0, "moneyline": 1.0}
+    Returns dict like {"KXMLBKS": 1.0, "KXMLBTB": 0.5}.
     """
     with _bets_lock:
         settled = [b for b in _bets
                    if b["status"] in ("won", "lost")
-                   and b.get("clv_source") in ("pin", "pin_entry", "kalshi")]
+                   and b.get("clv_source") != "corrupted_utc"
+                   and b.get("fair") is not None]
 
-    by_type: dict = {}
+    by_bucket: dict = {}
     for b in settled:
-        if b.get("clv_source") == "corrupted_utc":
-            continue
-        mtype = _infer_mkt_type(b)
-        if not mtype:
-            continue
-        by_type.setdefault(mtype, []).append(b["clv"])
+        by_bucket.setdefault(_calib_bucket(b), []).append(b)
 
     multipliers: dict = {}
-    for mtype, clvs in by_type.items():
-        if len(clvs) >= _CLV_PENALTY_MIN_SAMPLE:
-            avg_clv = sum(clvs) / len(clvs)
-            multipliers[mtype] = 0.5 if avg_clv < 0 else 1.0
+    for bucket, bets in by_bucket.items():
+        if len(bets) < _CALIB_PENALTY_MIN_SAMPLE:
+            continue
+        claimed  = sum((b["fair"] if b["side"] == "YES" else 1.0 - b["fair"])
+                       for b in bets) / len(bets)
+        realized = sum(1 for b in bets if b["status"] == "won") / len(bets)
+        multipliers[bucket] = 0.5 if (realized - claimed) <= -_CALIB_PENALTY_GAP else 1.0
 
     return multipliers
 
@@ -2233,8 +2260,7 @@ def _get_performance(since: Optional[str] = None) -> dict:
                     time_mult = _time_kelly_mult(b.get("game_time"))
             else:
                 time_mult  = _time_kelly_mult(b.get("game_time"))
-        mtype      = _infer_mkt_type(b)
-        clv_mult   = clv_mults.get(mtype, 1.0)
+        clv_mult   = clv_mults.get(_calib_bucket(b), 1.0)
         # High raw-edge TB is shadowed under current policy — mirror that here
         # so this "what would current policy stake" column matches reality.
         if b.get("ticker", "").upper().startswith("KXMLBTB") and b.get("raw_edge_pct", 0) >= TB_HIGH_EDGE_THRESHOLD:
@@ -2374,8 +2400,7 @@ def _get_performance(since: Optional[str] = None) -> dict:
             b["kelly_pnl_pct"]     = round(kp * 100, 3) if kp is not None else None
             b["kelly_pnl_dollars"] = round(kp * PERF_BANKROLL, 2) if kp is not None else None
         # Flag which multiplier was applied so the UI can show a note
-        mtype = _infer_mkt_type(b)
-        b["clv_mult_applied"]  = clv_mults.get(mtype, 1.0)
+        b["clv_mult_applied"]  = clv_mults.get(_calib_bucket(b), 1.0)
         # True CLV (pin drift) = Pinnacle close - Pinnacle at entry
         _paf = b.get("pin_prob_at_flag")
         _cpin = b.get("closing_pin_pct")
@@ -2789,8 +2814,7 @@ def _sms_kelly(e: dict) -> float:
         return 0.0
     full_kelly = edge / (1.0 - k)
     clv_mults  = _get_clv_multipliers()
-    mtype      = e.get("mkt_type", "")
-    clv_mult   = clv_mults.get(mtype, 1.0)
+    clv_mult   = clv_mults.get(_calib_bucket(e), 1.0)
     return min(full_kelly * 0.25 * clv_mult, 0.05)
 
 
@@ -2903,7 +2927,7 @@ def _alert_top10(newly_logged: list = None):
         # Lock-screen preview — shows the top edge + total count
         stars = "🔥" if best_ep >= 10 else "⚡" if best_ep >= 7 else "📈"
         extra = f" (+{len(group_edges)-1} more)" if len(group_edges) > 1 else ""
-        clv_tag = " (½ CLV)" if clv_mults.get(best.get("mkt_type",""), 1.0) == 0.5 else ""
+        clv_tag = " (½ cal)" if clv_mults.get(_calib_bucket(best), 1.0) == 0.5 else ""
         content = (f"{stars} **{best.get('matchup','')}**{extra}  "
                    f"+{best_ep}% edge | Kelly **${best_kelly_bet:.0f}**{clv_tag}")
 
@@ -2926,7 +2950,7 @@ def _alert_top10(newly_logged: list = None):
             kp        = round(kf * 100, 2)
             ka        = _prob_to_american_str(k)
             fa        = _prob_to_american_str(fair_p)
-            ct        = " (½ CLV)" if clv_mults.get(e.get("mkt_type",""), 1.0) == 0.5 else ""
+            ct        = " (½ cal)" if clv_mults.get(_calib_bucket(e), 1.0) == 0.5 else ""
             market_fields.append({
                 "name":   f"[{mtype}] {e.get('title','')}  —  {side}",
                 "value":  (f"`+{ep}%` adj EV  •  Kelly `${kb:.0f}` ({kp}%){ct}\n"
@@ -4660,13 +4684,17 @@ function getBankroll() {
 //   full Kelly   = (fair − kalshi) / (1 − kalshi)
 //   adjusted     = full × 0.25 × clvMultiplier(mktType)
 //   hard cap     = 5% of bankroll per bet
-// mktType is optional; if provided and that type has a CLV penalty, stake is halved.
-function kellyBet(fair, kalshi, bankroll, mktType) {
+// bucket is the Kalshi series prefix (KXMLBKS, KXMLBTB, ...); if that bucket has
+// a calibration penalty, stake is halved. Use calibBucket(e) to derive it.
+function calibBucket(e) {
+  return e && e.ticker ? String(e.ticker).split('-')[0].toUpperCase() : ((e && e.mkt_type) || '');
+}
+function kellyBet(fair, kalshi, bankroll, bucket) {
   if (!bankroll || fair == null || kalshi == null) return null;
   const edge = fair - kalshi;
   if (edge <= 0 || kalshi <= 0 || kalshi >= 1) return 0;
   const fullKelly   = edge / (1 - kalshi);
-  const clvMult     = (mktType && clvMultipliers[mktType] != null) ? clvMultipliers[mktType] : 1.0;
+  const clvMult     = (bucket && clvMultipliers[bucket] != null) ? clvMultipliers[bucket] : 1.0;
   const adjFraction = Math.min(fullKelly * 0.25 * clvMult, 0.05);   // 5% hard cap
   return adjFraction * bankroll;
 }
@@ -4780,7 +4808,7 @@ function renderTable(edges) {
 
   let rows = '';
   for (const e of sorted) {
-    const bet = kellyBet(e.fair, e.kalshi, bankroll, e.mkt_type);
+    const bet = kellyBet(e.fair, e.kalshi, bankroll, calibBucket(e));
     const kellyCell = `<td class="num kelly-val">$${bet != null ? bet.toFixed(0) : '—'}</td>`;
     const isNew = !prevEdgeKeys.has(edgeKey(e));
     const newBadge = isNew ? '<span class="badge-new">NEW</span>' : '';
@@ -5238,9 +5266,9 @@ function renderLiveEdges() {
       : ageMins >= 10 ? `<span style="font-size:9px;color:#e3a53a;margin-left:4px;">⚠${Math.round(ageMins)}m</span>` : '';
     const fairAmer    = e.fair != null ? probToAmerican(e.fair) : '—';
     const kalshiAmer  = fmtAmer(kalshiToAmerican(e.kalshi));
-    const bet         = kellyBet(e.fair, e.kalshi, bankroll, e.mkt_type);
+    const bet         = kellyBet(e.fair, e.kalshi, bankroll, calibBucket(e));
     const kellyDollars = bet != null ? `$${bet.toFixed(0)}` : '—';
-    const clvPenalty  = clvMultipliers[e.mkt_type] === 0.5;
+    const clvPenalty  = clvMultipliers[calibBucket(e)] === 0.5;
     const pclv        = e.projected_clv_pct;
     const pclvTxt     = pclv != null
       ? `<span class="${pclv>0?'clv-pos':'clv-neg'}">${pclv>=0?'+':''}${pclv.toFixed(1)}pp</span>`
@@ -5296,10 +5324,10 @@ function renderTop10() {
   let rows = combined.map((e, i) => {
     const isNew  = !prevEdgeKeys.has(edgeKey(e));
     const newBadge = isNew ? '<span class="badge-new">NEW</span>' : '';
-    const bet  = kellyBet(e.fair, e.kalshi, bankroll, e.mkt_type);
-    const clvPenalty = clvMultipliers[e.mkt_type] === 0.5;
+    const bet  = kellyBet(e.fair, e.kalshi, bankroll, calibBucket(e));
+    const clvPenalty = clvMultipliers[calibBucket(e)] === 0.5;
     const kellyCell = bet != null
-      ? `$${bet.toFixed(0)}${clvPenalty ? ' <span style="font-size:9px;color:#e3a53a;" title="CLV penalty active: 0.5× stake">½</span>' : ''}`
+      ? `$${bet.toFixed(0)}${clvPenalty ? ' <span style="font-size:9px;color:#e3a53a;" title="Calibration penalty active: 0.5× stake">½</span>' : ''}`
       : '—';
     const isProp = e.mkt_type === 'prop';
     const _sp = sportOf(e);
@@ -5510,14 +5538,14 @@ function renderPerformance(d) {
 
   const bankroll = d.kelly_bankroll || 1000;
 
-  // CLV penalty notice — list any types currently running at 0.5× stake
+  // Calibration penalty notice — list any buckets currently running at 0.5× stake
   const penalised = Object.entries(d.clv_multipliers || {})
     .filter(([, v]) => v < 1.0)
     .map(([k]) => k);
   const penaltyNote = penalised.length
     ? `<p style="font-size:11px;color:#e3a53a;padding:4px 0 8px;margin:0;">
-        ⚠️ <strong>CLV penalty active</strong> for: ${penalised.join(', ')}.
-        Stake is 0.5× until avg CLV for these types turns positive (min ${""" + str(_CLV_PENALTY_MIN_SAMPLE) + """} data points required).
+        ⚠️ <strong>Calibration penalty active</strong> for: ${penalised.join(', ')}.
+        Stake is 0.5× while realized win rate runs ≥5pp below the model's claimed rate (min ${""" + str(_CALIB_PENALTY_MIN_SAMPLE) + """} settled bets required).
        </p>`
     : '';
 
@@ -5779,7 +5807,7 @@ function renderPerformance(d) {
     const kBet   = b.shadow
       ? `<span style="color:var(--muted);font-size:11px;" title="Shadow market — no real stake">$0</span>`
       : b.kelly_bet_pct != null
-        ? `<span class="kelly-val" title="$${b.kelly_bet_dollars != null ? b.kelly_bet_dollars.toFixed(0) : '?'} on $${bankroll} bank${b.clv_mult_applied < 1 ? ' — CLV penalty 0.5×' : ''}">${b.kelly_bet_pct.toFixed(2)}%${b.clv_mult_applied < 1 ? ' <span style="color:#e3a53a;font-size:9px;">½</span>' : ''}</span>`
+        ? `<span class="kelly-val" title="$${b.kelly_bet_dollars != null ? b.kelly_bet_dollars.toFixed(0) : '?'} on $${bankroll} bank${b.clv_mult_applied < 1 ? ' — calibration penalty 0.5×' : ''}">${b.kelly_bet_pct.toFixed(2)}%${b.clv_mult_applied < 1 ? ' <span style="color:#e3a53a;font-size:9px;">½</span>' : ''}</span>`
         : '<span class="kelly-na">—</span>';
     // P&L as % of bankroll (dollar amount in tooltip)
     const kPnl   = b.kelly_pnl_pct != null
@@ -5873,7 +5901,7 @@ function renderPerformance(d) {
       <th class="num" title="Adjusted EV after 25% haircut (raw shown in tooltip)">Adj. EV</th>
       <th class="num" title="Kalshi entry → Pinnacle closing price. Green = Pinnacle moved in your favor. Sub-line = Pinnacle fair value at entry.">Line Move</th>
       <th class="num">Result</th>
-      <th class="num" title="0.25 Kelly stake as % of bankroll (hover for $ amount). ½ = CLV penalty active.">Kelly Bet %</th>
+      <th class="num" title="0.25 Kelly stake as % of bankroll (hover for $ amount). ½ = calibration penalty active.">Kelly Bet %</th>
       <th class="num" title="P&amp;L as % of bankroll at Kelly stake (hover for $ amount)">Kelly P&amp;L %</th>
     </tr></thead>
     <tbody>${rows}</tbody>

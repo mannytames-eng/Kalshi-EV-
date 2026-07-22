@@ -2443,24 +2443,41 @@ def _get_performance(since: Optional[str] = None) -> dict:
         key=lambda b: b["flagged_at"], reverse=True
     )
     table_bets = _clean_table + _corrupt_table
+
+    # ── Hypothetical 15% daily-exposure cap for the SHADOW ledger ────────────
+    # Shadow bets are a full parallel hypothetical book: sized exactly like live
+    # (quarter-Kelly, 3% per-position cap inside _kelly_frac, 15% per-PT-day cap
+    # here) so the hypothetical P&L reflects what the shadow restriction actually
+    # cost/saved. Own daily budget, independent of the live book. Bets that would
+    # push a day past 15% are $0-staked in the hypothetical (like the live cap).
+    _shadow_daily_frac: dict = {}
+    _shadow_capped: set = set()
+    for _sb in sorted([b for b in table_bets if _is_shadow_bet(b)],
+                      key=lambda b: b.get("flagged_at", "")):
+        _d = _pt_date(_sb.get("flagged_at"))
+        _f = _kelly_frac(_sb)
+        if _shadow_daily_frac.get(_d, 0.0) + _f > DAILY_EXPOSURE_CAP + 1e-9:
+            _shadow_capped.add(_sb.get("id"))
+        else:
+            _shadow_daily_frac[_d] = _shadow_daily_frac.get(_d, 0.0) + _f
+
     for b in table_bets:
         is_shadow_b = _is_shadow_bet(b)
-        # WNBA runs shadow (excluded from all aggregate metrics) but still gets its
-        # HYPOTHETICAL Kelly stake %, Kelly P&L, and flat-unit P&L computed per bet
-        # for display (user request 2026-07-22). Aggregates sum over all_settled,
-        # which excludes shadow, so this never touches the headline numbers.
-        _wnba = _wnba_hypo(b)                   # only EXTRAPOLATED WNBA props run hypothetical
-        _hypo = is_shadow_b and _wnba          # compute-but-don't-aggregate
-        kf = _kelly_frac(b) if (not is_shadow_b or _wnba) else 0.0
-        kp = _kelly_pnl(b)  if (not is_shadow_b or _wnba) else None
-        b["kelly_bet_pct"]     = round(kf * 100, 3)
-        b["kelly_bet_dollars"] = round(kf * PERF_BANKROLL, 2)
-        # Flat unit P&L per bet (+profit/contract if won, -1 if lost) — hypothetical
-        # for shadow WNBA, real otherwise. Null while open.
+        b["shadowed"] = is_shadow_b            # explicit live/shadowed flag for every row
+        # EVERY bet — live or shadow — carries a Kelly stake %, Kelly P&L, and flat
+        # units so the shadow ledger mirrors the live one. Shadow bets are still
+        # excluded from the headline aggregates (all_settled) and never touch real
+        # bankroll/exposure — this is a parallel HYPOTHETICAL ledger only.
+        _capped = is_shadow_b and b.get("id") in _shadow_capped
+        kf = 0.0 if _capped else _kelly_frac(b)
+        kp = 0.0 if _capped else _kelly_pnl(b)
+        b["kelly_bet_pct"]      = round(kf * 100, 3)
+        b["kelly_bet_dollars"]  = round(kf * PERF_BANKROLL, 2)
+        b["daily_capped_hypo"]  = _capped
         _k = b.get("kalshi_price") or 0
         b["unit_pnl"] = (round((1 - _k) / _k if b["status"] == "won" else -1.0, 3)
                          if (b["status"] in ("won", "lost") and _k) else None)
-        if b["status"] == "open" or (is_shadow_b and not _wnba):
+        if b["status"] == "open":
             b["kelly_pnl"]         = None
             b["kelly_pnl_pct"]     = None
             b["kelly_pnl_dollars"] = None
@@ -2468,7 +2485,7 @@ def _get_performance(since: Optional[str] = None) -> dict:
             b["kelly_pnl"]         = round(kp, 5) if kp is not None else None
             b["kelly_pnl_pct"]     = round(kp * 100, 3) if kp is not None else None
             b["kelly_pnl_dollars"] = round(kp * PERF_BANKROLL, 2) if kp is not None else None
-        b["hypo_shadow"] = _hypo   # UI: show these as hypothetical, tag accordingly
+        b["hypo_shadow"] = is_shadow_b   # any shadow bet is a hypothetical row
         # Flag which multiplier was applied so the UI can show a note
         b["clv_mult_applied"]  = clv_mults.get(_calib_bucket(b), 1.0)
         # True CLV (pin drift) = Pinnacle close - Pinnacle at entry
@@ -2674,7 +2691,73 @@ def _get_performance(since: Optional[str] = None) -> dict:
             "warn":    wr < AUDIT_WARN_THRESHOLD,
         })
 
+    # ── Live vs Shadowed vs Combined ledgers ─────────────────────────────────
+    # Each slice's stats over its settled bets, incl. a GAME-CLUSTERED t-stat and
+    # bootstrap 95% CI on the mean flat-unit P&L (bets in the same game share a
+    # correlated outcome, so we cluster on the ticker's event code). This is the
+    # honest before/after: what the shadow restriction saved or cost vs the live
+    # book. Uses the per-bet unit_pnl / kelly_pnl_dollars / clv computed above.
+    import random as _rand
+    def _game_key(b):
+        _p = b.get("ticker", "").split("-")
+        return _p[1] if len(_p) > 1 else b.get("ticker", "")
+
+    def _slice_stats(slice_bets):
+        s = [b for b in slice_bets if b["status"] in ("won", "lost")]
+        n = len(s)
+        if n == 0:
+            return {"n": 0}
+        wins  = sum(1 for b in s if b["status"] == "won")
+        units = [b["unit_pnl"] for b in s if b.get("unit_pnl") is not None]
+        clvs  = [b["clv"] for b in s if b.get("clv") is not None]
+        kdols = [b["kelly_pnl_dollars"] for b in s if b.get("kelly_pnl_dollars") is not None]
+        clusters: dict = {}
+        for b in s:
+            if b.get("unit_pnl") is not None:
+                clusters.setdefault(_game_key(b), []).append(b["unit_pnl"])
+        xbar = sum(units) / len(units) if units else 0.0
+        # cluster-robust SE of the mean: sqrt( Σ_g (Σ_i (x_i−x̄))² ) / N
+        tstat = None
+        if len(units) > 1 and len(clusters) > 1:
+            ss = sum((sum(u - xbar for u in us)) ** 2 for us in clusters.values())
+            se = (ss ** 0.5) / len(units)
+            tstat = round(xbar / se, 2) if se > 0 else None
+        # cluster bootstrap 95% CI on the mean unit P&L (resample whole games)
+        ci = None
+        gk = list(clusters.keys())
+        if len(gk) >= 2 and units:
+            _rand.seed(17)
+            ms = []
+            for _ in range(2000):
+                pool: list = []
+                for _ in range(len(gk)):
+                    pool.extend(clusters[gk[_rand.randrange(len(gk))]])
+                if pool:
+                    ms.append(sum(pool) / len(pool))
+            ms.sort()
+            ci = [round(ms[int(0.025 * len(ms))], 3), round(ms[int(0.975 * len(ms))], 3)]
+        return {
+            "n":                   n,
+            "n_games":             len(clusters),
+            "win_rate":            round(100 * wins / n, 1),
+            "avg_clv":             round(sum(clvs) / len(clvs), 2) if clvs else None,
+            "total_units":         round(sum(units), 2) if units else None,
+            "avg_units":           round(xbar, 3) if units else None,
+            "total_kelly_dollars": round(sum(kdols), 2) if kdols else None,
+            "roi_pct":             round(100 * sum(kdols) / PERF_BANKROLL, 2) if kdols else None,
+            "unit_tstat":          tstat,     # game-clustered, on mean unit P&L
+            "unit_ci95":           ci,        # game-cluster bootstrap CI on mean unit P&L
+        }
+
+    _settled_all = [b for b in table_bets if b["status"] in ("won", "lost")]
+    slice_stats = {
+        "live":     _slice_stats([b for b in _settled_all if not b.get("shadowed")]),
+        "shadowed": _slice_stats([b for b in _settled_all if b.get("shadowed")]),
+        "combined": _slice_stats(_settled_all),
+    }
+
     return {
+        "slice_stats":          slice_stats,   # {live, shadowed, combined} — see _slice_stats
         "total_bets":           len(all_clean),
         "won":                  len(all_won),
         "lost":                 len(all_lost),
@@ -5618,6 +5701,43 @@ async function fetchPerformance() {
 
 function renderPerformance(d) {
   let perfBodyHtml = '';   // accumulate all perf-body sections; written once at the end
+
+  // ── Live vs Shadowed hypothetical-ledger comparison ──────────────────────
+  if (d.slice_stats && (d.slice_stats.shadowed || {}).n) {
+    const ss = d.slice_stats, L = ss.live, S = ss.shadowed, C = ss.combined;
+    const uClr = v => v == null ? '' : v > 0 ? 'pnl-pos' : v < 0 ? 'pnl-neg' : '';
+    const ciTxt = s => s && s.unit_ci95 ? `[${s.unit_ci95[0]}, ${s.unit_ci95[1]}]` : '—';
+    const row = (label, get, cls) => `<tr>
+      <td style="color:var(--muted);">${label}</td>
+      <td class="num ${cls?cls(L):''}">${L&&L.n?get(L):'—'}</td>
+      <td class="num ${cls?cls(S):''}" style="border-left:2px solid #58a6ff33;">${S&&S.n?get(S):'—'}</td>
+      <td class="num ${cls?cls(C):''}">${C&&C.n?get(C):'—'}</td></tr>`;
+    perfBodyHtml += `
+      <details open style="margin-bottom:12px;">
+        <summary style="cursor:pointer;font-size:12px;color:var(--muted);user-select:none;font-weight:600;">
+          Live vs Shadowed ledger <span style="font-weight:400;">— is the shadow band protecting or costing edge? (game-clustered)</span>
+        </summary>
+        <table style="margin-top:6px;font-size:11px;width:100%;">
+          <thead><tr><th></th><th class="num">Live</th>
+            <th class="num" style="border-left:2px solid #58a6ff33;color:#58a6ff;">Shadowed (hypo)</th>
+            <th class="num">Combined</th></tr></thead>
+          <tbody>
+            ${row('Bets (games)', s=>`${s.n} (${s.n_games})`)}
+            ${row('Win rate', s=>`${s.win_rate}%`)}
+            ${row('Avg CLV', s=>s.avg_clv!=null?`${s.avg_clv>0?'+':''}${s.avg_clv}c`:'—')}
+            ${row('Total units', s=>s.total_units!=null?`${s.total_units>0?'+':''}${s.total_units}u`:'—', s=>uClr(s.total_units))}
+            ${row('Avg unit P&amp;L', s=>s.avg_units!=null?`${s.avg_units>0?'+':''}${s.avg_units}u`:'—', s=>uClr(s.avg_units))}
+            ${row('Kelly P&amp;L', s=>s.total_kelly_dollars!=null?`${s.total_kelly_dollars>=0?'+$':'-$'}${Math.abs(s.total_kelly_dollars).toFixed(2)}`:'—', s=>uClr(s.total_kelly_dollars))}
+            ${row('ROI (of bank)', s=>s.roi_pct!=null?`${s.roi_pct>0?'+':''}${s.roi_pct}%`:'—', s=>uClr(s.roi_pct))}
+            ${row('Unit t-stat', s=>s.unit_tstat!=null?s.unit_tstat:'—')}
+            ${row('Unit 95% CI', s=>ciTxt(s))}
+          </tbody>
+        </table>
+        <p style="font-size:10px;color:var(--muted);margin:4px 0 0;line-height:1.3;">
+          Shadowed = parallel HYPOTHETICAL ledger: $0 real stake, excluded from every headline stat, but sized/tracked exactly like live (¼-Kelly, 3% per-bet + 15%/day caps). t-stat &amp; 95% CI are game-clustered on flat-unit P&amp;L (same-game bets share an outcome). If Shadowed's units/CLV beat Live, the band is costing edge; if worse, it's protecting you.
+        </p>
+      </details>`;
+  }
   function pill(label, value, cls, sub) {
     const subHtml = sub ? `<div style="font-size:9px;color:var(--muted);margin-top:3px;line-height:1.25;font-weight:400;">${sub}</div>` : '';
     return `<div class="stat-pill"><div class="label">${label}</div><div class="value ${cls||''}">${value}</div>${subHtml}</div>`;

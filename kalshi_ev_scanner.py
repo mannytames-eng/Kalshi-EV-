@@ -1434,6 +1434,51 @@ def poisson_lambda_from_line(line: float, over_prob: float) -> Optional[float]:
     return lam
 
 
+# ── Normal model for WNBA prop line-extrapolation ────────────────────────────
+# Fits a Normal(mu, cv*mu) to a single Pinnacle anchor (over_prob at anchor_line)
+# and evaluates P(stat > kalshi_thresh) at a nearby rung. Used ONLY for the WNBA
+# self-averaging stats (see WNBA_EXTRAP_* config) — Poisson is too thin-tailed
+# for points. Parameter-light on purpose (one anchor + a cv prior).
+def _norm_cdf(x: float) -> float:
+    return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
+
+
+def _norm_ppf(p: float) -> float:
+    """Inverse standard-normal CDF by bisection (no scipy; matches codebase style)."""
+    lo, hi = -8.0, 8.0
+    for _ in range(64):
+        mid = (lo + hi) / 2.0
+        if _norm_cdf(mid) < p:
+            lo = mid
+        else:
+            hi = mid
+    return (lo + hi) / 2.0
+
+
+def normal_prop_fair_over(anchor_line: float, anchor_over_prob: float,
+                          kalshi_thresh: float, cv: float) -> Optional[float]:
+    """P(stat > kalshi_thresh) from a Normal fit to one Pinnacle line.
+
+    Solve mu from P(X > anchor_line) = anchor_over_prob with sigma = cv*mu:
+        (anchor_line - mu) / (cv*mu) = -z,  z = Phi^-1(anchor_over_prob)
+        => mu = anchor_line / (1 - z*cv)
+    then return 1 - Phi((kalshi_thresh - mu) / (cv*mu)). None on degenerate input.
+    """
+    p = anchor_over_prob
+    if not (0.02 < p < 0.98) or cv <= 0 or anchor_line <= 0:
+        return None
+    z = _norm_ppf(p)
+    denom = 1.0 - z * cv
+    if denom <= 0:
+        return None
+    mu = anchor_line / denom
+    sigma = cv * mu
+    if mu <= 0 or sigma <= 0:
+        return None
+    fair = 1.0 - _norm_cdf((kalshi_thresh - mu) / sigma)
+    return min(max(fair, 0.0), 1.0)
+
+
 # ── Negative Binomial model (diagnostic — Total Bases overdispersion check) ──
 # TB is a compound stat (1B/2B/3B/HR summed across at-bats), not a single count
 # process — the live Poisson model implicitly assumes variance == mean, which
@@ -2491,6 +2536,24 @@ NBA_PLAYER_PROP_MARKETS = "player_points,player_assists,player_threes"
 # produce a valid fair probability anyway.
 WNBA_PLAYER_PROP_MARKETS = "player_points,player_rebounds,player_assists"
 
+# WNBA prop line-extrapolation (2026-07-22). MLB rejects a Kalshi rung that
+# doesn't match Pinnacle's posted line (see the guard in scan_player_props) —
+# Pinnacle posts one basketball line per player, so ~2/3 of Kalshi's rungs were
+# dropped. But points/rebounds/assists are high-volume "all-game" accumulators:
+# low coefficient of variation, so a distribution fit to Pinnacle's anchor is
+# stable near it. We fit that anchor and evaluate at NEARBY Kalshi rungs, ONLY
+# for these self-averaging stats and ONLY within WNBA_EXTRAP_MAX_RUNGS — far
+# extrapolation reintroduces the thin-tail overconfidence that burned Total Bases
+# (a low-volume, lumpy stat).
+#
+# Model: a NORMAL with SD = cv*mean, NOT Poisson. Poisson forces variance=mean
+# (sigma≈sqrt(mu)≈3.3 for ~11 pts), far too thin for points (real SD≈5-6) — it
+# over/under-states a rung 1 away by ~5pp, enough to fake an edge. The cv values
+# are per-stat priors (unvalidated — watch calibration once bets settle).
+WNBA_EXTRAP_PROP_TYPES = {"player_points", "player_rebounds", "player_assists"}
+WNBA_EXTRAP_MAX_RUNGS  = 1.5
+WNBA_EXTRAP_CV = {"player_points": 0.45, "player_rebounds": 0.45, "player_assists": 0.55}
+
 MLB_PROP_SERIES: Dict[str, str] = {
     "KXMLBKS":  "pitcher_strikeouts",
     "KXMLBTB":  "batter_total_bases",
@@ -2890,7 +2953,16 @@ def scan_player_props(
         # too, but int(5.5)=5 == int(5.0)=5 is the right semantic test.
         pin_line      = matched["line"]
         kalshi_thresh = kp["threshold"]
-        if int(pin_line) != int(kalshi_thresh):
+        # WNBA self-averaging stats may extrapolate off Pinnacle's anchor to a
+        # nearby Kalshi rung (see WNBA_EXTRAP_* notes) instead of being rejected.
+        # The Poisson fair below is then a genuine extrapolation, not a wrong-line
+        # ghost edge. MLB and far/lumpy WNBA lines stay on the strict guard.
+        _wnba_extrap = (
+            mkt_type_label == "wnba_prop"
+            and prop_type in WNBA_EXTRAP_PROP_TYPES
+            and abs(pin_line - kalshi_thresh) <= WNBA_EXTRAP_MAX_RUNGS
+        )
+        if int(pin_line) != int(kalshi_thresh) and not _wnba_extrap:
             print(
                 f"  ✗ prop  {matched.get('player','?'):<25} REJECTED — line mismatch  "
                 f"pin={pin_line} (int={int(pin_line)})  kalshi_thresh={kalshi_thresh} (int={int(kalshi_thresh)})"
@@ -2898,12 +2970,17 @@ def scan_player_props(
             continue
         # Also catch any remaining large absolute differences (>0.6) as an extra
         # belt-and-suspenders guard in case a book uses full-integer lines.
-        if abs(pin_line - kalshi_thresh) > 0.6:
+        if abs(pin_line - kalshi_thresh) > 0.6 and not _wnba_extrap:
             print(
                 f"  ✗ prop  {matched.get('player','?'):<25} REJECTED — abs line diff too large  "
                 f"pin={pin_line}  kalshi_thresh={kalshi_thresh}  diff={abs(pin_line - kalshi_thresh):.2f}"
             )
             continue
+        if _wnba_extrap and int(pin_line) != int(kalshi_thresh):
+            print(
+                f"  ↝ WNBA extrap  {matched.get('player','?'):<25} "
+                f"pin={pin_line} → kalshi={kalshi_thresh}  (Poisson from anchor, Δ={abs(pin_line-kalshi_thresh):.1f} rungs)"
+            )
         print(
             f"  → prop line match  {matched.get('player','?'):<25} "
             f"pin={pin_line}  kalshi_thresh={kalshi_thresh}  (int boundary: {int(pin_line)}=={int(kalshi_thresh)})"
@@ -2913,7 +2990,16 @@ def scan_player_props(
         threshold = kp["threshold"]
         t_int     = int(threshold)
 
-        fair_over  = 1.0 - poisson_cdf(t_int, lam)
+        if _wnba_extrap:
+            # Normal extrapolation off Pinnacle's anchor (see WNBA_EXTRAP_*).
+            # Continuity boundaries: P(X >= n) == P(X > n-0.5) == eval at int+0.5.
+            _cv = WNBA_EXTRAP_CV.get(prop_type, 0.45)
+            _nf = normal_prop_fair_over(int(matched["line"]) + 0.5,
+                                        matched["over_prob"],
+                                        int(threshold) + 0.5, _cv)
+            fair_over = _nf if _nf is not None else (1.0 - poisson_cdf(t_int, lam))
+        else:
+            fair_over = 1.0 - poisson_cdf(t_int, lam)
         fair_under = 1.0 - fair_over
 
         # ── TB-only: parallel Negative Binomial fair value (diagnostic) ─────

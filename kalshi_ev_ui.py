@@ -234,16 +234,16 @@ WNBA_WINDOW_END_H   = 22   # 10pm PDT
 # track record with live stakes instead of shadow-first (KXWNBA removed from
 # SHADOW_MARKETS below).
 #
-# WNBA_PROPS_ENABLED stays False — deliberately NOT re-enabled alongside game
-# lines. Nothing has fixed the Pinnacle thin-line problem; flipping it back on
-# would very likely just repeat the 3-day zero-edge result and burn Odds API
-# credits for a known outcome. Flip only after a real fix (e.g. the scrapped
-# DK/FD retail-consensus fallback, redesigned) ships.
-#
-# Neither flag touches the one already-open WNBA bet (Sparks @ Dream total) —
-# that still settles normally via the existing pre-close CLV pipeline.
+# WNBA_PROPS_ENABLED re-enabled 2026-07-22 — the "real fix" the pause was waiting
+# for shipped: line-extrapolation for points/rebounds/assists (see WNBA_EXTRAP_*
+# in kalshi_ev_scanner.py). Pinnacle's single line is now fit and evaluated at
+# nearby Kalshi rungs instead of dropping ~2/3 of the ladder on line mismatch, so
+# the 3-day zero-edge result no longer applies. CREDIT NOTE: regular WNBA prop
+# scanning adds ~3-4k credits/month — watch the 100k Odds API cap (running near
+# it). Funds live (not shadow, user call); the calibration penalty auto-halves it
+# if it runs overconfident.
 WNBA_SCANNING_ENABLED = True
-WNBA_PROPS_ENABLED    = False
+WNBA_PROPS_ENABLED    = True
 
 def _all_wnba_games_commenced() -> bool:
     """Return True when a confirmed fetch shows zero WNBA games today — either

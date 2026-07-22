@@ -2530,27 +2530,21 @@ def _get_performance(since: Optional[str] = None) -> dict:
         # skip them here too so the by_type rows reconcile with the headline.
         if _is_correlated(b):
             continue
-        label = _perf_label(b)
         is_shad = _is_shadow_bet(b)
+        # Shadow bets get their OWN "(shadow)" row and accumulate HYPOTHETICAL units
+        # and Kelly P&L exactly like live rows — so their results/P&L/units show up
+        # in the breakdown instead of a bare "$0 stake". Still excluded from the
+        # headline aggregates (all_settled) — parallel hypothetical ledger only.
+        label = _perf_label(b) + (" (shadow)" if is_shad else "")
         if label not in by_type:
-            by_type[label] = {"won": 0, "lost": 0, "shadow_won": 0, "shadow_lost": 0,
+            by_type[label] = {"won": 0, "lost": 0,
                                "units": [], "kelly": [], "clv": [], "pin_drifts": [],
                                "kalshi_implied": [], "shadow": is_shad}
         # pin drift per bet = closing_pin_pct - pin_prob_at_flag (true CLV)
         _pin_at_flag  = b.get("pin_prob_at_flag")
         _closing_pin  = b.get("closing_pin_pct")
         _pin_drift_v  = round(_closing_pin - _pin_at_flag, 1) if (_pin_at_flag is not None and _closing_pin is not None) else None
-        # shadow bets: track CLV + shadow won/lost for monitoring — exclude from live counts
-        if is_shad:
-            if b["status"] == "won":   by_type[label]["shadow_won"]  += 1
-            elif b["status"] == "lost": by_type[label]["shadow_lost"] += 1
-            if _pin_drift_v is not None:
-                by_type[label]["pin_drifts"].append(_pin_drift_v)
-            clv_val = b.get("clv")
-            if clv_val is not None:
-                by_type[label]["clv"].append(clv_val)
-            continue
-        kp = _kelly_pnl(b)
+        kp = _kelly_pnl(b)   # hypothetical for shadow, real for live
         if b["status"] == "won":
             by_type[label]["won"] += 1
             k = b["kalshi_price"]
@@ -2595,8 +2589,6 @@ def _get_performance(since: Optional[str] = None) -> dict:
             "label":             label,
             "won":               d["won"],
             "lost":              d["lost"],
-            "shadow_won":        d.get("shadow_won", 0),
-            "shadow_lost":       d.get("shadow_lost", 0),
             "win_rate":          wr_t,
             "expected_win_rate": expected_wr_t,
             "kelly_pct":         kelly_pct_t,
@@ -5865,49 +5857,36 @@ function renderPerformance(d) {
       const wrCls  = insuf || t.win_rate == null ? '' : 'pnl-pos';
       const kpct   = t.kelly_pct;
       const kcls   = kpct == null ? '' : kpct > 0 ? 'pnl-pos' : 'pnl-neg';
-      const wrCell = isShadowRow
-        ? `<span style="color:var(--muted);font-size:10px;">CLV only</span>`
-        : insuf
-          ? `<span class="insufficient-data" title="Need 20+ settled bets for reliable stats">Insufficient data (${t.sample_size})</span>`
-          : t.win_rate != null ? `<span class="${wrCls}">${t.win_rate}%</span>` : '—';
+      const wrCell = insuf
+        ? `<span class="insufficient-data" title="Need 20+ settled bets for reliable stats">Insufficient data (${t.sample_size})</span>`
+        : t.win_rate != null ? `<span class="${wrCls}">${t.win_rate}%</span>` : '—';
       // Expected win rate = avg model-implied win prob for this type
       const ewr    = t.expected_win_rate;
-      const expGap = (ewr != null && t.win_rate != null && !insuf && !isShadowRow) ? (t.win_rate - ewr) : null;
-      const expTitle = expGap != null
-        ? `Kalshi-implied ${ewr}% (avg price paid = break-even); actual ${t.win_rate}% (${expGap >= 0 ? '+' : ''}${expGap.toFixed(1)}pp). Win Rate above this = beating the market price you paid, which drives flat units.`
-        : 'Average Kalshi-implied win probability for this market type — the price you paid, i.e. the break-even win rate.';
       const expCell = ewr != null
-        ? `<span style="color:var(--muted);" title="${expTitle}">${ewr}%</span>`
+        ? `<span style="color:var(--muted);" title="Average Kalshi-implied win probability — the price paid, i.e. break-even.">${ewr}%</span>`
         : '—';
       const shadowRowBadge = isShadowRow
-        ? ` <span style="font-size:9px;font-weight:700;color:#58a6ff;background:rgba(88,166,255,0.10);border:1px solid rgba(88,166,255,0.3);border-radius:3px;padding:1px 4px;vertical-align:middle;">SHADOW</span>`
+        ? ` <span style="font-size:9px;font-weight:700;color:#58a6ff;background:rgba(88,166,255,0.10);border:1px solid rgba(88,166,255,0.3);border-radius:3px;padding:1px 4px;vertical-align:middle;" title="Hypothetical — $0 real stake, excluded from headline stats">SHADOW</span>`
         : '';
       const labelCell = `<span style="font-weight:600;">${t.label}</span>${shadowRowBadge}`;
+      // Kelly P&L + units — HYPOTHETICAL for shadow rows, real for live. Both shown.
+      const hypPre = isShadowRow ? 'HYPOTHETICAL — ' : '';
       const kellyCell = kpct != null
-        ? `<span class="${kcls}" title="$${t.kelly_dollars != null ? Math.abs(t.kelly_dollars).toFixed(0) : '?'} on $${bankroll} bank">${sign(kpct)}${kpct.toFixed(2)}%</span>`
+        ? `<span class="${kcls}" title="${hypPre}$${t.kelly_dollars != null ? Math.abs(t.kelly_dollars).toFixed(0) : '?'} on $${bankroll} bank">${sign(kpct)}${kpct.toFixed(2)}%</span>`
         : '—';
-      // Total flat units ($1 on every bet) for this market type
       const tu     = t.total_units != null ? t.total_units : null;
       const tuCls  = tu == null ? '' : tu > 0 ? 'pnl-pos' : tu < 0 ? 'pnl-neg' : '';
       const unitsCell = tu != null
-        ? `<span class="${tuCls}" title="Total flat units for this market type — net profit if you'd staked $1 on every bet. Removes Kelly sizing noise; pure pick quality.">${sign(tu)}${tu.toFixed(2)}u</span>`
+        ? `<span class="${tuCls}" title="${hypPre}Total flat units — net profit if you'd staked $1 on every bet.">${sign(tu)}${tu.toFixed(2)}u</span>`
         : '—';
-      const shadowTotal = (t.shadow_won || 0) + (t.shadow_lost || 0);
-      const shadowWr    = shadowTotal > 0 ? Math.round(100 * (t.shadow_won || 0) / shadowTotal) : null;
-      const wonCell  = isShadowRow
-        ? `<span style="color:var(--green);opacity:0.7;" title="Shadow — excluded from live stats">${t.shadow_won || 0}</span>`
-        : t.won;
-      const lostCell = isShadowRow
-        ? `<span style="color:var(--red);opacity:0.7;" title="Shadow — excluded from live stats">${t.shadow_lost || 0}</span>`
-        : t.lost;
-      return `<tr style="${isShadowRow ? 'opacity:0.75;' : ''}">
+      return `<tr style="${isShadowRow ? 'opacity:0.8;' : ''}">
         <td>${labelCell}</td>
-        <td class="num pnl-pos">${wonCell}</td>
-        <td class="num pnl-neg">${lostCell}</td>
-        <td class="num">${isShadowRow && shadowTotal > 0 ? `<span style="color:var(--muted);font-size:10px;" title="Shadow win rate — not counted in live stats">${shadowWr}% (${shadowTotal})</span>` : wrCell}</td>
+        <td class="num pnl-pos">${t.won}</td>
+        <td class="num pnl-neg">${t.lost}</td>
+        <td class="num">${wrCell}</td>
         <td class="num">${expCell}</td>
-        <td class="num">${isShadowRow ? '<span style="color:var(--muted);font-size:10px;">$0 stake</span>' : kellyCell}</td>
-        <td class="num">${isShadowRow ? '<span style="color:var(--muted);font-size:10px;">$0 stake</span>' : unitsCell}</td>
+        <td class="num">${kellyCell}</td>
+        <td class="num">${unitsCell}</td>
       </tr>`;
     }).join('');
     perfBodyHtml += `
@@ -5924,25 +5903,13 @@ function renderPerformance(d) {
   }
 
   // ── Alpha section ────────────────────────────────────────────────────────
-  if (d.alpha_buckets && d.alpha_buckets.length) {
+  if (d.avg_true_alpha != null || d.avg_entry_discount != null) {
     const trueAlpha = d.avg_true_alpha;
     const taSign    = trueAlpha != null && trueAlpha > 0 ? '+' : '';
     const taCls     = trueAlpha != null ? (trueAlpha >= 0 ? 'pnl-pos' : 'pnl-neg') : '';
     const entryDisc = d.avg_entry_discount;
     const edSign    = entryDisc != null && entryDisc > 0 ? '+' : '';
     const edCls     = entryDisc != null ? (entryDisc >= 0 ? 'pnl-pos' : 'pnl-neg') : '';
-    const alphaRows = d.alpha_buckets.map(b => {
-      const dCls  = b.delta > 0 ? 'pnl-pos' : b.delta < 0 ? 'pnl-neg' : '';
-      const dSign = b.delta > 0 ? '+' : '';
-      const insuf = b.n < 10;
-      return `<tr>
-        <td style="font-weight:600;">${b.label}</td>
-        <td class="num">${b.n}</td>
-        <td class="num">${insuf ? `<span style="color:var(--muted);font-size:10px;">${b.win_rate}% <em>(small n)</em></span>` : `<span class="${dCls}">${b.win_rate}%</span>`}</td>
-        <td class="num" style="color:var(--muted);">${b.expected}%</td>
-        <td class="num"><span class="${insuf ? '' : dCls}" title="Actual win rate minus expected win rate (Kalshi implied prob). Positive = outperforming market.">${dSign}${b.delta}pp ${insuf ? '<span style="font-size:9px;opacity:0.6;">(n<10)</span>' : ''}</span></td>
-      </tr>`;
-    }).join('');
     perfBodyHtml += `
       <details style="margin-bottom:12px;" open>
         <summary style="cursor:pointer;font-size:13px;font-weight:600;color:var(--fg);user-select:none;padding:6px 0;list-style:none;display:flex;align-items:center;gap:8px;">
@@ -5953,19 +5920,8 @@ function renderPerformance(d) {
         </summary>
         <div style="font-size:11px;color:var(--muted);margin:4px 0 8px;line-height:1.5;">
           <strong style="color:var(--fg);">True Alpha</strong> = Kalshi closing price − Kalshi entry price (side-aware), n=${d.true_alpha_n || 0}. Did Kalshi's own line move toward us after we bet? This is the confirmed, realized alpha.<br>
-          <strong style="color:var(--fg);">Entry Discount</strong> = Pinnacle fair value − Kalshi entry price (<span class="${edCls}">${entryDisc != null ? edSign + entryDisc + 'pp' : '—'}</span>). This is only the predicted mispricing at bet time — it assumes Pinnacle was right and is never confirmed by what actually happened.<br>
-          <strong style="color:var(--fg);">Delta</strong> = actual win rate minus Kalshi's implied probability. Positive = outperforming market expectations.
+          <strong style="color:var(--fg);">Entry Discount</strong> = Pinnacle fair value − Kalshi entry price (<span class="${edCls}">${entryDisc != null ? edSign + entryDisc + 'pp' : '—'}</span>). This is only the predicted mispricing at bet time — it assumes Pinnacle was right and is never confirmed by what actually happened.
         </div>
-        <table style="font-size:12px;">
-          <thead><tr>
-            <th>Edge Bucket</th>
-            <th class="num">N</th>
-            <th class="num">Win Rate</th>
-            <th class="num" title="What Kalshi implied your win probability was at entry">Expected</th>
-            <th class="num" title="Actual minus expected — are higher edges winning proportionally more?">Delta</th>
-          </tr></thead>
-          <tbody>${alphaRows}</tbody>
-        </table>
       </details>`;
   }
 

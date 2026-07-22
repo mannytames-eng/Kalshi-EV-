@@ -2758,6 +2758,7 @@ def build_all_player_props(
                 entry = dict(line_entries[main_line])   # default = main line
                 entry["lines"] = line_entries           # all lines (incl. alternates)
                 entry["nb_fit"] = nb_fit                # (mu, r) diagnostic fit, or None
+                entry["commence_time"] = ev.get("commence_time")  # game start — CLV freeze needs it for WNBA/NBA (tickers omit time)
                 player_lookup.setdefault(player_key, {})[mtype] = entry
 
         fetched += 1
@@ -2922,9 +2923,10 @@ def scan_player_props(
         if matched is None:
             continue
         # Captured before any reassignment below -- the per-line dicts matched
-        # onto in the exact-alternate-line-match step don't carry nb_fit
-        # (only the top-level entry from build_all_player_props does).
+        # onto in the exact-alternate-line-match step don't carry nb_fit /
+        # commence_time (only the top-level entry from build_all_player_props does).
         _nb_fit = matched.get("nb_fit")
+        _commence = matched.get("commence_time")
 
         # ── Exact alternate-line match ───────────────────────────────────────
         # If Pinnacle posts a real line at the Kalshi threshold (incl. alternate
@@ -3157,6 +3159,7 @@ def scan_player_props(
             "tb_no_experiment":     _tb_no_exp,   # flagged below global threshold for the TB under-side test
             "confidence":           confidence,
             "mkt_type":             mkt_type_label,
+            "commence_time":        _commence,   # Pinnacle game start — CLV freeze needs it (WNBA/NBA tickers omit the time)
             "pin_line":             matched["line"],
             "prop_type":            prop_type,
             "books_used":           matched.get("books_used", []),

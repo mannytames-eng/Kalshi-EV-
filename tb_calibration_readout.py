@@ -132,6 +132,7 @@ def main():
 
     recal_readiness(tb)
     no_experiment_readout(tb)
+    wnba_prop_readout(d)
 
 
 # Gates for wiring an over-haircut recalibration (see design notes in the repo).
@@ -246,6 +247,48 @@ def no_experiment_readout(tb):
     else:
         wks = (NO_EXP_TARGET_N - ne) / max(last7, 1)
         print(f"  building: ~{wks:.0f} more weeks to n={NO_EXP_TARGET_N} at the current rate.")
+
+
+def wnba_prop_readout(d):
+    """Calibration check for the WNBA prop line-extrapolation pricer (Normal with
+    cv priors, live 2026-07-22). Compares realized win rate to the model's claimed
+    win prob, overall and by stat type — the direct test of whether the cv priors
+    are right. If a stat runs persistently overconfident, lower its
+    WNBA_EXTRAP_CV; underconfident, raise it. `fair` is already the side fair."""
+    WSERIES = ("KXWNBAPTS", "KXWNBAREB", "KXWNBAAST")
+    wp = [b for b in d["bets"]
+          if b.get("ticker", "").startswith(WSERIES)
+          and b.get("status") in ("won", "lost") and b.get("fair") is not None]
+    print("\n── WNBA PROP CALIBRATION (extrapolation cv-prior check) ──")
+    if not wp:
+        print("  no settled WNBA prop bets yet"); return
+    n = len(wp)
+    k = sum(b["status"] == "won" for b in wp)
+    claimed = sum(b["fair"] for b in wp) / n
+    real = k / n
+    gap = real - claimed
+    lo, hi = wilson(k, n)
+    print(f"  settled WNBA props n={n}  claimed {claimed*100:.1f}%  realized {real*100:.1f}% "
+          f"[{lo*100:.0f},{hi*100:.0f}]  gap {gap*100:+.1f}pp")
+    for pref, lab, cv in (("KXWNBAPTS", "points", 0.45),
+                          ("KXWNBAREB", "rebounds", 0.45),
+                          ("KXWNBAAST", "assists", 0.55)):
+        g = [b for b in wp if b["ticker"].startswith(pref)]
+        if not g:
+            continue
+        gk = sum(b["status"] == "won" for b in g)
+        gc = sum(b["fair"] for b in g) / len(g)
+        print(f"    {lab:9s} (cv {cv}) n={len(g):>2}  claimed {gc*100:.0f}%  "
+              f"realized {gk/len(g)*100:.0f}%  gap {(gk/len(g)-gc)*100:+.1f}pp")
+    if n < 20:
+        print(f"  >>> n={n}<20 — underpowered; watch as it grows. Persistent negative gap on a "
+              f"stat => lower its WNBA_EXTRAP_CV (thinner extrapolation was overconfident).")
+    else:
+        z, pv = binom_z_p(k, n, claimed)
+        verdict = ("OVERCONFIDENT — widen cv" if gap < 0 and pv < 0.05
+                   else "underconfident — narrow cv" if gap > 0 and pv < 0.05
+                   else "calibrated within noise")
+        print(f"  >>> n={n}: gap {gap*100:+.1f}pp, p={pv:.3f} → {verdict}")
 
 
 if __name__ == "__main__":

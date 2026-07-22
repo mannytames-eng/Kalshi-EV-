@@ -359,12 +359,8 @@ DAILY_EXPOSURE_CAP   = 0.15     # max 15% of bankroll committed per PT day
 # Move a ticker prefix here to validate a new market before committing real stakes.
 SHADOW_MARKETS: list[str] = [
     # Home runs were retired 2026-06-24 (longshot de-vig overstated edge).
-    "KXWNBA",   # Re-shadowed 2026-07-22 (user call) — WNBA runs HYPOTHETICAL:
-                # $0 real stake, excluded from every aggregate metric, but the
-                # per-bet Kelly P&L + flat units are still computed and shown so
-                # you can see what it would have won/lost. (Open funded WNBA bets
-                # from the 07-20→22 window are moved to shadow at load — freeze-safe
-                # since they're unsettled.)
+    # WNBA is NOT blanket-shadowed: only EXTRAPOLATED props run hypothetical (see
+    # _wnba_hypo) — exact-match props + game lines fund normally (2026-07-22).
     "KXMLBGAME",  # MLB moneyline added 2026-07-14 — real series (KXMLBML never
                   # resolved), h2h fetch + team-parsing + same-game-double-bet
                   # guard newly wired. Zero track record; shadow until it earns
@@ -373,6 +369,28 @@ SHADOW_MARKETS: list[str] = [
 
 def _is_shadow(ticker: str) -> bool:
     return any(ticker.upper().startswith(s) for s in SHADOW_MARKETS)
+
+
+def _wnba_hypo(b: dict) -> bool:
+    """True for a WNBA prop priced by line EXTRAPOLATION — Pinnacle's posted line
+    doesn't line up with the Kalshi rung. These run HYPOTHETICAL: $0 real stake,
+    excluded from all aggregate metrics, but per-bet hypo Kelly P&L + units shown.
+    Exact-match WNBA props (Kalshi rung == Pinnacle implied rung) and WNBA game
+    lines price directly off Pinnacle and fund normally. Works on both edge dicts
+    (pin_line) and stored bets (pin_line_at_flag), so classification is dynamic and
+    doesn't depend on a stored shadow flag."""
+    tk = b.get("ticker", "").upper()
+    if not (tk.startswith("KXWNBAPTS") or tk.startswith("KXWNBAREB")
+            or tk.startswith("KXWNBAAST")):
+        return False   # game lines / non-props: direct Pinnacle line, fund normally
+    pin = b.get("pin_line_at_flag")
+    if pin is None:
+        pin = b.get("pin_line")
+    try:
+        thr = int(tk.split("-")[-1])          # Kalshi rung, e.g. "10+" → 10
+        return thr != int(pin) + 1            # exact match: rung == floor(pin)+1
+    except (ValueError, IndexError, TypeError):
+        return True    # can't verify exact match → treat as hypothetical (safe)
 
 # ── Time-to-matchup Kelly multiplier ─────────────────────────────────────────
 # FLATTENED to 1.0× on 2026-06-23. The previous 4-bucket multiplier was
@@ -940,17 +958,26 @@ for _b in _bets:
         _data_fixed = True
         print(f"  Shadow-backfill: zeroed stake/pnl on {_b.get('id','?')}")
 
-# WNBA re-shadowed 2026-07-22 (hypothetical-only): move any OPEN WNBA bet that was
-# funded during the 07-20→22 window to shadow ($0 real stake) so it stops hitting
-# the real balance/metrics. OPEN ONLY — settled WNBA is left untouched (freeze).
-# Per-bet hypothetical Kelly P&L + units are still computed for display downstream.
+# WNBA reconcile 2026-07-22: only EXTRAPOLATED props run hypothetical shadow;
+# exact-match props + game lines fund normally. Fix any OPEN WNBA bet mis-flagged
+# by the earlier blanket shadow — extrapolated ones stay shadow ($0), exact-match
+# ones get un-shadowed and a real stake restored. OPEN ONLY (settled = freeze).
 for _b in _bets:
-    if (_b.get("ticker", "").upper().startswith("KXWNBA")
-            and _b.get("status") == "open" and not _b.get("shadow")):
-        _b["shadow"]      = True
-        _b["paper_stake"] = 0.0
-        _data_fixed = True
-        print(f"  WNBA→shadow (hypothetical): {_b.get('id','?')}")
+    if not _b.get("ticker", "").upper().startswith("KXWNBA") or _b.get("status") != "open":
+        continue
+    if _wnba_hypo(_b):
+        if not _b.get("shadow") or (_b.get("paper_stake") or 0) != 0:
+            _b["shadow"] = True; _b["paper_stake"] = 0.0; _data_fixed = True
+            print(f"  WNBA extrapolated → hypothetical shadow: {_b.get('id','?')}")
+    elif _b.get("shadow") or (_b.get("paper_stake") or 0) == 0:
+        # exact-match prop / game line → fund; restore a stake if the blanket shadow zeroed it
+        _e = (_b.get("edge_pct") or 0) / 100.0
+        _k = _b.get("kalshi_price") or 0
+        if _k and 0 < _k < 1 and _e > 0:
+            _b["paper_stake"] = round(min(_e / (1 - _k) * PAPER_KELLY_FRACTION,
+                                          PAPER_KELLY_CAP) * PAPER_START_BALANCE, 2)
+        _b["shadow"] = False; _data_fixed = True
+        print(f"  WNBA exact-match → funded: {_b.get('id','?')} stake ${_b.get('paper_stake',0):.2f}")
 
 # Fix: bets silently halved by the retroactive-resize migration (now removed
 # above). That migration was a one-time historical correction for the June
@@ -1443,8 +1470,11 @@ def _add_new_bets(edges: list) -> list:
             # also $0-stakes the TB NO-side experiment bets, which is intended — we
             # track the under side risk-free while testing whether it beats price.
             _tb_shadow_all = _tb_ticker
+            # WNBA: only EXTRAPOLATED props run hypothetical shadow; exact-match
+            # props + game lines fund normally (2026-07-22).
             shadow      = (_is_shadow(e.get("ticker", "")) or e.get("sanity_shadow", False)
-                           or _tb_high_edge or _tb_overconfident or _tb_shadow_all)
+                           or _tb_high_edge or _tb_overconfident or _tb_shadow_all
+                           or _wnba_hypo(e))
             _cal_mult = _stake_mults.get(_calib_bucket(e), 1.0)
             paper_stake = 0.0 if shadow else round(_paper_kelly_stake(
                 e["edge_pct"], e["kalshi"], _game_time_iso,
@@ -2224,9 +2254,10 @@ def _get_performance(since: Optional[str] = None) -> dict:
         return b.get("clv_source") == "corrupted_utc"
 
     def _is_shadow_bet(b: dict) -> bool:
-        return b.get("shadow", False) or any(
-            b.get("ticker", "").upper().startswith(s) for s in SHADOW_MARKETS
-        )
+        _tk = b.get("ticker", "").upper()
+        if _tk.startswith(("KXWNBAPTS", "KXWNBAREB", "KXWNBAAST")):
+            return _wnba_hypo(b)   # WNBA props: dynamic — extrapolated=shadow, exact=funded
+        return b.get("shadow", False) or any(_tk.startswith(s) for s in SHADOW_MARKETS)
 
     gl_bets    = [b for b in bets  if not _is_prop(b) and not _is_corrupted(b)]
     gl_won     = [b for b in won   if not _is_prop(b) and not _is_correlated(b) and not _is_corrupted(b)]
@@ -2418,7 +2449,7 @@ def _get_performance(since: Optional[str] = None) -> dict:
         # HYPOTHETICAL Kelly stake %, Kelly P&L, and flat-unit P&L computed per bet
         # for display (user request 2026-07-22). Aggregates sum over all_settled,
         # which excludes shadow, so this never touches the headline numbers.
-        _wnba = b.get("ticker", "").upper().startswith("KXWNBA")
+        _wnba = _wnba_hypo(b)                   # only EXTRAPOLATED WNBA props run hypothetical
         _hypo = is_shadow_b and _wnba          # compute-but-don't-aggregate
         kf = _kelly_frac(b) if (not is_shadow_b or _wnba) else 0.0
         kp = _kelly_pnl(b)  if (not is_shadow_b or _wnba) else None

@@ -4579,7 +4579,9 @@ const _MLB_TEAMS = new Set(['ARI','AZ','ATL','BAL','BOS','CHC','CWS','CIN','CLE'
 const _MLB_ID = {LAA:108,ARI:109,AZ:109,BAL:110,BOS:111,CHC:112,CIN:113,CLE:114,COL:115,DET:116,HOU:117,KC:118,LAD:119,WSH:120,NYM:121,OAK:133,ATH:133,PIT:134,SD:135,SEA:136,SF:137,STL:138,TB:139,TEX:140,TOR:141,MIN:142,PHI:143,ATL:144,CWS:145,MIA:146,NYY:147,MIL:158};
 function mlbLogo(ticker) {
   if (!ticker) return '';
-  const m = ticker.match(/^KXMLB(?:KS|TB|HIT|RBI|HR)-\d{2}[A-Z]{3}\d{6}([A-Z]+)-([A-Z]+?)\d/);
+  // (?:G\d+)? tolerates doubleheader suffixes (e.g. PITNYYG1) that sit between
+  // the team codes and the dash — without it, game-1/2 props render no logo.
+  const m = ticker.match(/^KXMLB(?:KS|TB|HIT|RBI|HR)-\d{2}[A-Z]{3}\d{6}([A-Z]+)(?:G\d+)?-([A-Z]+?)\d/);
   if (!m) return '';
   const matchup = m[1], playerSeg = m[2];
   let away, home;

@@ -359,10 +359,12 @@ DAILY_EXPOSURE_CAP   = 0.15     # max 15% of bankroll committed per PT day
 # Move a ticker prefix here to validate a new market before committing real stakes.
 SHADOW_MARKETS: list[str] = [
     # Home runs were retired 2026-06-24 (longshot de-vig overstated edge).
-    # KXWNBA UN-shadowed 2026-07-20 (user call) — now funds; growing a real
-    # track record with live stakes rather than shadow-first. Historical WNBA
-    # bets keep their stored shadow=True (forward-only); only bets flagged after
-    # this change are staked.
+    "KXWNBA",   # Re-shadowed 2026-07-22 (user call) — WNBA runs HYPOTHETICAL:
+                # $0 real stake, excluded from every aggregate metric, but the
+                # per-bet Kelly P&L + flat units are still computed and shown so
+                # you can see what it would have won/lost. (Open funded WNBA bets
+                # from the 07-20→22 window are moved to shadow at load — freeze-safe
+                # since they're unsettled.)
     "KXMLBGAME",  # MLB moneyline added 2026-07-14 — real series (KXMLBML never
                   # resolved), h2h fetch + team-parsing + same-game-double-bet
                   # guard newly wired. Zero track record; shadow until it earns
@@ -937,6 +939,18 @@ for _b in _bets:
             _b["paper_pnl"] = 0.0
         _data_fixed = True
         print(f"  Shadow-backfill: zeroed stake/pnl on {_b.get('id','?')}")
+
+# WNBA re-shadowed 2026-07-22 (hypothetical-only): move any OPEN WNBA bet that was
+# funded during the 07-20→22 window to shadow ($0 real stake) so it stops hitting
+# the real balance/metrics. OPEN ONLY — settled WNBA is left untouched (freeze).
+# Per-bet hypothetical Kelly P&L + units are still computed for display downstream.
+for _b in _bets:
+    if (_b.get("ticker", "").upper().startswith("KXWNBA")
+            and _b.get("status") == "open" and not _b.get("shadow")):
+        _b["shadow"]      = True
+        _b["paper_stake"] = 0.0
+        _data_fixed = True
+        print(f"  WNBA→shadow (hypothetical): {_b.get('id','?')}")
 
 # Fix: bets silently halved by the retroactive-resize migration (now removed
 # above). That migration was a one-time historical correction for the June
@@ -2400,11 +2414,22 @@ def _get_performance(since: Optional[str] = None) -> dict:
     table_bets = _clean_table + _corrupt_table
     for b in table_bets:
         is_shadow_b = _is_shadow_bet(b)
-        kf = 0.0 if is_shadow_b else _kelly_frac(b)
-        kp = None if is_shadow_b else _kelly_pnl(b)
+        # WNBA runs shadow (excluded from all aggregate metrics) but still gets its
+        # HYPOTHETICAL Kelly stake %, Kelly P&L, and flat-unit P&L computed per bet
+        # for display (user request 2026-07-22). Aggregates sum over all_settled,
+        # which excludes shadow, so this never touches the headline numbers.
+        _wnba = b.get("ticker", "").upper().startswith("KXWNBA")
+        _hypo = is_shadow_b and _wnba          # compute-but-don't-aggregate
+        kf = _kelly_frac(b) if (not is_shadow_b or _wnba) else 0.0
+        kp = _kelly_pnl(b)  if (not is_shadow_b or _wnba) else None
         b["kelly_bet_pct"]     = round(kf * 100, 3)
         b["kelly_bet_dollars"] = round(kf * PERF_BANKROLL, 2)
-        if b["status"] == "open" or is_shadow_b:
+        # Flat unit P&L per bet (+profit/contract if won, -1 if lost) — hypothetical
+        # for shadow WNBA, real otherwise. Null while open.
+        _k = b.get("kalshi_price") or 0
+        b["unit_pnl"] = (round((1 - _k) / _k if b["status"] == "won" else -1.0, 3)
+                         if (b["status"] in ("won", "lost") and _k) else None)
+        if b["status"] == "open" or (is_shadow_b and not _wnba):
             b["kelly_pnl"]         = None
             b["kelly_pnl_pct"]     = None
             b["kelly_pnl_dollars"] = None
@@ -2412,6 +2437,7 @@ def _get_performance(since: Optional[str] = None) -> dict:
             b["kelly_pnl"]         = round(kp, 5) if kp is not None else None
             b["kelly_pnl_pct"]     = round(kp * 100, 3) if kp is not None else None
             b["kelly_pnl_dollars"] = round(kp * PERF_BANKROLL, 2) if kp is not None else None
+        b["hypo_shadow"] = _hypo   # UI: show these as hypothetical, tag accordingly
         # Flag which multiplier was applied so the UI can show a note
         b["clv_mult_applied"]  = clv_mults.get(_calib_bucket(b), 1.0)
         # True CLV (pin drift) = Pinnacle close - Pinnacle at entry
@@ -5141,7 +5167,12 @@ function renderTodayEdges() {
     // If the FAIR value (Pinnacle) has moved >10pp since we flagged, the entry
     // line was likely stale/soft (the Marte case: NO fair 64%→50%). The entry
     // edge is suspect regardless of the current Kalshi price.
-    const entryFairPct = b.pin_prob_at_flag;
+    // Use the bet's own fair (the fair at the Kalshi THRESHOLD) as the flag fair,
+    // not pin_prob_at_flag (Pinnacle's prob at THEIR line — differs for WNBA props
+    // priced by extrapolation, e.g. Pinnacle 8.5 anchor vs Kalshi 10+ rung). Both
+    // this and curFair are then threshold fairs, so the comparison is apples-to-
+    // apples and the displayed fair matches the edge.
+    const entryFairPct = b.fair != null ? b.fair * 100 : b.pin_prob_at_flag;
     const curFairPct   = curFair != null ? curFair * 100 : null;
     const fairMoved    = (entryFairPct != null && curFairPct != null) ? (curFairPct - entryFairPct) : null;
     const staleEntry   = fairMoved != null && Math.abs(fairMoved) > 10;
@@ -5183,7 +5214,8 @@ function renderTodayEdges() {
 
     // ── American odds at flag time ──────────────────────────────────────────
     const flagKalshiAmer = b.kalshi_price != null ? kalshiToAmerican(b.kalshi_price) : '—';
-    const flagFairAmer   = b.pin_prob_at_flag != null ? probToAmerican(b.pin_prob_at_flag / 100) : '—';
+    const flagFairAmer   = b.fair != null ? probToAmerican(b.fair)
+                          : (b.pin_prob_at_flag != null ? probToAmerican(b.pin_prob_at_flag / 100) : '—');
     const flagOddsTxt = `<span style="font-size:10px;color:var(--muted);display:block;margin-top:2px;">
       Kalshi <span style="color:var(--text);">${flagKalshiAmer}</span>
       &nbsp;·&nbsp; Fair <span style="color:var(--text);">${flagFairAmer}</span>
@@ -5840,14 +5872,15 @@ function renderPerformance(d) {
       : isLive ? '<span style="color:#ff4444;font-weight:600;animation:pulse 1.5s infinite;">● LIVE</span>'
       : '…';
     // Kelly bet size as % of bankroll (dollar amount in tooltip)
-    const kBet   = b.shadow
+    const kBet   = (b.shadow && !b.hypo_shadow)
       ? `<span style="color:var(--muted);font-size:11px;" title="Shadow market — no real stake">$0</span>`
       : b.kelly_bet_pct != null
-        ? `<span class="kelly-val" title="$${b.kelly_bet_dollars != null ? b.kelly_bet_dollars.toFixed(0) : '?'} on $${bankroll} bank${b.clv_mult_applied < 1 ? ' — calibration penalty 0.5×' : ''}">${b.kelly_bet_pct.toFixed(2)}%${b.clv_mult_applied < 1 ? ' <span style="color:#e3a53a;font-size:9px;">½</span>' : ''}</span>`
+        ? `<span class="kelly-val" title="${b.hypo_shadow ? 'HYPOTHETICAL (WNBA shadow — $0 real stake): ' : ''}$${b.kelly_bet_dollars != null ? b.kelly_bet_dollars.toFixed(0) : '?'} on $${bankroll} bank${b.clv_mult_applied < 1 ? ' — calibration penalty 0.5×' : ''}">${b.kelly_bet_pct.toFixed(2)}%${b.hypo_shadow ? '<span style="color:#58a6ff;font-size:9px;" title="hypothetical — not staked">&nbsp;hyp</span>' : ''}${b.clv_mult_applied < 1 ? ' <span style="color:#e3a53a;font-size:9px;">½</span>' : ''}</span>`
         : '<span class="kelly-na">—</span>';
-    // P&L as % of bankroll (dollar amount in tooltip)
+    // P&L as % of bankroll; for WNBA hypo bets also show units added/subtracted.
+    const unitTxt = b.unit_pnl != null ? `${sign(b.unit_pnl)}${b.unit_pnl.toFixed(2)}u` : null;
     const kPnl   = b.kelly_pnl_pct != null
-      ? `<span class="${uClass(b.kelly_pnl_pct)}" title="${fmt$(b.kelly_pnl_dollars || 0)} on $${bankroll} bank">${sign(b.kelly_pnl_pct)}${b.kelly_pnl_pct.toFixed(2)}%</span>`
+      ? `<span class="${uClass(b.kelly_pnl_pct)}" title="${b.hypo_shadow ? 'HYPOTHETICAL — ' : ''}${fmt$(b.kelly_pnl_dollars || 0)} on $${bankroll} bank${unitTxt ? ' · ' + unitTxt + ' (flat units)' : ''}">${sign(b.kelly_pnl_pct)}${b.kelly_pnl_pct.toFixed(2)}%${b.hypo_shadow && unitTxt ? `<span style="color:var(--muted);font-size:9px;">&nbsp;${unitTxt}</span>` : ''}</span>`
       : b.status === 'open' && b.kelly_bet_pct != null
         ? `<span class="pnl-neu">open</span>`
         : '<span class="pnl-neu">—</span>';

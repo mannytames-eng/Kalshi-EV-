@@ -4712,6 +4712,29 @@ function kellyBet(fair, kalshi, bankroll, bucket) {
   return adjFraction * bankroll;
 }
 
+// Moneyline clarity: which real team you're actually betting. The ticker's last
+// segment is the team the market resolves YES for (YES = that team wins, NO = the
+// other). The event code ends with the HOME abbrev, which disambiguates away/home.
+function mlBetTeam(b) {
+  const parts = (b.ticker || '').split('-');
+  const yesAbbr = parts[parts.length - 1];
+  const eventCode = parts[1] || '';
+  const m = (b.matchup || '').split(' @ ');
+  if (m.length !== 2 || !yesAbbr) return null;
+  const away = m[0], home = m[1];
+  const yesTeam = eventCode.endsWith(yesAbbr) ? home : away;
+  return b.side === 'YES' ? yesTeam : (yesTeam === home ? away : home);
+}
+// Side-cell label: for a moneyline bet the team you back IS the answer (YES/NO is
+// meaningless to the user), so show the team; everything else keeps YES/NO.
+function sideLabel(b) {
+  if (b && (b.mkt_type === 'moneyline' || (b.ticker || '').startsWith('KXMLBGAME'))) {
+    const t = mlBetTeam(b);
+    if (t) return t;
+  }
+  return b ? b.side : '';
+}
+
 // ESPN team logo CDN map
 const LOGOS = {
   // MLB
@@ -5226,7 +5249,7 @@ function renderTodayEdges() {
       <td style="font-size:11px;color:var(--muted);white-space:nowrap;">${flagTime}</td>
       <td>${mlbLogo(b.ticker)}${matchupHtml(b.matchup)}${gameTimeBadge}</td>
       <td class="prop-col" style="font-size:12px;">${b.title}${kalshiLineBadge(b)}${driftTxt}${tickerTxt}${kalshiLink}</td>
-      <td class="${sideClass}">${b.side}</td>
+      <td class="${sideClass}">${sideLabel(b)}</td>
       <td class="num" style="color:${edgeColor(b.edge_pct)};font-weight:700;">+${pct(b.edge_pct)}${flagOddsTxt}</td>
       <td class="num">${liveCounter}</td>
       <td class="num">${lastScanEdge}</td>
@@ -5892,7 +5915,7 @@ function renderPerformance(d) {
       <td>${gameTimeCell}</td>
       <td>${mlbLogo(b.ticker)}${b.matchup}${corrBadge}${corruptBadge}${shadowBadge}</td>
       <td class="prop-col">${b.title}</td>
-      <td class="side-${b.side.toLowerCase()}">${b.side}</td>
+      <td class="side-${b.side.toLowerCase()}">${sideLabel(b)}</td>
       <td class="num">${edgeCell}</td>
       <td class="num">${lineMoveCell}</td>
       <td class="num ${rClass}">${rLabel}${b.actual_result ? (() => {
@@ -6118,7 +6141,7 @@ async function fetchPaper() {
           <td style="color:var(--muted);font-size:11px;">${flagDate}</td>
           <td class="matchup-inline">${mlbLogo(b.ticker)}${matchupHtml(b.matchup)}</td>
           <td style="font-size:12px;max-width:200px;">${b.title}${capBadge}</td>
-          <td class="side-${(b.side||'').toLowerCase()}">${b.side}</td>
+          <td class="side-${(b.side||'').toLowerCase()}">${sideLabel(b)}</td>
           <td class="num">${edgeTag}</td>
           <td class="num">${valCell}</td>
           <td class="num">${stake}</td>
@@ -6205,7 +6228,7 @@ function renderScannerHistory(bets) {
       <td style="font-size:11px;color:#4d5461;white-space:nowrap;">${flagTime}</td>
       <td style="font-size:11px;color:#6e7681;">${hesc(b.matchup || '—')}</td>
       <td style="font-size:11px;color:#6e7681;">${hesc(b.title || b.ticker || '—')}</td>
-      <td class="${sideClass}" style="opacity:0.7;">${b.side}</td>
+      <td class="${sideClass}" style="opacity:0.7;">${sideLabel(b)}</td>
       <td class="num" style="color:#6e7681;font-weight:700;">${edgePct}${oddsTxt}</td>
       <td class="num">${hsBadge}</td>
     </tr>`;

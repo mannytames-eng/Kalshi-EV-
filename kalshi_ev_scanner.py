@@ -2759,6 +2759,15 @@ def build_all_player_props(
                 entry["lines"] = line_entries           # all lines (incl. alternates)
                 entry["nb_fit"] = nb_fit                # (mu, r) diagnostic fit, or None
                 entry["commence_time"] = ev.get("commence_time")  # game start — CLV freeze needs it for WNBA/NBA (tickers omit time)
+                # Doubleheader collision guard: the same player + prop across two
+                # same-day games collides on this name-only key. We can't tell which
+                # game's line pairs with which Kalshi market by name alone, so flag
+                # the survivor unusable and skip it downstream — better than pricing
+                # the G1 market off G2's line (see the suppressed Muncy bet). Proper
+                # fix = game-aware keying (deferred). Interim: skip.
+                _prev = player_lookup.get(player_key, {}).get(mtype)
+                if _prev is not None and _prev.get("commence_time") != entry["commence_time"]:
+                    entry["_dh_collision"] = True
                 player_lookup.setdefault(player_key, {})[mtype] = entry
 
         fetched += 1
@@ -2927,6 +2936,11 @@ def scan_player_props(
         # commence_time (only the top-level entry from build_all_player_props does).
         _nb_fit = matched.get("nb_fit")
         _commence = matched.get("commence_time")
+        # Doubleheader name collision (see build_all_player_props) — skip rather
+        # than risk pricing this Kalshi market off the other game's line.
+        if matched.get("_dh_collision"):
+            print(f"  ⚠ prop  {matched.get('player','?'):<25} SKIPPED — doubleheader name collision (can't game-match)")
+            continue
 
         # ── Exact alternate-line match ───────────────────────────────────────
         # If Pinnacle posts a real line at the Kalshi threshold (incl. alternate

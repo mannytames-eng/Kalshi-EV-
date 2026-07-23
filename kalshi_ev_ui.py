@@ -1165,6 +1165,40 @@ if _dedup_count:
     _data_fixed = True
     print(f"  Open dedup: most-probable line on {_dedup_count} open same-player bet(s)")
 
+# Fix: Monique Akoa Makani WNBA prop CLV (2026-07-22) — clv_source was wrongly
+# "pin" (a confirmed Pinnacle close) when NO real Pinnacle close was ever
+# fetched: _lookup_pin_prob_for_bet only implements the "total" market lookup
+# and always returns None for props, so _maybe_fetch_pre_close_pinnacle fell
+# back to last_pin_pct (the FLAG-TIME snapshot for an unsupported market type)
+# and mislabeled it a genuine close. Tell: closing_pin_pct == pin_prob_at_flag
+# exactly (48.6), so clv == entry_discount (+6.6) — not a real closing-line
+# comparison. Meanwhile closing_yes_pct WAS captured correctly by the (separate,
+# working) Kalshi-price CLV loop: 58 -> 74, a real 16pp move against this NO
+# bet. Recompute clv from that genuine Kalshi drift instead. Root cause fixed
+# going forward in _maybe_fetch_pre_close_pinnacle (only writes a pin close for
+# market types the lookup actually supports — see comment there). Placed LAST
+# among the one-time corrections, after the "kalshi -> pin_entry" upgrade pass
+# above, which would otherwise match this bet and revert it. Deliberately does
+# NOT null closing_pin_pct: that pass keys on `closing_pin_pct is None`, so
+# nulling it would make these two blocks fight every restart. clv_source
+# "kalshi" is the signal that closing_pin_pct isn't the trustworthy field here;
+# its stale value is left in place (harmless — this bet is already resolved,
+# so no settlement code path reads it again) to keep both blocks' idempotency
+# checks stable.
+_makani_fix_id = "KXWNBAPTS-26JUL22PHXLA-PHXMAKOAMAKANI8-10|NO"
+for _b in _bets:
+    if _b.get("id") == _makani_fix_id and _b.get("clv_source") != "kalshi":
+        _ey = _b.get("kalshi_yes_at_flag")
+        _cy = _b.get("closing_yes_pct")
+        _ek = (_b.get("kalshi_price") or 0) * 100
+        if _ey is not None and _cy is not None and _ek:
+            _clv = round((_ey - _cy) if _b.get("side") == "NO" else (_cy - _ey), 1)
+            _b["clv"]             = _clv
+            _b["clv_pct"]         = round((_clv / _ek) * 100, 2)
+            _b["clv_source"]      = "kalshi"
+            _data_fixed = True
+            print(f"  Corrected Makani prop CLV bug: {_b['id']} clv -> {_clv:+.1f} (was mislabeled 'pin')")
+
 if _data_fixed:
     _save_bets(_bets)
     print("  Applied one-time data corrections (CLV/pin_entry upgrades)")
@@ -3986,9 +4020,25 @@ def _maybe_fetch_pre_close_pinnacle():
             sport   = _sport_for_ticker(ticker)
             game_idx = fresh_indices.get(sport)
 
+            # _lookup_pin_prob_for_bet only implements the "total" market lookup —
+            # it unconditionally returns None for props/spread/moneyline. The bug
+            # (see Makani WNBA prop CLV correction below): the old code treated
+            # that None the SAME as "Pinnacle briefly unavailable" and fell back to
+            # last_pin_pct (which, for an unsupported market type, is just the
+            # FLAG-TIME snapshot, since no real close was ever fetched) — then
+            # labeled it clv_source="pin" as if it were a confirmed close. That
+            # silently produced clv == entry_discount (closing_pin_pct frozen
+            # exactly at pin_prob_at_flag, pin_drift==0.0) and blocked the correct
+            # Kalshi-drift CLV fallback at settlement. Only allow the
+            # last-known-value fallback for market types the lookup genuinely
+            # supports; everything else is left alone here so the real,
+            # correctly-updating closing_yes_pct drives clv_source="kalshi" at
+            # settlement instead.
+            _pin_close_supported = bet.get("mkt_type", "total") in ("total", "")
+
             pin_prob = _lookup_pin_prob_for_bet(bet, game_idx) if game_idx else None
 
-            if pin_prob is None:
+            if pin_prob is None and _pin_close_supported:
                 # Pinnacle suspended this market or game not found — use last known
                 ek = _edge_key(bet)
                 with _edge_history_lock:
@@ -3997,19 +4047,20 @@ def _maybe_fetch_pre_close_pinnacle():
                 if pin_prob is not None:
                     print(f"  Pre-close: {bet.get('matchup','')} — Pinnacle unavailable, using last known {pin_prob}%")
 
-            # Update edge history with fresh/fallback Pinnacle close
-            ek = _edge_key(bet)
-            with _edge_history_lock:
-                hist = _edge_price_history.setdefault(ek, {})
-                if pin_prob is not None:
+            got_close = pin_prob is not None and _pin_close_supported
+
+            if got_close:
+                # Update edge history with fresh/fallback Pinnacle close
+                ek = _edge_key(bet)
+                with _edge_history_lock:
+                    hist = _edge_price_history.setdefault(ek, {})
                     hist["last_pin_pct"]      = pin_prob
                     hist["pre_close_pin_pct"] = pin_prob   # debug audit trail
 
-            # Write closing_pin_pct and CLV to bet record
-            with _bets_lock:
-                for b in _bets:
-                    if b["id"] == bet["id"]:
-                        if pin_prob is not None:
+                # Write closing_pin_pct and CLV to bet record
+                with _bets_lock:
+                    for b in _bets:
+                        if b["id"] == bet["id"]:
                             entry_k = b.get("kalshi_price", 0) * 100
                             b["closing_pin_pct"] = pin_prob
                             b["clv_source"]      = "pin"
@@ -4017,9 +4068,12 @@ def _maybe_fetch_pre_close_pinnacle():
                                 _clv = round(pin_prob - entry_k, 1)
                                 b["clv"]     = _clv
                                 b["clv_pct"] = _clv_pct(_clv, entry_k)
-                        break
+                            break
 
-            # Mark which stage completed so the two-stage logic advances correctly
+            # Mark which stage completed so the two-stage logic advances correctly —
+            # unconditional (even when we skipped writing) so unsupported market
+            # types don't get re-selected into bets_to_refresh (and re-trigger a
+            # full odds fetch) every single cycle for the rest of the window.
             game_start_chk = _parse_ticker_start_time(bet.get("ticker", ""))
             if game_start_chk is None:
                 gt = bet.get("game_time")
@@ -4035,9 +4089,15 @@ def _maybe_fetch_pre_close_pinnacle():
             else:
                 _pre_close_early_done.add(bet["id"])
                 stage_label = "EARLY"
-            bets_updated += 1
-            print(f"  Pre-close CLV [{stage_label}] {bet.get('matchup','')} | "
-                  f"{bet.get('side','')} | PIN close={pin_prob}% | {mins_chk:.0f} min to game")
+
+            if got_close:
+                bets_updated += 1
+                print(f"  Pre-close CLV [{stage_label}] {bet.get('matchup','')} | "
+                      f"{bet.get('side','')} | PIN close={pin_prob}% | {mins_chk:.0f} min to game")
+            elif not _pin_close_supported:
+                print(f"  Pre-close CLV [{stage_label}] {bet.get('matchup','')} — "
+                      f"mkt_type={bet.get('mkt_type')!r} not supported by pin-close lookup, "
+                      f"skipped (no fabricated 'pin' close written)")
 
         if bets_updated:
             with _bets_lock:

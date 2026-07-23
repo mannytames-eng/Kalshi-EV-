@@ -1165,39 +1165,67 @@ if _dedup_count:
     _data_fixed = True
     print(f"  Open dedup: most-probable line on {_dedup_count} open same-player bet(s)")
 
-# Fix: Monique Akoa Makani WNBA prop CLV (2026-07-22) — clv_source was wrongly
-# "pin" (a confirmed Pinnacle close) when NO real Pinnacle close was ever
-# fetched: _lookup_pin_prob_for_bet only implements the "total" market lookup
-# and always returns None for props, so _maybe_fetch_pre_close_pinnacle fell
-# back to last_pin_pct (the FLAG-TIME snapshot for an unsupported market type)
-# and mislabeled it a genuine close. Tell: closing_pin_pct == pin_prob_at_flag
-# exactly (48.6), so clv == entry_discount (+6.6) — not a real closing-line
-# comparison. Meanwhile closing_yes_pct WAS captured correctly by the (separate,
-# working) Kalshi-price CLV loop: 58 -> 74, a real 16pp move against this NO
-# bet. Recompute clv from that genuine Kalshi drift instead. Root cause fixed
+# Fix: bulk-correct historical prop CLV mislabeled "pin" (2026-07-22, discovered
+# via Monique Akoa Makani's WNBA points prop). _lookup_pin_prob_for_bet only
+# implements the "total" market lookup and always returns None for props, so
+# _maybe_fetch_pre_close_pinnacle fell back to last_pin_pct — for props that's
+# either the FLAG-TIME snapshot (never touched again: 152/231 historical prop
+# bets, closing_pin_pct == pin_prob_at_flag exactly) or, at best, whatever the
+# regular scan loop last observed before the props scan window closed (79/231:
+# still not a genuine pre-game close, median gap from flag only 0.4pp) — either
+# way mislabeled clv_source="pin" as if it were a confirmed closing-line fetch,
+# and blocked the correct Kalshi-drift fallback. Audited 2026-07-22: recomputing
+# from the real (correctly-captured all along) closing_yes_pct collapses the
+# stored avg prop CLV from +4.94c to +1.06c (-79%) — consistent with the
+# independent candlestick-based recompute earlier this session finding true
+# Kalshi-movement CLV near zero for both KXMLBKS and KXMLBTB. Root cause fixed
 # going forward in _maybe_fetch_pre_close_pinnacle (only writes a pin close for
-# market types the lookup actually supports — see comment there). Placed LAST
-# among the one-time corrections, after the "kalshi -> pin_entry" upgrade pass
-# above, which would otherwise match this bet and revert it. Deliberately does
-# NOT null closing_pin_pct: that pass keys on `closing_pin_pct is None`, so
-# nulling it would make these two blocks fight every restart. clv_source
-# "kalshi" is the signal that closing_pin_pct isn't the trustworthy field here;
-# its stale value is left in place (harmless — this bet is already resolved,
-# so no settlement code path reads it again) to keep both blocks' idempotency
-# checks stable.
-_makani_fix_id = "KXWNBAPTS-26JUL22PHXLA-PHXMAKOAMAKANI8-10|NO"
+# market types the lookup actually supports — see comment there). This bulk
+# pass recomputes every prop bet still tagged clv_source=="pin" from its real
+# Kalshi entry/close. Win/loss/stake/P&L untouched — CLV metadata only.
+#
+# Placed LAST among the one-time corrections, after the "kalshi -> pin_entry"
+# upgrade pass above, which would otherwise match freshly-corrected bets and
+# revert them. Deliberately does NOT null closing_pin_pct: that pass keys on
+# `closing_pin_pct is None`, so nulling it would make these two blocks fight
+# every restart. clv_source="kalshi" is the signal that closing_pin_pct isn't
+# the trustworthy field here; its stale value is left in place (harmless —
+# these bets are already resolved, so no settlement code path reads it again)
+# to keep both blocks' idempotency checks stable.
+_prop_clv_fix_count = 0
+_prop_clv_open_cleared = 0
 for _b in _bets:
-    if _b.get("id") == _makani_fix_id and _b.get("clv_source") != "kalshi":
+    if not (_b.get("mkt_type") in ("prop", "wnba_prop", "nba_prop")
+            and _b.get("clv_source") == "pin"):
+        continue
+    if _b.get("status") in ("won", "lost", "void"):
+        # Resolved (incl. void — no P&L either way, but the CLV evidence pool
+        # should still be honest): recompute clv immediately from the real,
+        # already-captured Kalshi close.
         _ey = _b.get("kalshi_yes_at_flag")
         _cy = _b.get("closing_yes_pct")
         _ek = (_b.get("kalshi_price") or 0) * 100
         if _ey is not None and _cy is not None and _ek:
             _clv = round((_ey - _cy) if _b.get("side") == "NO" else (_cy - _ey), 1)
-            _b["clv"]             = _clv
-            _b["clv_pct"]         = round((_clv / _ek) * 100, 2)
-            _b["clv_source"]      = "kalshi"
-            _data_fixed = True
-            print(f"  Corrected Makani prop CLV bug: {_b['id']} clv -> {_clv:+.1f} (was mislabeled 'pin')")
+            _b["clv"]        = _clv
+            _b["clv_pct"]    = round((_clv / _ek) * 100, 2)
+            _b["clv_source"] = "kalshi"
+            _prop_clv_fix_count += 1
+    elif _b.get("status") == "open":
+        # Still live — don't fabricate a final number now (closing_yes_pct is
+        # still being updated every cycle until game start). Just clear the
+        # stale closing_pin_pct so the correct Kalshi-drift path (which already
+        # fires whenever closing_pin_pct is None) takes over automatically at
+        # settlement, instead of the settlement code reusing this leftover bad
+        # value. Deliberately leaves clv_source=="pin" unchanged (not "kalshi")
+        # so the "kalshi -> pin_entry" upgrade pass above doesn't match it and
+        # revert it before this bet ever settles.
+        _b["closing_pin_pct"] = None
+        _prop_clv_open_cleared += 1
+if _prop_clv_fix_count or _prop_clv_open_cleared:
+    _data_fixed = True
+    print(f"  Bulk-corrected {_prop_clv_fix_count} resolved prop bet(s) mislabeled clv_source='pin' -> 'kalshi'; "
+          f"cleared stale closing_pin_pct on {_prop_clv_open_cleared} still-open prop bet(s)")
 
 if _data_fixed:
     _save_bets(_bets)

@@ -2000,6 +2000,29 @@ def _clv_pct(clv_pp: float, entry_k: float) -> Optional[float]:
     return round((clv_pp / entry_k) * 100, 2)
 
 
+def _true_clv(b: dict) -> Optional[float]:
+    """The one honest definition of CLV: Kalshi's OWN tradeable price, entry vs
+    close, side-aware (for NO bets close_side = 100 - closing_yes_pct). Positive
+    = the market you actually traded moved toward you after you bet.
+
+    This is deliberately independent of clv_source/the persisted `clv` field —
+    that field means different things per source ("pin" = Pinnacle close minus
+    Kalshi entry, a cross-market comparison; "kalshi" = this same formula). Two
+    audits this session (candlestick recompute + the prop clv_source="pin"
+    mislabel bug fix) found the cross-market version runs ~4-5x higher than
+    this and does not predict profitability (Total Bases had strong "pin" CLV
+    while losing money) — so every aggregate CLV figure should use this, not
+    the persisted field. "Value vs Pin" stays a separate, intentionally
+    cross-market metric and is unaffected."""
+    cy  = b.get("closing_yes_pct")
+    kpx = b.get("kalshi_price")
+    if cy is None or kpx is None:
+        return None
+    entry_side = kpx * 100
+    close_side = (100 - cy) if b.get("side") == "NO" else cy
+    return close_side - entry_side
+
+
 def _check_resolutions():
     """
     Settle open bets via two methods:
@@ -2398,6 +2421,8 @@ def _get_performance(since: Optional[str] = None) -> dict:
         return -f                        # loss = −stake (fraction of bankroll)
 
     # CLV stats — all market types, settled bets only.
+    # clv_bets: population for the "Value vs Pin" source breakdown below —
+    # UNCHANGED, keyed on clv_source so that section's sample sizes don't shift.
     # Open bets have a live-updating clv (current Pinnacle drift) that is NOT a
     # locked closing line.  Including them inflates avg_clv while those bets are
     # showing favourable drift and deflates it when they aren't — phantom signal
@@ -2407,7 +2432,18 @@ def _get_performance(since: Optional[str] = None) -> dict:
         if b.get("clv_source") in ("pin", "pin_entry", "kalshi")
         and b.get("status") in ("won", "lost")   # Restricts the metric to settled history
     ]
-    avg_clv  = round(sum(b["clv"] for b in clv_bets) / len(clv_bets), 1) if clv_bets else None
+    # avg_clv (headline pill) is ALWAYS Kalshi entry vs Kalshi close (_true_clv)
+    # — the one honest definition, independent of clv_source (2026-07-22; see
+    # _true_clv docstring). Deliberately a SEPARATE population from clv_bets
+    # above: don't sum the persisted b["clv"] field here — for clv_source
+    # "pin"/"pin_entry" bets that field is Pinnacle-referenced (a different,
+    # cross-market quantity — see the "Value vs Pin" section), not real CLV.
+    _true_clv_bets = [
+        b for b in all_clean
+        if b.get("status") in ("won", "lost") and _true_clv(b) is not None
+    ]
+    avg_clv = (round(sum(_true_clv(b) for b in _true_clv_bets) / len(_true_clv_bets), 1)
+               if _true_clv_bets else None)
 
     # ── CLV source breakdown — exposes how much of avg_clv is real vs proxy ──
     # "pin"       = true closing line: pre-close Pinnacle fetch fired and got a fresh
@@ -2626,7 +2662,7 @@ def _get_performance(since: Optional[str] = None) -> dict:
             by_type[label]["kelly"].append(kp)
         if _pin_drift_v is not None:
             by_type[label]["pin_drifts"].append(_pin_drift_v)
-        clv_val = b.get("clv")
+        clv_val = _true_clv(b)   # honest Kalshi entry-vs-close, not the persisted (source-mixed) field
         if clv_val is not None:
             by_type[label]["clv"].append(clv_val)
 
@@ -2685,19 +2721,13 @@ def _get_performance(since: Optional[str] = None) -> dict:
     avg_pin_drift      = round(sum(_pin_drifts_agg)  / len(_pin_drifts_agg),  1) if _pin_drifts_agg  else None
 
     # True alpha = realized, Kalshi-only price movement (entry vs. closing Kalshi
-    # price, side-aware — for NO bets close_side = 100 − closing_yes_pct). This is
-    # the confirmed alpha: did Kalshi's own line move toward us after we bet?
-    # Entry Discount above is only the *predicted* mispricing vs. Pinnacle at the
-    # moment of the bet — it is never confirmed against what actually happened.
-    _true_alpha_vals: list = []
-    for b in all_settled:
-        _cy  = b.get("closing_yes_pct")
-        _kpx = b.get("kalshi_price")
-        if _cy is None or _kpx is None:
-            continue
-        _entry_side = _kpx * 100
-        _close_side = (100 - _cy) if b.get("side") == "NO" else _cy
-        _true_alpha_vals.append(_close_side - _entry_side)
+    # price, side-aware). This is the confirmed alpha: did Kalshi's own line move
+    # toward us after we bet? Entry Discount above is only the *predicted*
+    # mispricing vs. Pinnacle at the moment of the bet — never confirmed against
+    # what actually happened. Same formula as the headline avg_clv (_true_clv) —
+    # they're the same underlying quantity, shown in two places for two
+    # different framings (headline pill vs. the Model Alpha detail section).
+    _true_alpha_vals = [_true_clv(b) for b in all_settled if _true_clv(b) is not None]
     avg_true_alpha = round(sum(_true_alpha_vals) / len(_true_alpha_vals), 2) if _true_alpha_vals else None
     true_alpha_n   = len(_true_alpha_vals)
 
@@ -2763,7 +2793,7 @@ def _get_performance(since: Optional[str] = None) -> dict:
             return {"n": 0}
         wins  = sum(1 for b in s if b["status"] == "won")
         units = [b["unit_pnl"] for b in s if b.get("unit_pnl") is not None]
-        clvs  = [b["clv"] for b in s if b.get("clv") is not None]
+        clvs  = [_true_clv(b) for b in s if _true_clv(b) is not None]   # honest Kalshi entry-vs-close, not the persisted (source-mixed) field
         kdols = [b["kelly_pnl_dollars"] for b in s if b.get("kelly_pnl_dollars") is not None]
         clusters: dict = {}
         for b in s:

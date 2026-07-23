@@ -1770,9 +1770,12 @@ def _build_score_index() -> dict:
 
 
 def _lookup_box_stat(bet: dict):
-    """Core MLB box-score lookup for a prop bet. Returns (value:int, label:str)
-    or None. Works on both final and in-progress (live) box scores — the MLB
-    Stats API updates the same endpoint during the game."""
+    """Core box-score lookup for a prop bet. Returns (value:int, label:str)
+    or None. Works on both final and in-progress (live) box scores — both the
+    MLB Stats API and ESPN's WNBA summary update the same endpoint during the
+    game. WNBA tickers dispatch to the ESPN path (defined below)."""
+    if bet.get("ticker", "").upper().startswith("KXWNBA"):
+        return _lookup_wnba_box_stat(bet)
     import re   # re is imported locally throughout this module, not globally
     prop_type = bet.get("prop_type", "")
     matchup   = bet.get("matchup", "")
@@ -1884,8 +1887,11 @@ def _live_stat_text(bet: dict, value, label) -> str:
 
 
 def _fetch_game_inning(bet: dict) -> Optional[str]:
-    """Return the live inning for a bet's game, e.g. 'Top 7th', 'Bot 3rd',
-    'Mid 5th', 'Final', or None. Uses the schedule's linescore hydrate."""
+    """Return the live game state for a bet's game — MLB: 'Top 7th', 'Bot 3rd',
+    'Mid 5th'; WNBA: 'Q3 5:24', 'Half'; both: 'Final'; or None. MLB uses the
+    schedule's linescore hydrate; WNBA dispatches to the ESPN scoreboard."""
+    if bet.get("ticker", "").upper().startswith("KXWNBA"):
+        return _fetch_wnba_quarter(bet)
     import re
     ticker = bet.get("ticker", "")
     game_date = _parse_ticker_date(ticker)
@@ -1919,13 +1925,150 @@ def _fetch_game_inning(bet: dict) -> Optional[str]:
     return None
 
 
+# ── WNBA (ESPN) — final results, live box stats, quarter/clock ────────────────
+# Mirrors the MLB Stats API plumbing above using ESPN's public scoreboard +
+# summary endpoints (free, no key, same endpoint live and final). Kalshi WNBA
+# prop tickers look like KXWNBAPTS-26JUL22PHXLA-PHXMAKOAMAKANI8-10 — the date
+# has NO time component and the team segment concatenates away+home Kalshi
+# codes. ESPN abbrs differ from Kalshi's on two teams (CONN→CON, PDX→POR).
+_WNBA_TEAMS  = {"ATL", "CHI", "CONN", "DAL", "GS", "IND", "LA", "LV", "MIN",
+                "NY", "PHX", "SEA", "WSH", "PDX", "TOR"}
+_WNBA_K2ESPN = {"CONN": "CON", "PDX": "POR"}   # Kalshi → ESPN abbr (identical otherwise)
+_WNBA_STAT_MAP = {"KXWNBAPTS": "PTS", "KXWNBAREB": "REB", "KXWNBAAST": "AST"}
+
+_wnba_sb_cache: dict = {}    # "YYYYMMDD" → (fetched_ts, events list) — 60s TTL
+_wnba_sum_cache: dict = {}   # ESPN event id → (fetched_ts, summary json) — 45s TTL
+
+
+def _wnba_scoreboard(date_iso: str) -> list:
+    """ESPN WNBA scoreboard for a YYYY-MM-DD date, cached 60s. Returns a list
+    of {id, away, home, start, state, period, clock, detail} (ESPN abbrs;
+    state is pre/in/post). Serves the stale cache on fetch failure."""
+    key = date_iso.replace("-", "")
+    now = time.time()
+    hit = _wnba_sb_cache.get(key)
+    if hit and now - hit[0] < 60:
+        return hit[1]
+    try:
+        import urllib.request as _ur
+        url = f"https://site.api.espn.com/apis/site/v2/sports/basketball/wnba/scoreboard?dates={key}"
+        with _ur.urlopen(url, timeout=5) as r:
+            data = json.loads(r.read())
+        events = []
+        for ev in data.get("events", []):
+            comp  = (ev.get("competitions") or [{}])[0]
+            teams = {c.get("homeAway"): (c.get("team") or {}).get("abbreviation", "")
+                     for c in comp.get("competitors", [])}
+            st = ev.get("status", {}) or {}
+            events.append({
+                "id":     ev.get("id"),
+                "away":   teams.get("away", ""),
+                "home":   teams.get("home", ""),
+                "start":  ev.get("date"),
+                "state":  (st.get("type") or {}).get("state", ""),
+                "period": st.get("period"),
+                "clock":  st.get("displayClock"),
+                "detail": (st.get("type") or {}).get("shortDetail", ""),
+            })
+    except Exception:
+        return hit[1] if hit else []
+    _wnba_sb_cache[key] = (now, events)
+    return events
+
+
+def _wnba_event_for_ticker(ticker: str) -> Optional[dict]:
+    """Match a Kalshi WNBA ticker to its ESPN scoreboard event via the
+    concatenated away+home team segment (e.g. PHXLA, DALPDX)."""
+    import re
+    game_date = _parse_ticker_date(ticker)
+    m = re.search(r"KXWNBA[A-Z]*-\d{2}[A-Z]{3}\d{2}([A-Z]+)-", ticker.upper())
+    if not game_date or not m:
+        return None
+    seg = m.group(1)
+    for n in (4, 3, 2):          # CONN is 4 letters — try longest split first
+        a, h = seg[:n], seg[n:]
+        if a in _WNBA_TEAMS and h in _WNBA_TEAMS:
+            ea, eh = _WNBA_K2ESPN.get(a, a), _WNBA_K2ESPN.get(h, h)
+            for ev in _wnba_scoreboard(game_date):
+                if ev["away"] == ea and ev["home"] == eh:
+                    return ev
+    return None
+
+
+def _lookup_wnba_box_stat(bet: dict):
+    """WNBA counterpart of _lookup_box_stat: (value:int, label:str) or None.
+    Works on both live and final box scores (same ESPN summary endpoint)."""
+    import re
+    ticker  = bet.get("ticker", "").upper()
+    label   = next((lab for pfx, lab in _WNBA_STAT_MAP.items() if ticker.startswith(pfx)), None)
+    matchup = bet.get("matchup", "")
+    if not label or not matchup:
+        return None
+    ev = _wnba_event_for_ticker(ticker)
+    if not ev or ev["state"] == "pre" or not ev.get("id"):
+        return None
+    # Same last-name match as MLB, incl. stripping a "(TEAM)" disambiguator.
+    player_last = re.sub(r"\s*\([^)]*\)\s*$", "", matchup).split()[-1].lower()
+    try:
+        import urllib.request as _ur
+        now = time.time()
+        hit = _wnba_sum_cache.get(ev["id"])
+        if hit and now - hit[0] < 45:
+            summ = hit[1]
+        else:
+            url = f"https://site.api.espn.com/apis/site/v2/sports/basketball/wnba/summary?event={ev['id']}"
+            with _ur.urlopen(url, timeout=5) as r:
+                summ = json.loads(r.read())
+            _wnba_sum_cache[ev["id"]] = (now, summ)
+        for team in (summ.get("boxscore", {}) or {}).get("players", []):
+            for stat in team.get("statistics", []):
+                labels = stat.get("labels") or stat.get("names") or []
+                if label not in labels:
+                    continue
+                idx = labels.index(label)
+                for ath in stat.get("athletes", []):
+                    nm = (ath.get("athlete") or {}).get("displayName", "")
+                    if not nm or nm.split()[-1].lower() != player_last:
+                        continue
+                    raw = ath.get("stats") or []
+                    # DNP players have an empty stats array
+                    if idx < len(raw) and raw[idx] not in ("", "--"):
+                        try:
+                            return (int(raw[idx]), label)
+                        except ValueError:
+                            return None
+    except Exception:
+        pass
+    return None
+
+
+def _fetch_wnba_quarter(bet: dict) -> Optional[str]:
+    """Live game state for a WNBA bet: 'Q3 5:24', 'Half', 'OT 2:00', 'Final',
+    or None (pregame / unknown)."""
+    ev = _wnba_event_for_ticker(bet.get("ticker", "").upper())
+    if not ev:
+        return None
+    if ev["state"] == "post":
+        return "Final"
+    if ev["state"] != "in":
+        return None
+    if "half" in (ev.get("detail") or "").lower():
+        return "Half"
+    p = ev.get("period")
+    if not p:
+        return None
+    lab = f"Q{p}" if p <= 4 else ("OT" if p == 5 else f"{p - 4}OT")
+    return f"{lab} {ev.get('clock') or ''}".strip()
+
+
 # ── Live in-game stat cache (refreshed by a background loop) ──────────────────
 _live_stats: dict = {}                 # bet_id → display string like "4 K · needs 6+"
 _live_stats_lock = threading.Lock()
 
 def _live_stats_loop():
     """Every 60s, refresh live in-game stats for open prop bets whose game has
-    started. Reads the live MLB box score; rate-limited and self-contained."""
+    started. Reads the live MLB box score (or ESPN box score for WNBA props);
+    rate-limited and self-contained."""
     import time as _t
     while True:
         try:
@@ -1933,7 +2076,8 @@ def _live_stats_loop():
             with _bets_lock:
                 inplay = []
                 for b in _bets:
-                    if b.get("status") != "open" or b.get("mkt_type") != "prop":
+                    if b.get("status") != "open" or \
+                            b.get("mkt_type") not in ("prop", "wnba_prop", "nba_prop"):
                         continue
                     gt = b.get("game_time")
                     started = False
@@ -2121,7 +2265,7 @@ def _check_resolutions():
                     b["status"]      = "won" if side_won else "lost"
                     b["resolved_at"] = datetime.now(timezone.utc).isoformat()
                     b["resolved_by"] = "score"
-                    if b.get("mkt_type") == "prop" and not b.get("actual_result"):
+                    if b.get("mkt_type") in ("prop", "wnba_prop", "nba_prop") and not b.get("actual_result"):
                         b["actual_result"] = _fetch_actual_stat(b)
                     # Kelly P&L — use paper_stake as the bet size
                     ps = b.get("paper_stake") or 0.0
@@ -2243,7 +2387,7 @@ def _check_resolutions():
                         b["status"]          = "won" if side_won else "lost"
                         b["resolved_at"]     = datetime.now(timezone.utc).isoformat()
                         b["resolved_by"]     = "kalshi"
-                        if b.get("mkt_type") == "prop" and not b.get("actual_result"):
+                        if b.get("mkt_type") in ("prop", "wnba_prop", "nba_prop") and not b.get("actual_result"):
                             b["actual_result"] = _fetch_actual_stat(b)
                         if closing_yes is not None:
                             b["closing_yes_pct"] = closing_yes
@@ -4864,6 +5008,32 @@ function mlbLogo(ticker) {
   return `<img src="https://www.mlbstatic.com/team-logos/${id}.svg" onerror="this.style.display='none'" style="width:18px;height:18px;vertical-align:middle;margin-right:6px;object-fit:contain;">`;
 }
 
+// WNBA team logo for a player-prop ticker (e.g. KXWNBAPTS-26JUL22PHXLA-PHXMAKOAMAKANI8-10
+// => player team PHX). Same disambiguation approach as mlbLogo. Notes: the WNBA
+// date segment has NO time digits, and CONN is a 4-letter code so splits try
+// longest-first. ESPN CDN slugs differ from Kalshi codes on CONN→con, PDX→por.
+const _WNBA_TEAMS_JS = new Set(['ATL','CHI','CONN','DAL','GS','IND','LA','LV','MIN','NY','PHX','SEA','WSH','PDX','TOR']);
+const _WNBA_SLUG = {ATL:'atl',CHI:'chi',CONN:'con',DAL:'dal',GS:'gs',IND:'ind',LA:'la',LV:'lv',MIN:'min',NY:'ny',PHX:'phx',SEA:'sea',WSH:'wsh',PDX:'por',TOR:'tor'};
+function wnbaLogo(ticker) {
+  if (!ticker) return '';
+  const m = ticker.match(/^KXWNBA(?:PTS|REB|AST)-\d{2}[A-Z]{3}\d{2}([A-Z]+)-([A-Z]+?)\d/);
+  if (!m) return '';
+  const matchup = m[1], playerSeg = m[2];
+  let away, home;
+  for (const n of [4, 3, 2]) {
+    const a = matchup.slice(0, n), h = matchup.slice(n);
+    if (_WNBA_TEAMS_JS.has(a) && _WNBA_TEAMS_JS.has(h)) { away = a; home = h; break; }
+  }
+  if (!away) return '';
+  const team = playerSeg.startsWith(away) ? away : (playerSeg.startsWith(home) ? home : null);
+  const slug = team && _WNBA_SLUG[team];
+  if (!slug) return '';
+  return `<img src="https://a.espncdn.com/i/teamlogos/wnba/500/${slug}.png" onerror="this.style.display='none'" style="width:18px;height:18px;vertical-align:middle;margin-right:6px;object-fit:contain;">`;
+}
+
+// Sport-agnostic logo dispatch — use this at render sites, not mlbLogo directly.
+function teamLogo(ticker) { return mlbLogo(ticker) || wnbaLogo(ticker); }
+
 // Edge color by strength: orange (weakest) → yellow → green → bright green (strongest)
 function edgeColor(pct) {
   if (pct >= 12) return '#00e676';   // bright green  — 12%+
@@ -5179,7 +5349,7 @@ function renderTable(edges) {
       ? `<span class="badge-drift">(${e.drift_pct > 0 ? '+' : ''}${e.drift_pct}%)</span>` : '';
     rows += `
     <tr>
-      <td class="matchup-inline">${mlbLogo(e.ticker)}${matchupHtml(e.matchup)}</td>
+      <td class="matchup-inline">${teamLogo(e.ticker)}${matchupHtml(e.matchup)}</td>
       <td class="prop-col">${e.title}${kalshiLineBadge(e)}${newBadge}${staleBadge}${driftTxt}</td>
       <td class="num pin-line">${pinLineLabel(e)}</td>
       <td class="side-${e.side.toLowerCase()}">${e.side}</td>
@@ -5574,12 +5744,12 @@ function renderTodayEdges() {
 
     // ── Live in-game counter (replaces the old Entry➔Live line column) ──────
     const liveCounter = b.live_stat
-      ? `<span style="font-weight:700;font-size:13px;color:var(--text);white-space:nowrap;" title="Live in-game stat — MLB box score, updates ~every minute">${b.live_stat}</span>`
+      ? `<span style="font-weight:700;font-size:13px;color:var(--text);white-space:nowrap;" title="Live in-game stat — official box score (MLB / ESPN for WNBA), updates ~every minute">${b.live_stat}</span>`
       : `<span style="color:var(--muted);">—</span>`;
 
     return `<tr>
       <td style="font-size:11px;color:var(--muted);white-space:nowrap;">${flagTime}</td>
-      <td>${mlbLogo(b.ticker)}${matchupHtml(b.matchup)}${gameTimeBadge}</td>
+      <td>${teamLogo(b.ticker)}${matchupHtml(b.matchup)}${gameTimeBadge}</td>
       <td class="prop-col" style="font-size:12px;">${b.title}${kalshiLineBadge(b)}${driftTxt}${tickerTxt}${kalshiLink}</td>
       <td class="${sideClass}">${sideLabel(b)}</td>
       <td class="num" style="color:${edgeColor(b.edge_pct)};font-weight:700;">+${pct(b.edge_pct)}${flagOddsTxt}</td>
@@ -6247,7 +6417,7 @@ function renderPerformance(d) {
     return `<tr style="${b.correlated || b.clv_source === 'corrupted_utc' ? 'opacity:0.55;' : isShadow ? 'opacity:0.75;border-left:2px solid #58a6ff22;' : ''}">
       <td>${ts}</td>
       <td>${gameTimeCell}</td>
-      <td>${mlbLogo(b.ticker)}${b.matchup}${corrBadge}${corruptBadge}${shadowBadge}</td>
+      <td>${teamLogo(b.ticker)}${b.matchup}${corrBadge}${corruptBadge}${shadowBadge}</td>
       <td class="prop-col">${b.title}</td>
       <td class="side-${b.side.toLowerCase()}">${sideLabel(b)}</td>
       <td class="num">${edgeCell}</td>
@@ -6257,7 +6427,7 @@ function renderPerformance(d) {
         const fg = hit ? 'var(--green)' : 'var(--red)';
         const bg = hit ? 'rgba(63,185,80,0.12)' : 'rgba(248,81,73,0.12)';
         const bd = hit ? 'rgba(63,185,80,0.4)' : 'rgba(248,81,73,0.4)';
-        return `<div style="margin-top:4px;"><span title="Actual result for this player/game (MLB official box score)" style="display:inline-block;font-size:11px;font-weight:700;color:${fg};background:${bg};border:1px solid ${bd};border-radius:4px;padding:1px 6px;letter-spacing:0.2px;">${b.actual_result}</span></div>`;
+        return `<div style="margin-top:4px;"><span title="Actual result for this player/game (official box score — MLB Stats API / ESPN for WNBA)" style="display:inline-block;font-size:11px;font-weight:700;color:${fg};background:${bg};border:1px solid ${bd};border-radius:4px;padding:1px 6px;letter-spacing:0.2px;">${b.actual_result}</span></div>`;
       })() : ''}</td>
       <td class="num">${kBet}</td>
       <td class="num">${kPnl}</td>
@@ -6473,7 +6643,7 @@ async function fetchPaper() {
 
         return `<tr style="${b.clv_source === 'corrupted_utc' ? 'opacity:0.55;' : ''}">
           <td style="color:var(--muted);font-size:11px;">${flagDate}</td>
-          <td class="matchup-inline">${mlbLogo(b.ticker)}${matchupHtml(b.matchup)}</td>
+          <td class="matchup-inline">${teamLogo(b.ticker)}${matchupHtml(b.matchup)}</td>
           <td style="font-size:12px;max-width:200px;">${b.title}${capBadge}</td>
           <td class="side-${(b.side||'').toLowerCase()}">${sideLabel(b)}</td>
           <td class="num">${edgeTag}</td>
@@ -7110,7 +7280,7 @@ def _backfill_actual_results():
     with _bets_lock:
         todo = [b for b in _bets
                 if b.get("status") in ("won", "lost")
-                and b.get("mkt_type") == "prop"
+                and b.get("mkt_type") in ("prop", "wnba_prop", "nba_prop")
                 and not b.get("actual_result")
                 and not b.get("ticker", "").upper().startswith("KXMLBHR")]
     if not todo:

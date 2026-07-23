@@ -676,6 +676,106 @@ def power_devig_prob(odds_a: float, odds_b: float, _iters: int = 80) -> Tuple[fl
     return pa / total, pb / total
 
 
+def shin_devig_multi(implied: List[float], _iters: int = 90) -> List[float]:
+    """N-way Shin de-vig. `implied` = per-outcome raw implied probabilities
+    (sum > 1 by the vig). Returns fair probabilities summing to 1.
+
+    This is the natural home of Shin's method: it was built for multi-runner
+    books, and the 2-outcome case (shin_devig_prob above) is the awkward edge
+    where it can fail to bracket. For 3-way soccer (home / draw / away) the
+    solve is well-conditioned — f(0)=sqrt(S)-1 > 0 and f(1)=Σpi²/S < 1 for any
+    realistic slate, so a root in z∈(0,1) always exists. Shin shrinks the
+    longshot (the draw, usually) and inflates the favorite relative to the
+    proportional de-vig, correcting the favorite-longshot bias that matters
+    more on 3-way markets than on near-coin-flip 2-way lines.
+
+    Falls back to proportional if there's no overround (S≤1), fewer than 2
+    outcomes, a non-positive input, or z can't be bracketed (should not happen
+    on a valid 3-way, but never fabricate a probability from a failed solve)."""
+    S = sum(implied)
+    n = len(implied)
+    if S <= 1.0 or n < 2 or any(pi <= 0 for pi in implied):
+        return [pi / S for pi in implied] if S > 0 else list(implied)
+
+    def p_i(pi: float, z: float) -> float:
+        if z >= 1.0 - 1e-12:
+            return (pi * pi) / S
+        return (math.sqrt(z * z + 4.0 * (1.0 - z) * (pi * pi) / S) - z) / (2.0 * (1.0 - z))
+
+    def f(z: float) -> float:
+        return sum(p_i(pi, z) for pi in implied) - 1.0
+
+    lo, hi = 0.0, 1.0 - 1e-9
+    f_lo, f_hi = f(lo), f(hi)
+    if f_lo * f_hi > 0:
+        return [pi / S for pi in implied]   # no bracketed root — proportional fallback
+    for _ in range(_iters):
+        mid = (lo + hi) / 2.0
+        f_mid = f(mid)
+        if f_lo * f_mid <= 0:
+            hi, f_hi = mid, f_mid
+        else:
+            lo, f_lo = mid, f_mid
+    z = (lo + hi) / 2.0
+    ps = [p_i(pi, z) for pi in implied]
+    tot = sum(ps)
+    return [p / tot for p in ps] if tot > 0 else [pi / S for pi in implied]
+
+
+# ── Poisson total-goals helpers (soccer) ─────────────────────────────────────
+# Soccer total goals are low-count and well-modelled by a Poisson on the match
+# total (the sum of two independent team Poissons is itself Poisson). Pinnacle
+# posts ONE total line per game; we de-vig it to an over-probability, fit the
+# single λ that reproduces it, then price EVERY Kalshi over-x.5 rung off that λ.
+# This mirrors the WNBA single-line extrapolation but with the discrete Poisson
+# tail (goals are lumpy and low, so a Normal would misprice the tails). Caveat:
+# real scorelines are mildly overdispersed/correlated vs pure Poisson, so far-
+# out rungs are guarded (MLS_MAX_TOTAL_RUNGS) and MLS launches shadow-first.
+def _poisson_cdf(k: int, lam: float) -> float:
+    """P(X ≤ k) for X ~ Poisson(lam), computed by stable term recurrence."""
+    if k < 0:
+        return 0.0
+    term = math.exp(-lam)
+    cum = term
+    for i in range(1, k + 1):
+        term *= lam / i
+        cum += term
+    return cum
+
+
+def poisson_over_prob(line: float, lam: float) -> float:
+    """P(total goals > line) for a half-integer Kalshi line k.5 → P(X ≥ k+1)."""
+    return 1.0 - _poisson_cdf(int(math.floor(line)), lam)
+
+
+def fit_poisson_lambda(pin_line: float, pin_over_prob: float) -> Optional[float]:
+    """Solve for the Poisson mean λ that reproduces Pinnacle's de-vigged over
+    probability at its posted line. Handles both half-integer lines (no push)
+    and integer lines (Pinnacle voids the exact-total push, so its over is the
+    push-excluded conditional). Bisection on the monotonic-in-λ over function."""
+    if not (0.0 < pin_over_prob < 1.0) or pin_line <= 0:
+        return None
+    is_integer = abs(pin_line - round(pin_line)) < 1e-6
+
+    def model_over(lam: float) -> float:
+        if is_integer:
+            L = int(round(pin_line))
+            pmf_L = math.exp(-lam) * lam ** L / math.factorial(L)
+            return (1.0 - _poisson_cdf(L, lam)) / (1.0 - pmf_L) if pmf_L < 1.0 else 0.0
+        return poisson_over_prob(pin_line, lam)
+
+    lo, hi = 0.05, 8.0
+    if model_over(lo) > pin_over_prob or model_over(hi) < pin_over_prob:
+        return None   # target outside plausible λ range — don't extrapolate a bad fit
+    for _ in range(100):
+        mid = (lo + hi) / 2.0
+        if model_over(mid) < pin_over_prob:
+            lo = mid
+        else:
+            hi = mid
+    return (lo + hi) / 2.0
+
+
 def prob_to_american(p: float) -> Optional[int]:
     """Convert a decimal (no-vig) probability to American odds.
     e.g. 0.60 → -150,  0.40 → +150,  0.50 → +100
@@ -3272,6 +3372,345 @@ def scan_wnba_player_props() -> List[dict]:
         mkt_type_label  = "wnba_prop",
         parse_event_fn  = _parse_nba_event,
     )
+
+
+# ── MLS (soccer) — moneyline (3-way) + total goals ───────────────────────────
+# Added 2026-07-23 with the credits freed by terminating Total Bases. Soccer is
+# structurally different from MLB/WNBA (a THIRD moneyline outcome — the draw —
+# and low-count Poisson totals), so it gets a dedicated scanner rather than
+# threading special-cases through scan_sport (keeps the proven MLB/WNBA path
+# untouched). Pinnacle is the sole fair-value anchor, same as every other
+# market. Launches SHADOW-first (KXMLS in SHADOW_MARKETS, UI side) until it
+# earns a CLV/calibration track record.
+#
+# Kalshi MLS market shapes (verified live):
+#   KXMLSGAME-<date><HOMEAWAY>-<CODE>  three binary markets per game:
+#       -<HOMECODE>  YES = home team wins
+#       -<AWAYCODE>  YES = away team wins
+#       -TIE         YES = draw
+#   KXMLSTOTAL-<date><HOMEAWAY>-<n>    over 0.5 / 1.5 / … / 5.5 goals (YES = over)
+#
+# DOUBLE CHANCE is automatic — it's the NO side of a team/tie market, which the
+# YES/NO edge logic already evaluates:
+#   NO on away-team market  = home win OR draw   (1X)
+#   NO on home-team market  = away win OR draw   (X2)
+#   NO on TIE               = either team wins    (12, "no draw")
+# Correct 3-way de-vig (fair probs summing to 1) is what makes the NO/DC price
+# right, so no separate market wiring is needed.
+#
+# code → (Pinnacle team name for odds matching, ESPN team id for logos/live).
+# All 30 MLS teams; Kalshi codes taken from live KXMLSGAME market tickers.
+MLS_TEAMS: Dict[str, Dict[str, str]] = {
+    "ATL":  {"pin": "Atlanta United FC",      "espn": "18418"},
+    "ATX":  {"pin": "Austin FC",              "espn": "20906"},
+    "MTL":  {"pin": "CF Montreal",            "espn": "9720"},
+    "CLT":  {"pin": "Charlotte FC",           "espn": "21300"},
+    "CHI":  {"pin": "Chicago Fire",           "espn": "182"},
+    "COL":  {"pin": "Colorado Rapids",        "espn": "184"},
+    "CLB":  {"pin": "Columbus Crew SC",       "espn": "183"},
+    "DCU":  {"pin": "D.C. United",            "espn": "193"},
+    "CIN":  {"pin": "FC Cincinnati",          "espn": "18267"},
+    "DAL":  {"pin": "FC Dallas",              "espn": "185"},
+    "HOU":  {"pin": "Houston Dynamo",         "espn": "6077"},
+    "MIA":  {"pin": "Inter Miami CF",         "espn": "20232"},
+    "LAG":  {"pin": "LA Galaxy",              "espn": "187"},
+    "LAFC": {"pin": "Los Angeles FC",         "espn": "18966"},
+    "MIN":  {"pin": "Minnesota United FC",    "espn": "17362"},
+    "NSH":  {"pin": "Nashville SC",           "espn": "18986"},
+    "NE":   {"pin": "New England Revolution", "espn": "189"},
+    "NYC":  {"pin": "New York City FC",       "espn": "17606"},
+    "NYRB": {"pin": "New York Red Bulls",     "espn": "190"},
+    "ORL":  {"pin": "Orlando City SC",        "espn": "12011"},
+    "PHI":  {"pin": "Philadelphia Union",     "espn": "10739"},
+    "POR":  {"pin": "Portland Timbers",       "espn": "9723"},
+    "RSL":  {"pin": "Real Salt Lake",         "espn": "4771"},
+    "SD":   {"pin": "San Diego FC",           "espn": "22529"},
+    "SJ":   {"pin": "San Jose Earthquakes",   "espn": "191"},
+    "SEA":  {"pin": "Seattle Sounders FC",    "espn": "9726"},
+    "SKC":  {"pin": "Sporting Kansas City",   "espn": "186"},
+    "STL":  {"pin": "St. Louis City SC",      "espn": "21812"},
+    "TOR":  {"pin": "Toronto FC",             "espn": "7318"},
+    "VAN":  {"pin": "Vancouver Whitecaps FC", "espn": "9727"},
+}
+_MLS_PIN_TO_CODE = {v["pin"]: k for k, v in MLS_TEAMS.items()}
+MLS_MAX_TOTAL_RUNGS = 2.5   # only price Kalshi over-x.5 rungs within this many
+                            # goals of Pinnacle's line — the Poisson tail gets
+                            # unreliable far out (mild overdispersion), same
+                            # guard philosophy as WNBA_EXTRAP_MAX_RUNGS.
+
+
+def fetch_mls_odds() -> Tuple[Dict[str, dict], str]:
+    """Fetch Pinnacle MLS h2h (3-way) + totals in one call (2 credits) and build
+    a per-game index keyed by frozenset of the two Pinnacle team names:
+        { frozenset({home,away}): {
+            "home", "away", "commence_time",
+            "ml":    {team_name: fair_prob, ...}  # 3-way Shin de-vig, draw incl.
+            "draw":  fair_prob,
+            "total": {"line": L, "over_prob": p} or None,
+        } }
+    fair_prob values are the Shin de-vigged probabilities (sum to 1 across the
+    three moneyline outcomes)."""
+    r = requests.get(f"{ODDS_BASE}/sports/soccer_usa_mls/odds", params={
+        "apiKey":     ODDS_API_KEY,
+        "bookmakers": "pinnacle",
+        "markets":    "h2h,totals",
+        "oddsFormat": "american",
+    }, timeout=15)
+    r.raise_for_status()
+    remaining = r.headers.get("x-requests-remaining", "?")
+    index: Dict[str, dict] = {}
+    for g in r.json():
+        home, away = g.get("home_team", ""), g.get("away_team", "")
+        if not home or not away:
+            continue
+        entry: dict = {"home": home, "away": away,
+                       "commence_time": g.get("commence_time"),
+                       "ml": {}, "draw": None, "total": None}
+        for bm in g.get("bookmakers", []):
+            if bm.get("key") != "pinnacle":
+                continue
+            for mk in bm.get("markets", []):
+                outs = {o["name"]: o["price"] for o in mk.get("outcomes", []) if o.get("price") is not None}
+                if mk.get("key") == "h2h" and home in outs and away in outs and "Draw" in outs:
+                    implied = [american_to_implied(outs[home]),
+                               american_to_implied(outs[away]),
+                               american_to_implied(outs["Draw"])]
+                    ph, pa, pd = shin_devig_multi(implied)
+                    entry["ml"] = {home: ph, away: pa}
+                    entry["draw"] = pd
+                elif mk.get("key") == "totals":
+                    over  = next((o for o in mk.get("outcomes", []) if o.get("name") == "Over"), None)
+                    under = next((o for o in mk.get("outcomes", []) if o.get("name") == "Under"), None)
+                    if over and under and over.get("point") is not None:
+                        io = american_to_implied(over["price"])
+                        iu = american_to_implied(under["price"])
+                        if io + iu > 0:
+                            entry["total"] = {"line": float(over["point"]),
+                                              "over_prob": io / (io + iu)}
+        if entry["ml"] and entry["draw"] is not None:
+            index[frozenset({home, away})] = entry
+    return index, remaining
+
+
+def _mls_teams_from_event(evt: dict) -> Optional[Tuple[str, str]]:
+    """Return (home_code, away_code) for a KXMLS event from its non-TIE market
+    ticker suffixes. The event ticker's concatenated segment is ambiguous to
+    split (2- vs 3- vs 4-letter codes), but each market ticker ends in its own
+    unambiguous team code, so read them directly. Kalshi lists home first."""
+    codes = []
+    for m in (evt.get("markets") or []):
+        suffix = m.get("ticker", "").split("-")[-1]
+        if suffix and suffix != "TIE" and suffix in MLS_TEAMS:
+            codes.append(suffix)
+    # de-dupe preserving order (KXMLSTOTAL markets all share the game, no codes)
+    seen: set = set()
+    codes = [c for c in codes if not (c in seen or seen.add(c))]
+    return (codes[0], codes[1]) if len(codes) == 2 else None
+
+
+def scan_mls(mls_index: Optional[Dict[str, dict]] = None) -> Tuple[List[dict], str]:
+    """Scan Kalshi MLS moneyline (KXMLSGAME, 3-way) and total-goals (KXMLSTOTAL)
+    markets against Pinnacle's Shin-devigged 3-way probabilities and Poisson
+    total model. Returns (edges, credits_remaining). Same edge-dict format as
+    scan_sport so the UI consumes it identically. Double chance rides free on
+    the NO side of team/tie markets (see module comment above)."""
+    print(f"\n{'═'*70}")
+    print(f"  MLS — Moneyline (3-way) & Total Goals  —  {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"{'═'*70}")
+
+    remaining = "?"
+    if mls_index is None:
+        try:
+            mls_index, remaining = fetch_mls_odds()
+        except Exception as exc:
+            print(f"  ERROR — MLS book odds: {exc}")
+            return [], remaining
+    print(f"  Pinnacle MLS games: {len(mls_index)}")
+
+    def _find_game(home_code: str, away_code: str) -> Optional[dict]:
+        hp = MLS_TEAMS.get(home_code, {}).get("pin")
+        ap = MLS_TEAMS.get(away_code, {}).get("pin")
+        if not hp or not ap:
+            return None
+        return mls_index.get(frozenset({hp, ap}))
+
+    edges: List[dict] = []
+    now_utc = datetime.now(timezone.utc)
+
+    def _price_market(mkt: dict, fair: float, mkt_type: str, title: str,
+                      matchup: str, commence_time, pin_line, threshold) -> Optional[dict]:
+        """Shared YES/NO edge builder — identical EV math to scan_sport."""
+        prices = kalshi_prices(mkt)
+        if prices is None:
+            return None
+        yes_bid, yes_ask = prices
+        yes_raw = fair - yes_ask
+        no_raw  = (1 - fair) - (1 - yes_bid)
+        yes_fee = KALSHI_FEE_RATE * fair       * (1 - yes_ask)
+        no_fee  = KALSHI_FEE_RATE * (1 - fair) * yes_bid
+        yes_adj = (yes_raw - yes_fee) * (1 - EV_HAIRCUT)
+        no_adj  = (no_raw  - no_fee)  * (1 - EV_HAIRCUT)
+        best_adj = max(yes_adj, no_adj)
+        if best_adj < EDGE_THRESHOLD or best_adj > MAX_EDGE:
+            return None
+        if yes_adj >= no_adj:
+            side, k_side, f_side, raw_edge, adj = "YES", yes_ask, fair, yes_raw, yes_adj
+        else:
+            side, k_side, f_side, raw_edge, adj = "NO", 1 - yes_bid, 1 - fair, no_raw, no_adj
+        if k_side < MIN_KALSHI_PRICE:
+            return None
+        books_detail = {"pinnacle": round(fair, 4)}   # fair = canonical YES prob
+        # For NO bets, express per-book as P(Kalshi YES) — already fair here.
+        per_book_novig = _build_per_book_novig(books_detail, side)
+        cons_yes = round(fair, 4)
+        cons_no  = round(1 - fair, 4)
+        return {
+            "ticker":               mkt.get("ticker", ""),
+            "title":                title,
+            "kalshi_line":          threshold,
+            "matchup":              matchup,
+            "side":                 side,
+            "kalshi":               round(k_side, 4),
+            "fair":                 round(f_side, 4),
+            "raw_edge":             round(raw_edge, 4),
+            "edge":                 round(adj, 4),
+            "confidence":           1.0,          # single sharp anchor (Pinnacle)
+            "mkt_type":             mkt_type,
+            "pin_line":             pin_line,
+            "fair_source":          "exact",
+            "books_used":           ["pinnacle"],
+            "books_detail":         books_detail,
+            "per_book_novig":       per_book_novig,
+            "consensus_yes":        cons_yes,
+            "consensus_no":         cons_no,
+            "consensus_yes_american": prob_to_american(cons_yes),
+            "consensus_no_american":  prob_to_american(cons_no),
+            "consensus_prob":       cons_yes,
+            "is_valid_consensus":   True,
+            "consensus_reason":     "Pinnacle (sole sharp anchor)",
+            "kalshi_price_ts":      now_utc.isoformat(),
+            "commence_time":        commence_time,
+        }
+
+    def _event_live_or_expired(evt: dict) -> bool:
+        """True if the game has started or the event expired (skip it)."""
+        mkts = evt.get("markets") or []
+        exp_str = ""
+        if mkts:
+            exp_str = mkts[0].get("expected_expiration_time") or mkts[0].get("close_time") or ""
+        game_dt = _parse_ticker_game_time(evt.get("event_ticker", ""))
+        if game_dt is None and exp_str:
+            try:
+                from datetime import timedelta as _tde
+                exp_dt = datetime.fromisoformat(exp_str.replace("Z", "+00:00"))
+                game_dt = exp_dt - _tde(hours=2.5)   # soccer ≈ 2h + buffer
+            except (ValueError, AttributeError):
+                game_dt = None
+        if game_dt is not None and now_utc >= game_dt:
+            return True
+        return False
+
+    # ── Moneyline (KXMLSGAME) — 3-way ────────────────────────────────────────
+    try:
+        ml_events = fetch_kalshi_events("KXMLSGAME")
+    except Exception as e:
+        print(f"  ERROR — Kalshi KXMLSGAME: {e}")
+        ml_events = []
+    for evt in ml_events:
+        if _event_live_or_expired(evt):
+            continue
+        codes = _mls_teams_from_event(evt)
+        if not codes:
+            continue
+        home_code, away_code = codes
+        game = _find_game(home_code, away_code)
+        if not game:
+            continue
+        home_name, away_name = game["home"], game["away"]
+        matchup = f"{away_name} @ {home_name}"
+        outcome_fair = {
+            home_code: (game["ml"].get(home_name), f"{home_name} to win"),
+            away_code: (game["ml"].get(away_name), f"{away_name} to win"),
+            "TIE":     (game["draw"],              "Draw (match ends level)"),
+        }
+        for mkt in (evt.get("markets") or []):
+            suffix = mkt.get("ticker", "").split("-")[-1]
+            fair_title = outcome_fair.get(suffix)
+            if not fair_title or fair_title[0] is None:
+                continue
+            fair, title = fair_title
+            e = _price_market(mkt, fair, "mls_moneyline", title, matchup,
+                              game.get("commence_time"), None, None)
+            if e:
+                edges.append(e)
+
+    # ── Total goals (KXMLSTOTAL) — Poisson off Pinnacle's line ───────────────
+    try:
+        tot_events = fetch_kalshi_events("KXMLSTOTAL")
+    except Exception as e:
+        print(f"  ERROR — Kalshi KXMLSTOTAL: {e}")
+        tot_events = []
+    for evt in tot_events:
+        if _event_live_or_expired(evt):
+            continue
+        codes = _mls_teams_from_event(evt)
+        # KXMLSTOTAL markets carry no team codes; parse from the event segment.
+        if not codes:
+            m = re.search(r"KXMLSTOTAL-\d{2}[A-Z]{3}\d{2}([A-Z]+)-", evt.get("event_ticker", "").upper())
+            if not m:
+                continue
+            seg = m.group(1)
+            # split against known codes (longest-first to disambiguate)
+            found = None
+            for n in (4, 3, 2):
+                a, h = seg[:n], seg[n:]
+                if a in MLS_TEAMS and h in MLS_TEAMS:
+                    found = (a, h)
+                    break
+            if not found:
+                continue
+            codes = found
+        game = _find_game(codes[0], codes[1])
+        if not game or not game.get("total"):
+            continue
+        lam = fit_poisson_lambda(game["total"]["line"], game["total"]["over_prob"])
+        if lam is None:
+            continue
+        matchup = f"{game['away']} @ {game['home']}"
+        for mkt in (evt.get("markets") or []):
+            # Kalshi over-x.5 line lives in yes_sub_title ("Over 2.5 goals scored")
+            sub = mkt.get("yes_sub_title", "") or mkt.get("title", "")
+            m = re.search(r"([0-9]+\.5)", sub)
+            if not m:
+                continue
+            line = float(m.group(1))
+            if abs(line - game["total"]["line"]) > MLS_MAX_TOTAL_RUNGS:
+                continue   # too far from the anchor — Poisson tail unreliable
+            fair = poisson_over_prob(line, lam)
+            e = _price_market(mkt, fair, "mls_total", f"Over {line} goals",
+                              matchup, game.get("commence_time"),
+                              game["total"]["line"], line)
+            if e:
+                edges.append(e)
+
+    edges.sort(key=lambda x: x["edge"], reverse=True)
+
+    # Correlation control: the 3 moneyline outcomes (home/away/tie) plus their
+    # NO/double-chance sides are all mutually-exclusive positions on one game,
+    # and adjacent total-goal rungs move together. Never stack correlated soccer
+    # bets — keep only the single best edge per (game, group), same as MLB's
+    # moneyline cap=1. One moneyline + one total per game may still both surface
+    # (weakly correlated, consistent with how MLB flags total & ML together).
+    best_per_group: Dict[Tuple[str, str], dict] = {}
+    for e in edges:   # already sorted best-first, so first seen per key wins
+        group = "total" if e["mkt_type"] == "mls_total" else "moneyline"
+        key = (e["matchup"], group)
+        if key not in best_per_group:
+            best_per_group[key] = e
+    edges = sorted(best_per_group.values(), key=lambda x: x["edge"], reverse=True)
+
+    print(f"  MLS edges ≥{EDGE_THRESHOLD:.0%}: {len(edges)}")
+    return edges, remaining
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────

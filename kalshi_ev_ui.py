@@ -47,6 +47,8 @@ from kalshi_ev_scanner import (
     scan_sport,
     scan_player_props,
     scan_wnba_player_props,
+    scan_mls,
+    MLS_TEAMS,
     kalshi_get,
     fetch_game_scores,
     fetch_odds_index,
@@ -295,6 +297,29 @@ def _wnba_props_refresh_interval() -> int:
         return 40 * 60
     return 10 ** 9
 
+# ── MLS scheduling (added 2026-07-23) ────────────────────────────────────────
+# MLS clusters on Wed/Sat evenings but plays scattered days; kickoffs observed
+# ~22:30–02:30 UTC = 15:30–19:30 PDT (west-coast games run late). Window
+# 12:00–22:00 PDT covers early-evening east-coast starts through late west-coast
+# ones. ONE Pinnacle call (h2h+totals, 2 credits) feeds both moneyline and
+# totals, so cadence is the only cost lever. 6-min cadence over a 10h window =
+# 100 calls × 2 = 200 credits/game-day; ~2 game-days/week ⇒ ~1.7k/month, deep
+# inside the ~35k/month freed by terminating Total Bases. scan_mls fetches its
+# own odds on this cadence (no pre-warmed cache thread, like the props scans).
+MLS_SCANNING_ENABLED = True
+MLS_WINDOW_START_H   = 12   # 12pm PDT
+MLS_WINDOW_END_H     = 22   # 10pm PDT
+
+def _mls_refresh_interval() -> int:
+    """Seconds between MLS scans. Single daytime→evening window; effectively off
+    outside it. Self-paced from the main scan loop via a _last_mls_scan gate."""
+    if not MLS_SCANNING_ENABLED:
+        return 10 ** 9
+    h = _pdt_hour()
+    if MLS_WINDOW_START_H <= h < MLS_WINDOW_END_H:
+        return 6 * 60
+    return 10 ** 9
+
 REFRESH_SECONDS       = 30         # re-scan Kalshi every 30 sec   (0 credits)
 # Monthly credit math (20k budget):
 #   Odds refresh : 2 × 144/day × 30 =  8,640
@@ -365,6 +390,10 @@ SHADOW_MARKETS: list[str] = [
                   # resolved), h2h fetch + team-parsing + same-game-double-bet
                   # guard newly wired. Zero track record; shadow until it earns
                   # its own CLV evidence like WNBA/TB did.
+    "KXMLS",      # MLS moneyline (3-way Shin de-vig) + total goals (Poisson),
+                  # added 2026-07-23 with credits freed by terminating TB. New
+                  # market, unvalidated soccer pricing — shadow until it earns a
+                  # calibration/CLV track record. Covers KXMLSGAME + KXMLSTOTAL.
 ]
 
 def _is_shadow(ticker: str) -> bool:
@@ -2061,6 +2090,93 @@ def _fetch_wnba_quarter(bet: dict) -> Optional[str]:
     return f"{lab} {ev.get('clock') or ''}".strip()
 
 
+# ── MLS (ESPN soccer) — live score + match clock, game state ─────────────────
+# Mirrors the WNBA ESPN plumbing above for MLS game-line bets (moneyline /
+# total goals). ESPN soccer scoreboard is usa.1; matches Kalshi MLS tickers by
+# team ESPN id (via MLS_TEAMS from the scanner). Kalshi MLS tickers carry the
+# date but no time, and the team segment concatenates home+away Kalshi codes.
+_MLS_ESPN_ID = {code: info["espn"] for code, info in MLS_TEAMS.items()}
+_mls_sb_cache: dict = {}   # "YYYYMMDD" → (ts, events) 60s TTL
+
+
+def _mls_scoreboard(date_iso: str) -> list:
+    """ESPN MLS scoreboard for a date, cached 60s. Each event:
+    {home_id, away_id, home_abbr, away_abbr, home_score, away_score,
+     state (pre/in/post), clock, detail}. Serves stale cache on failure."""
+    key = date_iso.replace("-", "")
+    now = time.time()
+    hit = _mls_sb_cache.get(key)
+    if hit and now - hit[0] < 60:
+        return hit[1]
+    try:
+        import urllib.request as _ur
+        url = f"https://site.api.espn.com/apis/site/v2/sports/soccer/usa.1/scoreboard?dates={key}"
+        with _ur.urlopen(url, timeout=5) as r:
+            data = json.loads(r.read())
+        events = []
+        for ev in data.get("events", []):
+            comp = (ev.get("competitions") or [{}])[0]
+            teams = {c.get("homeAway"): c for c in comp.get("competitors", [])}
+            h, a = teams.get("home", {}), teams.get("away", {})
+            st = ev.get("status", {}) or {}
+            events.append({
+                "home_id":  str((h.get("team") or {}).get("id", "")),
+                "away_id":  str((a.get("team") or {}).get("id", "")),
+                "home_abbr": (h.get("team") or {}).get("abbreviation", ""),
+                "away_abbr": (a.get("team") or {}).get("abbreviation", ""),
+                "home_score": h.get("score"),
+                "away_score": a.get("score"),
+                "state":  (st.get("type") or {}).get("state", ""),
+                "clock":  st.get("displayClock"),
+                "detail": (st.get("type") or {}).get("shortDetail", ""),
+            })
+    except Exception:
+        return hit[1] if hit else []
+    _mls_sb_cache[key] = (now, events)
+    return events
+
+
+def _mls_event_for_ticker(ticker: str) -> Optional[dict]:
+    """Match a Kalshi MLS ticker to its ESPN scoreboard event via the two team
+    ESPN ids parsed from the concatenated code segment."""
+    import re
+    game_date = _parse_ticker_date(ticker)
+    m = re.search(r"KXMLS(?:GAME|TOTAL)-\d{2}[A-Z]{3}\d{2}([A-Z]+)", ticker.upper())
+    if not game_date or not m:
+        return None
+    seg = m.group(1)
+    for n in (4, 3, 2):
+        a, h = seg[:n], seg[n:]
+        if a in _MLS_ESPN_ID and h in _MLS_ESPN_ID:
+            ids = {_MLS_ESPN_ID[a], _MLS_ESPN_ID[h]}
+            for ev in _mls_scoreboard(game_date):
+                if {ev["home_id"], ev["away_id"]} == ids:
+                    return ev
+    return None
+
+
+def _lookup_mls_state(bet: dict):
+    """Live state for an MLS game-line bet. Returns (scoreline:str, clock:str)
+    e.g. ('SJ 1 - 0 LAG', "63'") / (…, 'HT') / (…, 'Full Time'), or None if the
+    game hasn't started / can't be matched. Works live and final (same endpoint)."""
+    ev = _mls_event_for_ticker(bet.get("ticker", "").upper())
+    if not ev or ev["state"] == "pre":
+        return None
+    hs, as_ = ev.get("home_score"), ev.get("away_score")
+    if hs is None or as_ is None:
+        return None
+    scoreline = f"{ev['away_abbr']} {as_} - {hs} {ev['home_abbr']}"
+    if ev["state"] == "post":
+        clock = "Full Time"
+    else:
+        det = (ev.get("detail") or "").lower()
+        if "half" in det:
+            clock = "HT"
+        else:
+            clock = ev.get("clock") or "Live"
+    return (scoreline, clock)
+
+
 # ── Live in-game stat cache (refreshed by a background loop) ──────────────────
 _live_stats: dict = {}                 # bet_id → display string like "4 K · needs 6+"
 _live_stats_lock = threading.Lock()
@@ -2077,7 +2193,8 @@ def _live_stats_loop():
                 inplay = []
                 for b in _bets:
                     if b.get("status") != "open" or \
-                            b.get("mkt_type") not in ("prop", "wnba_prop", "nba_prop"):
+                            b.get("mkt_type") not in ("prop", "wnba_prop", "nba_prop",
+                                                       "mls_moneyline", "mls_total"):
                         continue
                     gt = b.get("game_time")
                     started = False
@@ -2090,13 +2207,19 @@ def _live_stats_loop():
                         inplay.append(dict(b))   # shallow copy — don't hold the lock during HTTP
             fresh = {}
             for b in inplay:
-                r = _lookup_box_stat(b)
-                inning = _fetch_game_inning(b)
-                if r or inning:
-                    fresh[b["id"]] = {
-                        "stat":   _live_stat_text(b, r[0], r[1]) if r else None,
-                        "inning": inning,
-                    }
+                if b.get("mkt_type") in ("mls_moneyline", "mls_total"):
+                    # Game lines: live tracker = scoreline + match clock (ESPN soccer)
+                    st = _lookup_mls_state(b)
+                    if st:
+                        fresh[b["id"]] = {"stat": st[0], "inning": st[1]}
+                else:
+                    r = _lookup_box_stat(b)
+                    inning = _fetch_game_inning(b)
+                    if r or inning:
+                        fresh[b["id"]] = {
+                            "stat":   _live_stat_text(b, r[0], r[1]) if r else None,
+                            "inning": inning,
+                        }
                 _t.sleep(0.3)
             with _live_stats_lock:
                 _live_stats.clear()
@@ -2807,6 +2930,10 @@ def _get_performance(since: Optional[str] = None) -> dict:
             return "NBA Props"
         if mtype == "wnba_prop":
             return "WNBA Props"
+        if mtype == "mls_moneyline" or ticker.startswith("KXMLSGAME"):
+            return "MLS Moneyline"
+        if mtype == "mls_total" or ticker.startswith("KXMLSTOTAL"):
+            return "MLS Total"
         if mtype == "prop":
             for prefix, label in _PROP_SERIES_LABELS.items():
                 if ticker.startswith(prefix):
@@ -3160,6 +3287,7 @@ print(f"  Loaded {len(_alerted_keys)} previously alerted edge key(s) from disk")
 _zero_edge_streak      = 0          # consecutive scans with no qualifying edges
 _last_props_scan: float = 0.0       # epoch seconds of last props scan
 _last_prop_snapshot: dict = {}      # persists between prop scan cycles so UI stays populated
+_last_mls_scan: float = 0.0         # epoch seconds of last MLS scan (own cadence)
 # Props refresh interval is now dynamic — see _props_refresh_interval() above.
 _zero_edge_alerted     = False      # suppresses duplicate alerts per drought
 _ZERO_EDGE_ALERT_SCANS = 60         # 60 × 2-min scan = 2 hours of silence
@@ -3802,7 +3930,20 @@ def _run_scan():
         else:
             wnba_props, _fresh_wnba_prop_snap = [], {}
 
-        all_edges = sorted(mlb + nba + mlb_props + wnba + wnba_props, key=lambda x: x["edge"], reverse=True)
+        # MLS — moneyline (3-way) + total goals, own daytime→evening cadence
+        # (own Pinnacle fetch, 2 credits per scan). Shadow-first via SHADOW_MARKETS.
+        global _last_mls_scan
+        if now_ts - _last_mls_scan >= _mls_refresh_interval():
+            try:
+                mls, _mls_remaining = scan_mls()
+            except Exception as _mls_exc:
+                print(f"  MLS scan error: {_mls_exc}")
+                mls = []
+            _last_mls_scan = now_ts
+        else:
+            mls = []
+
+        all_edges = sorted(mlb + nba + mlb_props + wnba + wnba_props + mls, key=lambda x: x["edge"], reverse=True)
 
         # Deduplicate: keep only best edge per (matchup, mkt_type, side)
         edges = _best_edge_per_game(all_edges)
@@ -5031,8 +5172,37 @@ function wnbaLogo(ticker) {
   return `<img src="https://a.espncdn.com/i/teamlogos/wnba/500/${slug}.png" onerror="this.style.display='none'" style="width:18px;height:18px;vertical-align:middle;margin-right:6px;object-fit:contain;">`;
 }
 
-// Sport-agnostic logo dispatch — use this at render sites, not mlbLogo directly.
-function teamLogo(ticker) { return mlbLogo(ticker) || wnbaLogo(ticker); }
+// MLS team logo for a moneyline/total ticker (e.g. KXMLSGAME-26JUL25SJLAG-SJ
+// => player-side team not applicable; use the two team codes from the segment).
+// For team markets the market suffix IS a team code (SJ/LAG/TIE); TIE has no
+// logo. For totals the ticker carries no team suffix, so fall back to the first
+// code in the segment. ESPN soccer logos are by numeric team id.
+const _MLS_TEAM_ID = {ATL:'18418',ATX:'20906',MTL:'9720',CLT:'21300',CHI:'182',COL:'184',CLB:'183',DCU:'193',CIN:'18267',DAL:'185',HOU:'6077',MIA:'20232',LAG:'187',LAFC:'18966',MIN:'17362',NSH:'18986',NE:'189',NYC:'17606',NYRB:'190',ORL:'12011',PHI:'10739',POR:'9723',RSL:'4771',SD:'22529',SJ:'191',SEA:'9726',SKC:'186',STL:'21812',TOR:'7318',VAN:'9727'};
+const _MLS_CODES = new Set(Object.keys(_MLS_TEAM_ID));
+function mlsLogo(ticker) {
+  if (!ticker) return '';
+  const m = ticker.match(/^KXMLS(?:GAME|TOTAL)-\d{2}[A-Z]{3}\d{2}([A-Z]+)(?:-([A-Z]+))?/);
+  if (!m) return '';
+  const seg = m[1], suffix = m[2] || '';
+  // Team markets: suffix is the team code (skip TIE — no single team).
+  if (suffix && suffix !== 'TIE' && _MLS_TEAM_ID[suffix]) {
+    return `<img src="https://a.espncdn.com/i/teamlogos/soccer/500/${_MLS_TEAM_ID[suffix]}.png" onerror="this.style.display='none'" style="width:18px;height:18px;vertical-align:middle;margin-right:6px;object-fit:contain;">`;
+  }
+  // Totals / TIE: show the home (first) team logo from the segment.
+  for (const n of [4, 3, 2]) {
+    const a = seg.slice(0, n), h = seg.slice(n);
+    if (_MLS_CODES.has(a) && _MLS_CODES.has(h)) {
+      return `<img src="https://a.espncdn.com/i/teamlogos/soccer/500/${_MLS_TEAM_ID[a]}.png" onerror="this.style.display='none'" style="width:18px;height:18px;vertical-align:middle;margin-right:6px;object-fit:contain;">`;
+    }
+  }
+  return '';
+}
+
+// Sport-agnostic logo dispatch from a TICKER — use this at render sites.
+// NOTE: named sportLogo (not teamLogo) to avoid colliding with the name-based
+// teamLogo(name) used by matchupHtml further below; JS would let the later
+// declaration win and silently break ticker-based logos.
+function sportLogo(ticker) { return mlbLogo(ticker) || wnbaLogo(ticker) || mlsLogo(ticker); }
 
 // Edge color by strength: orange (weakest) → yellow → green → bright green (strongest)
 function edgeColor(pct) {
@@ -5349,7 +5519,7 @@ function renderTable(edges) {
       ? `<span class="badge-drift">(${e.drift_pct > 0 ? '+' : ''}${e.drift_pct}%)</span>` : '';
     rows += `
     <tr>
-      <td class="matchup-inline">${teamLogo(e.ticker)}${matchupHtml(e.matchup)}</td>
+      <td class="matchup-inline">${sportLogo(e.ticker)}${matchupHtml(e.matchup)}</td>
       <td class="prop-col">${e.title}${kalshiLineBadge(e)}${newBadge}${staleBadge}${driftTxt}</td>
       <td class="num pin-line">${pinLineLabel(e)}</td>
       <td class="side-${e.side.toLowerCase()}">${e.side}</td>
@@ -5744,12 +5914,12 @@ function renderTodayEdges() {
 
     // ── Live in-game counter (replaces the old Entry➔Live line column) ──────
     const liveCounter = b.live_stat
-      ? `<span style="font-weight:700;font-size:13px;color:var(--text);white-space:nowrap;" title="Live in-game stat — official box score (MLB / ESPN for WNBA), updates ~every minute">${b.live_stat}</span>`
+      ? `<span style="font-weight:700;font-size:13px;color:var(--text);white-space:nowrap;" title="Live in-game — box stat for props (MLB Stats / ESPN), scoreline for MLS game lines (ESPN). Updates ~every minute.">${b.live_stat}</span>`
       : `<span style="color:var(--muted);">—</span>`;
 
     return `<tr>
       <td style="font-size:11px;color:var(--muted);white-space:nowrap;">${flagTime}</td>
-      <td>${teamLogo(b.ticker)}${matchupHtml(b.matchup)}${gameTimeBadge}</td>
+      <td>${sportLogo(b.ticker)}${matchupHtml(b.matchup)}${gameTimeBadge}</td>
       <td class="prop-col" style="font-size:12px;">${b.title}${kalshiLineBadge(b)}${driftTxt}${tickerTxt}${kalshiLink}</td>
       <td class="${sideClass}">${sideLabel(b)}</td>
       <td class="num" style="color:${edgeColor(b.edge_pct)};font-weight:700;">+${pct(b.edge_pct)}${flagOddsTxt}</td>
@@ -6423,7 +6593,7 @@ function renderPerformance(d) {
     return `<tr style="${b.correlated || b.clv_source === 'corrupted_utc' ? 'opacity:0.55;' : isShadow ? 'opacity:0.75;border-left:2px solid #58a6ff22;' : ''}">
       <td>${ts}</td>
       <td>${gameTimeCell}</td>
-      <td>${teamLogo(b.ticker)}${b.matchup}${corrBadge}${corruptBadge}${shadowBadge}</td>
+      <td>${sportLogo(b.ticker)}${b.matchup}${corrBadge}${corruptBadge}${shadowBadge}</td>
       <td class="prop-col">${b.title}</td>
       <td class="side-${b.side.toLowerCase()}">${sideLabel(b)}</td>
       <td class="num">${edgeCell}</td>
@@ -6649,7 +6819,7 @@ async function fetchPaper() {
 
         return `<tr style="${b.clv_source === 'corrupted_utc' ? 'opacity:0.55;' : ''}">
           <td style="color:var(--muted);font-size:11px;">${flagDate}</td>
-          <td class="matchup-inline">${teamLogo(b.ticker)}${matchupHtml(b.matchup)}</td>
+          <td class="matchup-inline">${sportLogo(b.ticker)}${matchupHtml(b.matchup)}</td>
           <td style="font-size:12px;max-width:200px;">${b.title}${capBadge}</td>
           <td class="side-${(b.side||'').toLowerCase()}">${sideLabel(b)}</td>
           <td class="num">${edgeTag}</td>

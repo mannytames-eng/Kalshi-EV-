@@ -2527,7 +2527,17 @@ def scan_sport(
 # (106 K, 56 TB, 8 Total, 0 Hits, 0 RBI) — pure credit cost with no signal.
 # Also halves the per-event props cost (4 credits/event -> 2), the single
 # biggest driver of Odds API credit usage.
-PLAYER_PROP_MARKETS = "pitcher_strikeouts,batter_total_bases"
+#
+# TOTAL BASES TERMINATED 2026-07-23 (user call). TB was fully shadowed since
+# 2026-07-20 (phantom-vig overs, true Kalshi CLV ~0, tradeable + Shin de-vig
+# both dead — see project-tb-full-shadow). Shadow logging cost real credits
+# (~half of all prop spend) for a market with no viable path to profitability
+# without a long outcome-recalibration slog. Dropped from the scan entirely to
+# reclaim that budget for MLS (moneyline + total goals). The settled TB track
+# record is frozen and still displayed (tagged TERMINATED in the UI); no NEW TB
+# is fetched, priced, or flagged. This also ends the TB_NO_EXPERIMENT under-side
+# capture (its premise was already weak — see project-tb-full-shadow).
+PLAYER_PROP_MARKETS = "pitcher_strikeouts"
 NBA_PLAYER_PROP_MARKETS = "player_points,player_assists,player_threes"
 # WNBA: Pinnacle carries points/rebounds/assists but NOT threes (verified
 # 2026-07-10 against the live Odds API — DK/FanDuel have player_threes,

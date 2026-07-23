@@ -6206,7 +6206,10 @@ function renderPerformance(d) {
 
   // By-type breakdown table
   const PROP_LABELS = new Set(['Strikeouts (K)', 'Hits', 'Total Bases', 'RBIs', 'MLB Props', 'NBA Props', 'WNBA Props']);
-  const TYPE_ORDER  = ['MLB Total', 'MLB Spread', 'Strikeouts (K)', 'Hits', 'Total Bases', 'RBIs', 'MLB Props', 'NBA Props', 'WNBA Total', 'WNBA Spread', 'WNBA Props'];
+  const TYPE_ORDER  = ['MLB Total', 'MLB Spread', 'Strikeouts (K)', 'Hits', 'Total Bases', 'RBIs', 'MLB Props', 'NBA Props', 'WNBA Total', 'WNBA Spread', 'WNBA Props', 'MLS Moneyline', 'MLS Total'];
+  // Markets no longer scanned — settled record frozen & still shown, but tagged
+  // so it's clear no new bets are being placed. Total Bases terminated 2026-07-23.
+  const TERMINATED_LABELS = new Set(['Total Bases']);
   if (d.by_type && d.by_type.length) {
     const sorted = [...d.by_type].sort((a, b) => {
       const ai = TYPE_ORDER.indexOf(a.label); const bi = TYPE_ORDER.indexOf(b.label);
@@ -6230,7 +6233,10 @@ function renderPerformance(d) {
       const shadowRowBadge = isShadowRow
         ? ` <span style="font-size:9px;font-weight:700;color:#58a6ff;background:rgba(88,166,255,0.10);border:1px solid rgba(88,166,255,0.3);border-radius:3px;padding:1px 4px;vertical-align:middle;" title="Hypothetical — $0 real stake, excluded from headline stats">SHADOW</span>`
         : '';
-      const labelCell = `<span style="font-weight:600;">${t.label}</span>${shadowRowBadge}`;
+      const terminatedBadge = TERMINATED_LABELS.has(t.label)
+        ? ` <span style="font-size:9px;font-weight:700;color:#f85149;background:rgba(248,81,73,0.10);border:1px solid rgba(248,81,73,0.35);border-radius:3px;padding:1px 4px;vertical-align:middle;" title="Terminated 2026-07-23 — no longer scanned or bet. Settled record frozen for reference.">⛔ TERMINATED</span>`
+        : '';
+      const labelCell = `<span style="font-weight:600;${TERMINATED_LABELS.has(t.label) ? 'opacity:0.65;' : ''}">${t.label}</span>${shadowRowBadge}${terminatedBadge}`;
       // Kelly P&L + units — HYPOTHETICAL for shadow rows, real for live. Both shown.
       const hypPre = isShadowRow ? 'HYPOTHETICAL — ' : '';
       const kellyCell = kpct != null

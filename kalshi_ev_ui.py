@@ -2191,16 +2191,27 @@ def _check_resolutions():
             # CLV — primary: true CLV vs Pinnacle closing line.
             # Grab the stored closing_pin_pct (filled by _capture_clv_prices).
             # Fall back to last_pin_pct in edge history, then Kalshi drift.
+            #
+            # Pin-close CLV is only valid for market types the Pinnacle close
+            # lookup actually supports (game totals) — same gate as
+            # _maybe_fetch_pre_close_pinnacle. For props/spread/moneyline no
+            # real Pinnacle close is ever fetched: the stored closing_pin_pct
+            # should not exist, and the edge-history last_pin_pct is just the
+            # most recent SCAN-time snapshot, not a close. Falling back to it
+            # here fabricated CLV at settlement (Shepard REB: neutralized to 0,
+            # then this fallback re-wrote clv=+10 from a scan-time 49.0) — the
+            # same mislabel bug as the pre-close path, via a second door.
+            _pin_close_ok = bet.get("mkt_type", "total") in ("total", "")
             with _bets_lock:
                 bet_pin_close = next(
                     (b.get("closing_pin_pct") for b in _bets if b["id"] == bet["id"]),
                     None,
-                )
+                ) if _pin_close_ok else None
                 bet_closing = next(
                     (b.get("closing_yes_pct") for b in _bets if b["id"] == bet["id"]),
                     None,
                 )
-            if bet_pin_close is None:
+            if bet_pin_close is None and _pin_close_ok:
                 ek = _edge_key(bet)
                 with _edge_history_lock:
                     hist = _edge_price_history.get(ek, {})

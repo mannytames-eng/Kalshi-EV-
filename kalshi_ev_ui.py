@@ -1227,6 +1227,49 @@ if _prop_clv_fix_count or _prop_clv_open_cleared:
     print(f"  Bulk-corrected {_prop_clv_fix_count} resolved prop bet(s) mislabeled clv_source='pin' -> 'kalshi'; "
           f"cleared stale closing_pin_pct on {_prop_clv_open_cleared} still-open prop bet(s)")
 
+# --- One-time correction: neutralize CLV on WNBA/NBA props with no game-start
+#     anchor (game_time is None). Discovered 2026-07-22 via Monique Akoa Makani
+#     ("10+ points", NO): her game_time was None, so the CLV freeze in
+#     _capture_clv_prices had no trustworthy way to tell pre-game from in-game.
+#     Its only remaining fallback (close_time − Nh) put game-start too late, so
+#     closing_yes_pct kept updating and crept 58 -> 74 as she scored toward 10+
+#     — a fake -16 CLV. The 20pp single-cycle jump backstop can't catch a
+#     gradual in-game creep. WNBA/NBA prop tickers omit the start time, so when
+#     commence_time is also missing from the edge (intermittent upstream) there
+#     is NO reliable anchor at all, and any captured close is untrustworthy.
+#     Honest fix per the _capture_clv_prices docstring's own design ("never
+#     captured a pre-game price -> closing == entry -> CLV = 0, neutral, not
+#     misleading"): reset closing_yes_pct to entry, CLV to 0, clv_source="none".
+#     Metadata-only — status/stake/P&L untouched (freeze-settled compliant). The
+#     permanent guard lives in _capture_clv_prices (freezes these at entry so a
+#     bogus close can never be written again).
+_gtnone_clv_fixed = 0
+for _b in _bets:
+    if _b.get("mkt_type") not in ("wnba_prop", "nba_prop"):
+        continue
+    if _b.get("game_time") is not None:
+        continue
+    _ey = _b.get("kalshi_yes_at_flag")
+    if _ey is None:
+        continue
+    # Only rewrite if the stored close actually drifted off entry (i.e. a real
+    # or potential contamination) — idempotent, and leaves genuinely-neutral
+    # bets alone.
+    if _b.get("closing_yes_pct") == _ey and _b.get("clv") in (0.0, 0) \
+            and _b.get("closing_pin_pct") is None and _b.get("clv_source") == "none":
+        continue
+    _b["closing_yes_pct"] = _ey
+    _b["closing_pin_pct"] = None
+    _b["clv"]             = 0.0
+    _b["clv_pct"]         = 0.0
+    _b["clv_source"]      = "none"
+    _b["clv_frozen"]      = True   # never let the capture loop re-touch it
+    _gtnone_clv_fixed += 1
+if _gtnone_clv_fixed:
+    _data_fixed = True
+    print(f"  Neutralized CLV on {_gtnone_clv_fixed} WNBA/NBA prop bet(s) with no "
+          f"game-start anchor (game_time=None) — untrustworthy in-game close")
+
 if _data_fixed:
     _save_bets(_bets)
     print("  Applied one-time data corrections (CLV/pin_entry upgrades)")
@@ -4226,6 +4269,26 @@ def _capture_clv_prices():
                         game_start = datetime.fromisoformat(gt.replace("Z", "+00:00"))
                     except (ValueError, AttributeError):
                         pass
+            # No trustworthy game-start anchor: ticker has no embedded time AND
+            # game_time is missing. This is the WNBA/NBA-prop failure mode (see
+            # the Makani one-time fix at load) — commence_time occasionally never
+            # reaches the edge, so game_time is None. The close_time − Nh
+            # heuristic below has twice put game-start too late for these,
+            # letting closing_yes_pct creep to a live in-game value and
+            # fabricating CLV. Basketball markets stay "active" through the game,
+            # so without an anchor we CANNOT distinguish pre-game from in-game —
+            # freeze at entry (CLV stays 0, neutral) rather than trust the clock.
+            if game_start is None and bet.get("game_time") is None \
+                    and "NBA" in bet["ticker"].upper():   # matches KXNBA* and KXWNBA*
+                with _bets_lock:
+                    for b in _bets:
+                        if b["id"] == bet["id"] and not b.get("clv_frozen"):
+                            b["clv_frozen"] = True
+                            print(f"  CLV capture: no game-start anchor for {bet['ticker']} "
+                                  f"(game_time=None, ticker has no time) — froze at entry, "
+                                  f"CLV neutral (avoids in-game contamination)")
+                            break
+                continue
             if game_start is None:
                 close_str = mkt.get("close_time") or mkt.get("expected_expiration_time")
                 if close_str:

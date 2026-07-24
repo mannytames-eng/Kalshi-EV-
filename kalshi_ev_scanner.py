@@ -744,32 +744,76 @@ def _poisson_cdf(k: int, lam: float) -> float:
 
 
 def poisson_over_prob(line: float, lam: float) -> float:
-    """P(total goals > line) for a half-integer Kalshi line k.5 → P(X ≥ k+1)."""
+    """P(total goals > line) for a half-integer Kalshi line k.5 → P(X ≥ k+1).
+    Kalshi over-x.5 rungs are always clean half lines (no push), so this is the
+    right formula for PRICING them. For anchoring on a Pinnacle line (which may
+    be Asian) use _poisson_asian_over below."""
     return 1.0 - _poisson_cdf(int(math.floor(line)), lam)
+
+
+def _asian_over_components(line: float):
+    """Decompose an Asian/soccer total line into clean (integer-push or half)
+    legs with stake weights. Pinnacle prices soccer totals on QUARTER lines
+    (~half of all lines: x.25 / x.75) which are literally a half-stake split
+    across the two adjacent lines — e.g. 2.25 = ½·(over 2.0) + ½·(over 2.5).
+    Half lines and integer (push) lines are a single leg."""
+    n = math.floor(line)
+    frac = round(line - n, 2)
+    if abs(frac) < 1e-6:
+        return [(1.0, float(n))]                        # integer push line
+    if abs(frac - 0.5) < 1e-6:
+        return [(1.0, n + 0.5)]                         # clean half line
+    if abs(frac - 0.25) < 1e-6:
+        return [(0.5, float(n)), (0.5, n + 0.5)]        # quarter: n.0 / n.5
+    if abs(frac - 0.75) < 1e-6:
+        return [(0.5, n + 0.5), (0.5, float(n + 1))]    # quarter: n.5 / (n+1).0
+    return [(1.0, line)]                                 # unexpected — as-is
+
+
+def _clean_over(clean_line: float, over_at) -> float:
+    """Over-prob at a single clean line via a caller-supplied over_at(threshold,
+    is_push): half lines (no push) → over_at(n, False); integer lines → the
+    Pinnacle push-excluded conditional via over_at(n, True). Shared by the
+    Poisson and bivariate-Poisson models so Asian-line handling is identical."""
+    n = int(math.floor(clean_line))
+    is_push = abs(clean_line - n) < 1e-6
+    return over_at(n, is_push)
+
+
+def _asian_over(line: float, over_at) -> float:
+    """Stake-weighted over-prob for any Asian/half/integer line, given an
+    over_at(threshold, is_push) primitive for clean lines."""
+    return sum(w * _clean_over(cl, over_at) for w, cl in _asian_over_components(line))
+
+
+def _poisson_over_at(lam: float):
+    """over_at(threshold, is_push) primitive for a Poisson(λ) total."""
+    def _f(n: int, is_push: bool) -> float:
+        if is_push:                     # over 'n.0': P(X>n) conditional on X≠n
+            pmf = math.exp(-lam) * lam ** n / math.factorial(n)
+            return (1.0 - _poisson_cdf(n, lam)) / (1.0 - pmf) if pmf < 1.0 else 0.0
+        return 1.0 - _poisson_cdf(n, lam)   # over 'n.5': P(X ≥ n+1)
+    return _f
+
+
+def _poisson_asian_over(line: float, lam: float) -> float:
+    """P(over `line`) for a Poisson(λ) total, correct for Asian quarter lines."""
+    return _asian_over(line, _poisson_over_at(lam))
 
 
 def fit_poisson_lambda(pin_line: float, pin_over_prob: float) -> Optional[float]:
     """Solve for the Poisson mean λ that reproduces Pinnacle's de-vigged over
-    probability at its posted line. Handles both half-integer lines (no push)
-    and integer lines (Pinnacle voids the exact-total push, so its over is the
-    push-excluded conditional). Bisection on the monotonic-in-λ over function."""
+    probability at its posted line — correct for half, integer (push), AND
+    Asian quarter lines (~half of soccer totals). Bisection on the monotonic
+    over function."""
     if not (0.0 < pin_over_prob < 1.0) or pin_line <= 0:
         return None
-    is_integer = abs(pin_line - round(pin_line)) < 1e-6
-
-    def model_over(lam: float) -> float:
-        if is_integer:
-            L = int(round(pin_line))
-            pmf_L = math.exp(-lam) * lam ** L / math.factorial(L)
-            return (1.0 - _poisson_cdf(L, lam)) / (1.0 - pmf_L) if pmf_L < 1.0 else 0.0
-        return poisson_over_prob(pin_line, lam)
-
     lo, hi = 0.05, 8.0
-    if model_over(lo) > pin_over_prob or model_over(hi) < pin_over_prob:
+    if _poisson_asian_over(pin_line, lo) > pin_over_prob or _poisson_asian_over(pin_line, hi) < pin_over_prob:
         return None   # target outside plausible λ range — don't extrapolate a bad fit
     for _ in range(100):
         mid = (lo + hi) / 2.0
-        if model_over(mid) < pin_over_prob:
+        if _poisson_asian_over(pin_line, mid) < pin_over_prob:
             lo = mid
         else:
             hi = mid

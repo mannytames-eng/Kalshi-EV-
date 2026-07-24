@@ -3650,9 +3650,15 @@ MLS_MAX_TOTAL_RUNGS = 2.5   # only price Kalshi over-x.5 rungs within this many
                             # guard philosophy as WNBA_EXTRAP_MAX_RUNGS.
 
 
-SOCCER_LOOKAHEAD_H = 12   # zero-game short-circuit: only spend the paid odds
-                          # call when a league has a game commencing within this
-                          # many hours (checked via the FREE /events endpoint).
+# ── Soccer scan windows ───────────────────────────────────────────────────────
+# Soccer is scanned ONLY at three fixed pre-kickoff checkpoints, never earlier
+# and never after kickoff. Minutes-to-kickoff must land within TOL of one of
+# these, so a 6-min scan cadence reliably catches each band without having to
+# hit the exact minute. Tune here, not in the scan loop.
+SOCCER_SCAN_WINDOWS      = [720, 360, 60]   # 12h, 6h, 1h before kickoff (minutes)
+SOCCER_SCAN_WINDOW_TOL_M = 15               # ± band around each checkpoint
+SOCCER_LOOKAHEAD_H = 12   # outer bound for the FREE /events short-circuit — no
+                          # game further out than the widest window can matter.
 SOCCER_MIN_KALSHI_PRICE = 0.30   # soccer-only price floor (vs the 0.15 global).
                           # Sub-30¢ longshot rungs are where a 2-3¢ book gap
                           # balloons into a huge % edge AND where the book is
@@ -3710,30 +3716,42 @@ def fetch_soccer_odds(odds_key: str) -> Tuple[List[dict], str]:
     return games, remaining
 
 
+def minutes_to_kickoff(commence_time, now: Optional[datetime] = None) -> Optional[float]:
+    """Minutes until kickoff from an ISO commence_time (negative once started)."""
+    if not commence_time:
+        return None
+    try:
+        dt = datetime.fromisoformat(str(commence_time).replace("Z", "+00:00"))
+    except (ValueError, AttributeError):
+        return None
+    return (dt - (now or datetime.now(timezone.utc))).total_seconds() / 60.0
+
+
+def soccer_in_scan_window(commence_time, now: Optional[datetime] = None) -> bool:
+    """True only when a game sits inside one of the fixed pre-kickoff windows.
+    PREGAME ONLY: once minutes-to-kickoff <= 0 the game is dropped from the scan
+    pool entirely, so a market is never touched after kickoff — which is what
+    structurally prevents the stale-pregame-line-on-an-in-play-total bug (we
+    stop looking the moment the last window closes). Games further out than the
+    widest window are ignored too — no reason to poll Pinnacle days early."""
+    ttk = minutes_to_kickoff(commence_time, now)
+    if ttk is None or ttk <= 0:
+        return False
+    return any(abs(ttk - w) <= SOCCER_SCAN_WINDOW_TOL_M for w in SOCCER_SCAN_WINDOWS)
+
+
 def soccer_has_upcoming_game(odds_key: str, within_h: int = SOCCER_LOOKAHEAD_H) -> bool:
-    """Zero-game short-circuit. Uses the FREE Odds-API /events endpoint (0
-    credits) to decide whether a league has a game worth scanning right now —
-    True if any game commences within `within_h` hours (or started in the last
-    3h, so an in-progress slate still refreshes). Fails OPEN (returns True) on a
-    transient error so a blip never silently blacks out a live slate."""
+    """Zero-game short-circuit, now window-aware. Uses the FREE Odds-API /events
+    endpoint (0 credits) and returns True only if some game is currently inside
+    one of the SOCCER_SCAN_WINDOWS — so the paid odds call is spent only during
+    the three narrow bands per game, not continuously for the 12h before it.
+    Fails OPEN on a transient error so a blip never blacks out a live slate."""
     try:
         events = fetch_odds_events_list(odds_key)
     except Exception:
         return True
     now = datetime.now(timezone.utc)
-    from datetime import timedelta as _td
-    lo, hi = now - _td(hours=3), now + _td(hours=within_h)
-    for e in events:
-        ct = e.get("commence_time")
-        if not ct:
-            continue
-        try:
-            dt = datetime.fromisoformat(ct.replace("Z", "+00:00"))
-        except (ValueError, AttributeError):
-            continue
-        if lo <= dt <= hi:
-            return True
-    return False
+    return any(soccer_in_scan_window(e.get("commence_time"), now) for e in events)
 
 
 # ── Generalized soccer matching ──────────────────────────────────────────────
@@ -3958,17 +3976,13 @@ def scan_soccer(cfg: dict, games: Optional[List[dict]] = None) -> Tuple[List[dic
 
     def find_game(evt: dict) -> Optional[dict]:
         g = _locate_game(evt)
-        # Robust no-live guard: never flag a game that has already kicked off.
-        # Soccer tickers carry no start time, so the event-level heuristic can't
-        # be trusted alone — gate on the accurate Pinnacle commence_time.
-        if g is not None:
-            ct = g.get("commence_time")
-            if ct:
-                try:
-                    if datetime.fromisoformat(ct.replace("Z", "+00:00")) <= now_utc:
-                        return None
-                except (ValueError, AttributeError):
-                    pass
+        # Pre-kickoff scan windows only (12h / 6h / 1h ± tolerance). This both
+        # drops games that haven't reached the first checkpoint (no polling days
+        # out) and — critically — drops them the instant kickoff passes, so an
+        # in-play market is never priced off a pregame line. Gated on the
+        # accurate Pinnacle commence_time (soccer tickers carry no start time).
+        if g is not None and not soccer_in_scan_window(g.get("commence_time"), now_utc):
+            return None
         return g
 
     def outcome_fair(mkt: dict, game: dict):

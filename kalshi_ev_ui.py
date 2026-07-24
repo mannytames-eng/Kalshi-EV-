@@ -53,6 +53,9 @@ from kalshi_ev_scanner import (
     total_market_resolved,
     poisson_live_over_prob,
     fit_poisson_lambda,
+    minutes_to_kickoff,
+    SOCCER_SCAN_WINDOWS,
+    SOCCER_SCAN_WINDOW_TOL_M,
     kalshi_get,
     fetch_game_scores,
     fetch_odds_index,
@@ -1334,10 +1337,19 @@ _open_soccer_clean = [
     if _b.get("status") == "open"
     and (_b.get("mkt_type", "").split("_")[0] in _SOCCER_PREFIXES_CLEAN)
 ]
-_drop_ids, _drop_price, _drop_dupe = set(), 0, 0
+_drop_ids, _drop_price, _drop_dupe, _drop_early = set(), 0, 0, 0
 for _b in _open_soccer_clean:
     if (_b.get("kalshi") or 0) < 0.30:
         _drop_ids.add(_b["id"]); _drop_price += 1
+        continue
+    # (c) flagged before the first scan window: soccer is now only scanned at
+    #     12h/6h/1h to kickoff, so a position taken days out was premature. Drop
+    #     it — it will be re-flagged (at a fresher price) once the game crosses
+    #     into the 12h window. Positions already past kickoff are LEFT ALONE:
+    #     they're legitimate pregame entries that must settle into the record.
+    _ttk = minutes_to_kickoff(_b.get("game_time"))
+    if _ttk is not None and _ttk > max(SOCCER_SCAN_WINDOWS) + SOCCER_SCAN_WINDOW_TOL_M:
+        _drop_ids.add(_b["id"]); _drop_early += 1
 _seen_match: dict = {}
 for _b in sorted([x for x in _open_soccer_clean if x["id"] not in _drop_ids],
                  key=lambda x: -(x.get("edge_pct") or 0)):
@@ -1350,7 +1362,8 @@ if _drop_ids:
     _bets[:] = [_b for _b in _bets if _b["id"] not in _drop_ids]
     _data_fixed = True
     print(f"  Soccer cleanup: dropped {len(_drop_ids)} open position(s) — "
-          f"{_drop_price} under 30¢, {_drop_dupe} duplicate-on-same-match")
+          f"{_drop_price} under 30¢, {_drop_dupe} duplicate-on-same-match, "
+          f"{_drop_early} flagged before the 12h scan window")
 
 if _data_fixed:
     _save_bets(_bets)
@@ -7376,6 +7389,14 @@ class Handler(BaseHTTPRequestHandler):
                 ts = cache.get("market_status")
                 if cache.get("game_final") or (ts and ts.get("resolved")):
                     continue
+                # Soccer is a PREGAME-only feed: once kickoff passes the market
+                # is no longer an opportunity (we stop scanning it entirely), so
+                # drop it from the active board. The position itself stays in the
+                # book and settles normally — this only hides it from the feed.
+                if _is_soccer_bet(b):
+                    _ttk_feed = minutes_to_kickoff(b.get("game_time"))
+                    if _ttk_feed is not None and _ttk_feed <= 0:
+                        continue
                 row = {**b,
                        "live_stat":   cache.get("stat"),
                        "live_inning": cache.get("inning"),

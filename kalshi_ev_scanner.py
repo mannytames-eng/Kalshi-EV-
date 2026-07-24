@@ -3650,15 +3650,67 @@ MLS_MAX_TOTAL_RUNGS = 2.5   # only price Kalshi over-x.5 rungs within this many
                             # guard philosophy as WNBA_EXTRAP_MAX_RUNGS.
 
 
-# ── Soccer scan windows ───────────────────────────────────────────────────────
-# Soccer is scanned ONLY at three fixed pre-kickoff checkpoints, never earlier
-# and never after kickoff. Minutes-to-kickoff must land within TOL of one of
-# these, so a 6-min scan cadence reliably catches each band without having to
-# hit the exact minute. Tune here, not in the scan loop.
-SOCCER_SCAN_WINDOWS      = [720, 360, 60]   # 12h, 6h, 1h before kickoff (minutes)
-SOCCER_SCAN_WINDOW_TOL_M = 15               # ± band around each checkpoint
+# ── Soccer scan schedule (lineup-anchored) ───────────────────────────────────
+# Soccer is scanned ONLY at fixed pre-kickoff checkpoints — never earlier, never
+# after kickoff. The cluster at 70/55/40 brackets the typical starting-lineup
+# announcement (~60-75 min out): we cannot query the real lineup-drop event, and
+# its exact timing varies by league/broadcaster, so we bracket the estimate with
+# three passes rather than pretend to detect it. 15 catches late Kalshi book
+# movement reacting to that news. Tune here, not in the scan loop.
+SOCCER_SCAN_CHECKPOINTS = [720, 360, 70, 55, 40, 15]   # minutes before kickoff
+SOCCER_CHECKPOINT_TOL_M = 5                            # ± band per checkpoint
+# NOTE: the band (2×TOL = 10 min) is deliberately WIDER than the scan cadence
+# (~6 min) so a cycle can't step over a checkpoint — which means a band can hold
+# two cycles, so _soccer_fired below is required to stop a checkpoint re-firing.
+# The bands never overlap each other (nearest pair 70/55 leaves a 5-min gap).
 SOCCER_LOOKAHEAD_H = 12   # outer bound for the FREE /events short-circuit — no
-                          # game further out than the widest window can matter.
+                          # game further out than the widest checkpoint matters.
+
+# (game_id, checkpoint) -> cycle_id of the scan that fired it. A checkpoint may
+# only fire ONCE per game; entries from the same cycle are allowed through so
+# every market loop (moneyline/totals/BTTS) sees the game within that one scan.
+_soccer_fired: Dict[Tuple[str, int], str] = {}
+
+
+def _soccer_game_id(home: str, away: str, commence_time) -> str:
+    """Stable per-match key. commence_time leads so stale entries can be pruned
+    by parsing it back out. Built from the Odds-API game identity, which is the
+    same on both sides (the free /events short-circuit and the matched game)."""
+    return f"{commence_time}|{home}|{away}"
+
+
+def soccer_due_checkpoint(commence_time, now: Optional[datetime] = None) -> Optional[int]:
+    """The checkpoint whose band currently contains this game, else None.
+    PREGAME ONLY — returns None once minutes-to-kickoff <= 0."""
+    ttk = minutes_to_kickoff(commence_time, now)
+    if ttk is None or ttk <= 0:
+        return None
+    for cp in SOCCER_SCAN_CHECKPOINTS:
+        if abs(ttk - cp) <= SOCCER_CHECKPOINT_TOL_M:
+            return cp
+    return None
+
+
+def soccer_checkpoint_pending(home: str, away: str, commence_time,
+                              now: Optional[datetime] = None,
+                              cycle_id: Optional[str] = None) -> bool:
+    """True if this game sits in a checkpoint band that hasn't fired yet (or
+    fired in THIS cycle). Used both by the free /events short-circuit — so a
+    paid odds call is only spent when something is genuinely due — and by the
+    per-event gate."""
+    cp = soccer_due_checkpoint(commence_time, now)
+    if cp is None:
+        return False
+    prev = _soccer_fired.get((_soccer_game_id(home, away, commence_time), cp))
+    return prev is None or prev == cycle_id
+
+
+def _prune_soccer_fired(now: Optional[datetime] = None) -> None:
+    """Drop fired-checkpoint records for matches well past kickoff."""
+    now = now or datetime.now(timezone.utc)
+    for key in [k for k in _soccer_fired
+                if (minutes_to_kickoff(k[0].split("|")[0], now) or -9999) < -180]:
+        _soccer_fired.pop(key, None)
 SOCCER_MIN_KALSHI_PRICE = 0.30   # soccer-only price floor (vs the 0.15 global).
                           # Sub-30¢ longshot rungs are where a 2-3¢ book gap
                           # balloons into a huge % edge AND where the book is
@@ -3727,31 +3779,22 @@ def minutes_to_kickoff(commence_time, now: Optional[datetime] = None) -> Optiona
     return (dt - (now or datetime.now(timezone.utc))).total_seconds() / 60.0
 
 
-def soccer_in_scan_window(commence_time, now: Optional[datetime] = None) -> bool:
-    """True only when a game sits inside one of the fixed pre-kickoff windows.
-    PREGAME ONLY: once minutes-to-kickoff <= 0 the game is dropped from the scan
-    pool entirely, so a market is never touched after kickoff — which is what
-    structurally prevents the stale-pregame-line-on-an-in-play-total bug (we
-    stop looking the moment the last window closes). Games further out than the
-    widest window are ignored too — no reason to poll Pinnacle days early."""
-    ttk = minutes_to_kickoff(commence_time, now)
-    if ttk is None or ttk <= 0:
-        return False
-    return any(abs(ttk - w) <= SOCCER_SCAN_WINDOW_TOL_M for w in SOCCER_SCAN_WINDOWS)
-
-
-def soccer_has_upcoming_game(odds_key: str, within_h: int = SOCCER_LOOKAHEAD_H) -> bool:
-    """Zero-game short-circuit, now window-aware. Uses the FREE Odds-API /events
-    endpoint (0 credits) and returns True only if some game is currently inside
-    one of the SOCCER_SCAN_WINDOWS — so the paid odds call is spent only during
-    the three narrow bands per game, not continuously for the 12h before it.
-    Fails OPEN on a transient error so a blip never blacks out a live slate."""
+def soccer_has_upcoming_game(odds_key: str, cycle_id: Optional[str] = None) -> bool:
+    """Zero-game short-circuit, checkpoint-aware. Uses the FREE Odds-API /events
+    endpoint (0 credits) and returns True only if some game has a checkpoint that
+    is BOTH in band and not yet fired — so the paid odds call is spent once per
+    checkpoint per game, not on every cycle the band happens to span. Fails OPEN
+    on a transient error so a blip never blacks out a live slate."""
     try:
         events = fetch_odds_events_list(odds_key)
     except Exception:
         return True
     now = datetime.now(timezone.utc)
-    return any(soccer_in_scan_window(e.get("commence_time"), now) for e in events)
+    return any(
+        soccer_checkpoint_pending(e.get("home_team", ""), e.get("away_team", ""),
+                                  e.get("commence_time"), now, cycle_id)
+        for e in events
+    )
 
 
 # ── Generalized soccer matching ──────────────────────────────────────────────
@@ -3926,10 +3969,14 @@ def scan_soccer(cfg: dict, games: Optional[List[dict]] = None) -> Tuple[List[dic
     label, prefix = cfg["label"], cfg["prefix"]
     ml_type, tot_type = f"{prefix}_moneyline", f"{prefix}_total"
     remaining = "?"
+    # One id per scan invocation: a checkpoint fired by THIS cycle stays visible
+    # to every market loop below, while one fired by an earlier cycle blocks.
+    cycle_id = f"{label}-{datetime.now(timezone.utc).timestamp()}"
+    _prune_soccer_fired()
 
     if games is None:
-        if not soccer_has_upcoming_game(cfg["odds_key"]):
-            print(f"  {label}: no game within {SOCCER_LOOKAHEAD_H}h — skip (0 credits)")
+        if not soccer_has_upcoming_game(cfg["odds_key"], cycle_id):
+            print(f"  {label}: no checkpoint due — skip (0 credits)")
             return [], remaining
         try:
             games, remaining = fetch_soccer_odds(cfg["odds_key"])
@@ -3981,8 +4028,21 @@ def scan_soccer(cfg: dict, games: Optional[List[dict]] = None) -> Tuple[List[dic
         # out) and — critically — drops them the instant kickoff passes, so an
         # in-play market is never priced off a pregame line. Gated on the
         # accurate Pinnacle commence_time (soccer tickers carry no start time).
-        if g is not None and not soccer_in_scan_window(g.get("commence_time"), now_utc):
+        if g is None:
             return None
+        # Lineup-anchored checkpoint gate. Fires each checkpoint at most once per
+        # match (the band spans more than one cycle by design), and returns None
+        # once kickoff passes or outside every band — so an in-play market is
+        # never reachable from the scan pool at all.
+        ct = g.get("commence_time")
+        cp = soccer_due_checkpoint(ct, now_utc)
+        if cp is None:
+            return None
+        key = (_soccer_game_id(g["home"], g["away"], ct), cp)
+        prev = _soccer_fired.get(key)
+        if prev is not None and prev != cycle_id:
+            return None                      # this checkpoint already fired
+        _soccer_fired[key] = cycle_id
         return g
 
     def outcome_fair(mkt: dict, game: dict):

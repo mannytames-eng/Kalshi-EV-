@@ -54,8 +54,8 @@ from kalshi_ev_scanner import (
     poisson_live_over_prob,
     fit_poisson_lambda,
     minutes_to_kickoff,
-    SOCCER_SCAN_WINDOWS,
-    SOCCER_SCAN_WINDOW_TOL_M,
+    SOCCER_SCAN_CHECKPOINTS,
+    SOCCER_CHECKPOINT_TOL_M,
     kalshi_get,
     fetch_game_scores,
     fetch_odds_index,
@@ -1348,7 +1348,7 @@ for _b in _open_soccer_clean:
     #     into the 12h window. Positions already past kickoff are LEFT ALONE:
     #     they're legitimate pregame entries that must settle into the record.
     _ttk = minutes_to_kickoff(_b.get("game_time"))
-    if _ttk is not None and _ttk > max(SOCCER_SCAN_WINDOWS) + SOCCER_SCAN_WINDOW_TOL_M:
+    if _ttk is not None and _ttk > max(SOCCER_SCAN_CHECKPOINTS) + SOCCER_CHECKPOINT_TOL_M:
         _drop_ids.add(_b["id"]); _drop_early += 1
 _seen_match: dict = {}
 for _b in sorted([x for x in _open_soccer_clean if x["id"] not in _drop_ids],

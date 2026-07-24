@@ -2225,7 +2225,8 @@ def _lookup_soccer_state(bet: dict):
 def _is_soccer_bet(b: dict) -> bool:
     """True for any MLS/Argentina/Brazil moneyline or total bet."""
     mt = b.get("mkt_type", "")
-    if mt.split("_")[0] in _SOCCER_LEAGUE_NAMES and (mt.endswith("_moneyline") or mt.endswith("_total")):
+    if mt.split("_")[0] in _SOCCER_LEAGUE_NAMES and \
+            (mt.endswith("_moneyline") or mt.endswith("_total") or mt.endswith("_btts")):
         return True
     return _soccer_espn_league_for_ticker(b.get("ticker", "")) is not None
 
@@ -2991,16 +2992,18 @@ def _get_performance(since: Optional[str] = None) -> dict:
         # (prefix in _SOCCER_LEAGUE_NAMES). Fall back to the ticker's ESPN-league
         # prefix (longest-first) + GAME/TOTAL for bets without a stored mkt_type.
         _pfx = mtype.split("_")[0]
-        if _pfx in _SOCCER_LEAGUE_NAMES and mtype.endswith("_moneyline"):
-            return f"{_SOCCER_LEAGUE_NAMES[_pfx]} Moneyline"
-        if _pfx in _SOCCER_LEAGUE_NAMES and mtype.endswith("_total"):
-            return f"{_SOCCER_LEAGUE_NAMES[_pfx]} Total"
+        if _pfx in _SOCCER_LEAGUE_NAMES:
+            _lg = _SOCCER_LEAGUE_NAMES[_pfx]
+            if mtype.endswith("_moneyline"): return f"{_lg} Moneyline"
+            if mtype.endswith("_total"):     return f"{_lg} Total"
+            if mtype.endswith("_btts"):      return f"{_lg} BTTS"
         for _tk_pfx in _SOCCER_ESPN_PREFIXES:
             if ticker.startswith(_tk_pfx):
                 _lg = {"usa.1": "MLS", "arg.1": "Argentina", "bra.1": "Brazil",
                        "bra.2": "Brazil B", "mex.1": "Liga MX",
                        "conmebol.sudamericana": "Sudamericana"}[_SOCCER_ESPN_LEAGUE[_tk_pfx]]
-                return f"{_lg} {'Total' if 'TOTAL' in ticker else 'Moneyline'}"
+                _mk = "BTTS" if "BTTS" in ticker else ("Total" if "TOTAL" in ticker else "Moneyline")
+                return f"{_lg} {_mk}"
         if mtype == "prop":
             for prefix, label in _PROP_SERIES_LABELS.items():
                 if ticker.startswith(prefix):
@@ -6457,7 +6460,7 @@ function renderPerformance(d) {
 
   // By-type breakdown table
   const PROP_LABELS = new Set(['Strikeouts (K)', 'Hits', 'Total Bases', 'RBIs', 'MLB Props', 'NBA Props', 'WNBA Props']);
-  const TYPE_ORDER  = ['MLB Total', 'MLB Spread', 'Strikeouts (K)', 'Hits', 'Total Bases', 'RBIs', 'MLB Props', 'NBA Props', 'WNBA Total', 'WNBA Spread', 'WNBA Props', 'MLS Moneyline', 'MLS Total', 'Argentina Moneyline', 'Argentina Total', 'Brazil Moneyline', 'Brazil Total', 'Liga MX Moneyline', 'Liga MX Total', 'Brazil B Moneyline', 'Brazil B Total', 'Sudamericana Moneyline', 'Sudamericana Total'];
+  const TYPE_ORDER  = ['MLB Total', 'MLB Spread', 'Strikeouts (K)', 'Hits', 'Total Bases', 'RBIs', 'MLB Props', 'NBA Props', 'WNBA Total', 'WNBA Spread', 'WNBA Props', 'MLS Moneyline', 'MLS Total', 'MLS BTTS', 'Argentina Moneyline', 'Argentina Total', 'Argentina BTTS', 'Brazil Moneyline', 'Brazil Total', 'Brazil BTTS', 'Liga MX Moneyline', 'Liga MX Total', 'Liga MX BTTS', 'Brazil B Moneyline', 'Brazil B Total', 'Brazil B BTTS', 'Sudamericana Moneyline', 'Sudamericana Total', 'Sudamericana BTTS'];
   // Markets no longer scanned — settled record frozen & still shown, but tagged
   // so it's clear no new bets are being placed. Total Bases terminated 2026-07-23.
   const TERMINATED_LABELS = new Set(['Total Bases']);

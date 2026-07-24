@@ -820,6 +820,140 @@ def fit_poisson_lambda(pin_line: float, pin_over_prob: float) -> Optional[float]
     return (lo + hi) / 2.0
 
 
+# ── Bivariate Poisson (Dixon-Coles) scoreline model ──────────────────────────
+# Fits home/away goal rates (λ_H, λ_A) from the Shin-devigged moneyline (the
+# home/away split) + Pinnacle's total line (the sum), then prices EVERY market
+# from one coherent joint score distribution. Honest scope note: because the
+# sum of two independent Poissons is Poisson in the total, this does NOT
+# materially change the moneyline (it's fit to reproduce Shin) or the total
+# rungs (≈ the single-λ Poisson) vs. what we already compute. Its real value:
+#   (1) the Dixon-Coles low-score correction (ρ) — pure Poisson underprices the
+#       0-0 / 1-1 draw cluster, biasing the low UNDER rungs;
+#   (2) it recovers λ_H and λ_A SEPARATELY, which is what unlocks the split-
+#       dependent Kalshi markets we currently leave on the table — BTTS, team
+#       totals, correct score, Asian spread — priced from the h2h+totals we
+#       already fetch, at ZERO extra Odds-API credits;
+#   (3) a moneyline-vs-total consistency check (a stale-line signal).
+DC_RHO = -0.08   # Dixon-Coles low-score dependence prior (soccer-typical, ρ<0
+                 # inflates 0-0/1-1 draws). Calibratable per-league from settled
+                 # results later; a prior for now since 3 market constraints
+                 # barely identify it.
+
+
+def _dc_tau(x: int, y: int, lh: float, la: float, rho: float) -> float:
+    """Dixon-Coles low-score correction factor (1 outside the 4 cells)."""
+    if x == 0 and y == 0:
+        return 1.0 - lh * la * rho
+    if x == 0 and y == 1:
+        return 1.0 + lh * rho
+    if x == 1 and y == 0:
+        return 1.0 + la * rho
+    if x == 1 and y == 1:
+        return 1.0 - rho
+    return 1.0
+
+
+def bivariate_scoreline(lh: float, la: float, rho: float = DC_RHO,
+                        max_goals: int = 12) -> List[List[float]]:
+    """Normalized joint pmf P[x][y] of (home goals, away goals) under a
+    Dixon-Coles-corrected independent-Poisson model."""
+    px = [math.exp(-lh) * lh ** x / math.factorial(x) for x in range(max_goals + 1)]
+    py = [math.exp(-la) * la ** y / math.factorial(y) for y in range(max_goals + 1)]
+    M = [[px[x] * py[y] * _dc_tau(x, y, lh, la, rho) for y in range(max_goals + 1)]
+         for x in range(max_goals + 1)]
+    tot = sum(sum(row) for row in M)
+    return [[v / tot for v in row] for row in M] if tot > 0 else M
+
+
+def _scoreline_summary(M: List[List[float]]):
+    """(p_home, p_draw, p_away, total_pmf[]) from a scoreline matrix."""
+    n = len(M)
+    ph = pd = pa = 0.0
+    total_pmf = [0.0] * (2 * n)
+    for x in range(n):
+        for y in range(n):
+            p = M[x][y]
+            if x > y:
+                ph += p
+            elif x == y:
+                pd += p
+            else:
+                pa += p
+            total_pmf[x + y] += p
+    return ph, pd, pa, total_pmf
+
+
+def _over_at_from_pmf(total_pmf: List[float]):
+    """over_at(threshold, is_push) primitive from a total-goals pmf — reuses the
+    same Asian-line machinery as the Poisson path."""
+    def _f(n: int, is_push: bool) -> float:
+        over = sum(total_pmf[n + 1:])
+        if is_push:
+            eq = total_pmf[n] if n < len(total_pmf) else 0.0
+            return over / (1.0 - eq) if eq < 1.0 else 0.0
+        return over
+    return _f
+
+
+def fit_bivariate_poisson(sh_home: float, sh_draw: float, sh_away: float,
+                          pin_line: float, pin_over: float,
+                          rho: float = DC_RHO) -> Optional[Tuple[float, float]]:
+    """Fit (λ_H, λ_A) so the Dixon-Coles model reproduces the moneyline home/away
+    split AND the total over-prob at Pinnacle's (possibly Asian) line. Alternating
+    exact bisections on (λ_total, supremacy) — near-orthogonal, so it converges
+    fast. Returns None if inputs are degenerate."""
+    if not (0.0 < pin_over < 1.0) or pin_line <= 0 or (sh_home + sh_away) <= 0:
+        return None
+    hshare = sh_home / (sh_home + sh_away)      # target home win-share
+    lam_tot, s = 2.6, 0.0
+    for _outer in range(10):
+        # (a) bisect λ_total to hit the total over-prob, holding supremacy s
+        lo, hi = 0.4, 7.0
+        for _ in range(36):
+            mid = (lo + hi) / 2.0
+            lh, la = max(0.03, (mid + s) / 2.0), max(0.03, (mid - s) / 2.0)
+            _, _, _, tp = _scoreline_summary(bivariate_scoreline(lh, la, rho))
+            if _asian_over(pin_line, _over_at_from_pmf(tp)) < pin_over:
+                lo = mid
+            else:
+                hi = mid
+        lam_tot = (lo + hi) / 2.0
+        # (b) bisect supremacy to hit the home win-share, holding λ_total
+        lo, hi = -lam_tot * 0.97, lam_tot * 0.97
+        for _ in range(36):
+            mid = (lo + hi) / 2.0
+            lh, la = max(0.03, (lam_tot + mid) / 2.0), max(0.03, (lam_tot - mid) / 2.0)
+            ph, _, pa, _ = _scoreline_summary(bivariate_scoreline(lh, la, rho))
+            cur = ph / (ph + pa) if (ph + pa) > 0 else 0.5
+            if cur < hshare:
+                lo = mid
+            else:
+                hi = mid
+        s = (lo + hi) / 2.0
+    return max(0.03, (lam_tot + s) / 2.0), max(0.03, (lam_tot - s) / 2.0)
+
+
+def bivariate_market_probs(lh: float, la: float, rho: float = DC_RHO) -> dict:
+    """All fair probabilities derivable from the joint scoreline model. `over`
+    is a callable over(line) valid for any half/integer/Asian line; the split-
+    dependent markets (BTTS, team totals) are the ones the single-λ model can't
+    produce."""
+    M = bivariate_scoreline(lh, la, rho)
+    ph, pd, pa, tpmf = _scoreline_summary(M)
+    n = len(M)
+    p_home0 = sum(M[0][y] for y in range(n))   # home fails to score
+    p_away0 = sum(M[x][0] for x in range(n))   # away fails to score
+    btts = 1.0 - p_home0 - p_away0 + M[0][0]   # both score = 1 − P(H=0) − P(A=0) + P(0,0)
+    over_at = _over_at_from_pmf(tpmf)
+    return {
+        "home": ph, "draw": pd, "away": pa,
+        "btts_yes": btts, "btts_no": 1.0 - btts,
+        "over": lambda line: _asian_over(line, over_at),   # any line type
+        "lambda_home": lh, "lambda_away": la,
+        "total_pmf": tpmf,
+    }
+
+
 def prob_to_american(p: float) -> Optional[int]:
     """Convert a decimal (no-vig) probability to American odds.
     e.g. 0.60 → -150,  0.40 → +150,  0.50 → +100
@@ -3592,17 +3726,16 @@ def _soccer_name_match(kdisp: str, pinname: str) -> bool:
     return bool(ta) and all(t in tb for t in ta)
 
 def _soccer_title_teams(evt: dict) -> Optional[Tuple[str, str]]:
-    """Parse the two team display names from a KX soccer event title, e.g.
-    'Riestra vs Boca Juniors' or 'Palmeiras vs Atletico Mineiro: Total Goals'
-    or 'San Jose vs Los Angeles G Winner?'. Present on both GAME and TOTAL
-    events, so it's the one uniform team source for name-matched leagues."""
-    t = evt.get("title", "") or ""
-    t = re.sub(r":\s*Total Goals\s*$", "", t, flags=re.I)
-    t = re.sub(r"\s*Winner\??\s*$", "", t, flags=re.I)
+    """Parse the two team display names from a KX soccer event title, uniformly
+    across market types: 'Riestra vs Boca Juniors' (GAME, may end ' Winner?'),
+    '… : Total Goals', '… : BTTS', '… : Regulation Time BTTS'. Strip a trailing
+    ' Winner?' then everything from the ':' suffix on the away side."""
+    t = re.sub(r"\s*Winner\??\s*$", "", evt.get("title", "") or "", flags=re.I)
     parts = re.split(r"\s+vs\.?\s+", t, maxsplit=1, flags=re.I)
     if len(parts) != 2:
         return None
-    a, b = parts[0].strip(), parts[1].strip()
+    a = parts[0].strip()
+    b = re.sub(r":.*$", "", parts[1]).strip()   # drop ': Total Goals' / ': BTTS' / etc.
     return (a, b) if a and b else None
 
 def _soccer_safe_match(kteams: Tuple[str, str], kdate, games: List[dict]) -> Optional[dict]:
@@ -3706,22 +3839,22 @@ def _soccer_event_live_or_expired(evt: dict, now_utc: datetime) -> bool:
 # All launch SHADOW-first (KX* prefixes in SHADOW_MARKETS on the UI side).
 SOCCER_LEAGUES: List[dict] = [
     {"label": "MLS", "prefix": "mls", "match": "map", "team_map": MLS_TEAMS,
-     "game_series": "KXMLSGAME", "total_series": "KXMLSTOTAL",
+     "game_series": "KXMLSGAME", "total_series": "KXMLSTOTAL", "btts_series": "KXMLSBTTS",
      "odds_key": "soccer_usa_mls", "espn": "usa.1"},
     {"label": "Argentina Primera", "prefix": "arg", "match": "name",
-     "game_series": "KXARGPREMDIVGAME", "total_series": "KXARGPREMDIVTOTAL",
+     "game_series": "KXARGPREMDIVGAME", "total_series": "KXARGPREMDIVTOTAL", "btts_series": "KXARGPREMDIVBTTS",
      "odds_key": "soccer_argentina_primera_division", "espn": "arg.1"},
     {"label": "Brazil Serie A", "prefix": "bra", "match": "name",
-     "game_series": "KXBRASILEIROGAME", "total_series": "KXBRASILEIROTOTAL",
+     "game_series": "KXBRASILEIROGAME", "total_series": "KXBRASILEIROTOTAL", "btts_series": "KXBRASILEIROBTTS",
      "odds_key": "soccer_brazil_campeonato", "espn": "bra.1"},
     {"label": "Liga MX", "prefix": "lmx", "match": "name",
-     "game_series": "KXLIGAMXGAME", "total_series": "KXLIGAMXTOTAL",
+     "game_series": "KXLIGAMXGAME", "total_series": "KXLIGAMXTOTAL", "btts_series": "KXLIGAMXBTTS",
      "odds_key": "soccer_mexico_ligamx", "espn": "mex.1"},
     {"label": "Brazil Serie B", "prefix": "brb", "match": "name",
-     "game_series": "KXBRASILEIROBGAME", "total_series": "KXBRASILEIROBTOTAL",
+     "game_series": "KXBRASILEIROBGAME", "total_series": "KXBRASILEIROBTOTAL", "btts_series": "KXBRASILEIROBBTTS",
      "odds_key": "soccer_brazil_serie_b", "espn": "bra.2"},
     {"label": "Copa Sudamericana", "prefix": "sud", "match": "name",
-     "game_series": "KXCONMEBOLSUDGAME", "total_series": "KXCONMEBOLSUDTOTAL",
+     "game_series": "KXCONMEBOLSUDGAME", "total_series": "KXCONMEBOLSUDTOTAL", "btts_series": "KXCONMEBOLSUDBTTS",
      "odds_key": "soccer_conmebol_copa_sudamericana", "espn": "conmebol.sudamericana"},
 ]
 
@@ -3759,8 +3892,11 @@ def scan_soccer(cfg: dict, games: Optional[List[dict]] = None) -> Tuple[List[dic
         if is_map:
             codes = _mls_teams_from_event(evt)
             if not codes:
-                m = re.search(cfg["total_series"] + r"-\d{2}[A-Z]{3}\d{2}([A-Z]+)-",
-                              evt.get("event_ticker", "").upper())
+                # Total / BTTS events carry no per-team market suffix — parse the
+                # team segment from the event ticker itself (series-agnostic). The
+                # event ticker ENDS at the segment (e.g. KXMLSTOTAL-26JUL25SJLAG),
+                # so the segment runs to end-of-string, not to a trailing dash.
+                m = re.search(r"-\d{2}[A-Z]{3}\d{2}([A-Z]+)", evt.get("event_ticker", "").upper())
                 if not m:
                     return None
                 seg, found = m.group(1), None
@@ -3847,13 +3983,47 @@ def scan_soccer(cfg: dict, games: Optional[List[dict]] = None) -> Tuple[List[dic
             if e:
                 edges.append(e)
 
-    # Correlation control — one best moneyline + one best total per game (the 3
-    # ML outcomes are mutually exclusive; adjacent rungs correlate).
+    # ── BTTS (both teams to score) — priced from the bivariate-Poisson model ──
+    # Derived from the h2h+totals we ALREADY fetched (no extra credits): fit
+    # (λ_H, λ_A) from the Shin moneyline split + total, then P(both score). This
+    # is the split-dependent market the single-λ total model can't produce.
+    btts_type = f"{prefix}_btts"
+    if cfg.get("btts_series"):
+        try:
+            btts_events = fetch_kalshi_events(cfg["btts_series"])
+        except Exception as e:
+            print(f"  ERROR — Kalshi {cfg['btts_series']}: {e}")
+            btts_events = []
+        for evt in btts_events:
+            if _soccer_event_live_or_expired(evt, now_utc):
+                continue
+            game = find_game(evt)
+            if not game or not game.get("total"):
+                continue
+            fit = fit_bivariate_poisson(game["ml"].get(game["home"]), game["draw"],
+                                        game["ml"].get(game["away"]),
+                                        game["total"]["line"], game["total"]["over_prob"])
+            if not fit:
+                continue
+            btts_yes = bivariate_market_probs(*fit)["btts_yes"]
+            matchup = f"{game['away']} @ {game['home']}"
+            for mkt in (evt.get("markets") or []):
+                if mkt.get("ticker", "").split("-")[-1] != "BTTS":
+                    continue
+                e = _soccer_price_market(mkt, btts_yes, btts_type, "Both teams to score",
+                                         matchup, game.get("commence_time"), None, None, now_utc)
+                if e:
+                    edges.append(e)
+
+    # Correlation control — one best edge per (game, market group). The 3 ML
+    # outcomes are mutually exclusive and adjacent rungs correlate, so each group
+    # (moneyline / total / btts) keeps only its single best edge per game.
     edges.sort(key=lambda x: x["edge"], reverse=True)
     best: Dict[Tuple[str, str], dict] = {}
     for e in edges:
-        key = (e["matchup"], "total" if e["mkt_type"].endswith("_total") else "moneyline")
-        best.setdefault(key, e)
+        grp = "total" if e["mkt_type"].endswith("_total") else (
+              "btts" if e["mkt_type"].endswith("_btts") else "moneyline")
+        best.setdefault((e["matchup"], grp), e)
     edges = sorted(best.values(), key=lambda x: x["edge"], reverse=True)
     print(f"  {label} edges ≥{EDGE_THRESHOLD:.0%}: {len(edges)}")
     return edges, remaining
@@ -3863,210 +4033,6 @@ def scan_mls(mls_index: Optional[List[dict]] = None) -> Tuple[List[dict], str]:
     """Back-compat wrapper — MLS is SOCCER_LEAGUES[0]."""
     return scan_soccer(SOCCER_LEAGUES[0], games=mls_index)
 
-
-def scan_mls(mls_index: Optional[Dict[str, dict]] = None) -> Tuple[List[dict], str]:
-    """Scan Kalshi MLS moneyline (KXMLSGAME, 3-way) and total-goals (KXMLSTOTAL)
-    markets against Pinnacle's Shin-devigged 3-way probabilities and Poisson
-    total model. Returns (edges, credits_remaining). Same edge-dict format as
-    scan_sport so the UI consumes it identically. Double chance rides free on
-    the NO side of team/tie markets (see module comment above)."""
-    print(f"\n{'═'*70}")
-    print(f"  MLS — Moneyline (3-way) & Total Goals  —  {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    print(f"{'═'*70}")
-
-    remaining = "?"
-    if mls_index is None:
-        try:
-            mls_index, remaining = fetch_mls_odds()
-        except Exception as exc:
-            print(f"  ERROR — MLS book odds: {exc}")
-            return [], remaining
-    print(f"  Pinnacle MLS games: {len(mls_index)}")
-
-    def _find_game(home_code: str, away_code: str) -> Optional[dict]:
-        hp = MLS_TEAMS.get(home_code, {}).get("pin")
-        ap = MLS_TEAMS.get(away_code, {}).get("pin")
-        if not hp or not ap:
-            return None
-        return mls_index.get(frozenset({hp, ap}))
-
-    edges: List[dict] = []
-    now_utc = datetime.now(timezone.utc)
-
-    def _price_market(mkt: dict, fair: float, mkt_type: str, title: str,
-                      matchup: str, commence_time, pin_line, threshold) -> Optional[dict]:
-        """Shared YES/NO edge builder — identical EV math to scan_sport."""
-        prices = kalshi_prices(mkt)
-        if prices is None:
-            return None
-        yes_bid, yes_ask = prices
-        yes_raw = fair - yes_ask
-        no_raw  = (1 - fair) - (1 - yes_bid)
-        yes_fee = KALSHI_FEE_RATE * fair       * (1 - yes_ask)
-        no_fee  = KALSHI_FEE_RATE * (1 - fair) * yes_bid
-        yes_adj = (yes_raw - yes_fee) * (1 - EV_HAIRCUT)
-        no_adj  = (no_raw  - no_fee)  * (1 - EV_HAIRCUT)
-        best_adj = max(yes_adj, no_adj)
-        if best_adj < EDGE_THRESHOLD or best_adj > MAX_EDGE:
-            return None
-        if yes_adj >= no_adj:
-            side, k_side, f_side, raw_edge, adj = "YES", yes_ask, fair, yes_raw, yes_adj
-        else:
-            side, k_side, f_side, raw_edge, adj = "NO", 1 - yes_bid, 1 - fair, no_raw, no_adj
-        if k_side < MIN_KALSHI_PRICE:
-            return None
-        books_detail = {"pinnacle": round(fair, 4)}   # fair = canonical YES prob
-        # For NO bets, express per-book as P(Kalshi YES) — already fair here.
-        per_book_novig = _build_per_book_novig(books_detail, side)
-        cons_yes = round(fair, 4)
-        cons_no  = round(1 - fair, 4)
-        return {
-            "ticker":               mkt.get("ticker", ""),
-            "title":                title,
-            "kalshi_line":          threshold,
-            "matchup":              matchup,
-            "side":                 side,
-            "kalshi":               round(k_side, 4),
-            "fair":                 round(f_side, 4),
-            "raw_edge":             round(raw_edge, 4),
-            "edge":                 round(adj, 4),
-            "confidence":           1.0,          # single sharp anchor (Pinnacle)
-            "mkt_type":             mkt_type,
-            "pin_line":             pin_line,
-            "fair_source":          "exact",
-            "books_used":           ["pinnacle"],
-            "books_detail":         books_detail,
-            "per_book_novig":       per_book_novig,
-            "consensus_yes":        cons_yes,
-            "consensus_no":         cons_no,
-            "consensus_yes_american": prob_to_american(cons_yes),
-            "consensus_no_american":  prob_to_american(cons_no),
-            "consensus_prob":       cons_yes,
-            "is_valid_consensus":   True,
-            "consensus_reason":     "Pinnacle (sole sharp anchor)",
-            "kalshi_price_ts":      now_utc.isoformat(),
-            "commence_time":        commence_time,
-        }
-
-    def _event_live_or_expired(evt: dict) -> bool:
-        """True if the game has started or the event expired (skip it)."""
-        mkts = evt.get("markets") or []
-        exp_str = ""
-        if mkts:
-            exp_str = mkts[0].get("expected_expiration_time") or mkts[0].get("close_time") or ""
-        game_dt = _parse_ticker_game_time(evt.get("event_ticker", ""))
-        if game_dt is None and exp_str:
-            try:
-                from datetime import timedelta as _tde
-                exp_dt = datetime.fromisoformat(exp_str.replace("Z", "+00:00"))
-                game_dt = exp_dt - _tde(hours=2.5)   # soccer ≈ 2h + buffer
-            except (ValueError, AttributeError):
-                game_dt = None
-        if game_dt is not None and now_utc >= game_dt:
-            return True
-        return False
-
-    # ── Moneyline (KXMLSGAME) — 3-way ────────────────────────────────────────
-    try:
-        ml_events = fetch_kalshi_events("KXMLSGAME")
-    except Exception as e:
-        print(f"  ERROR — Kalshi KXMLSGAME: {e}")
-        ml_events = []
-    for evt in ml_events:
-        if _event_live_or_expired(evt):
-            continue
-        codes = _mls_teams_from_event(evt)
-        if not codes:
-            continue
-        home_code, away_code = codes
-        game = _find_game(home_code, away_code)
-        if not game:
-            continue
-        home_name, away_name = game["home"], game["away"]
-        matchup = f"{away_name} @ {home_name}"
-        outcome_fair = {
-            home_code: (game["ml"].get(home_name), f"{home_name} to win"),
-            away_code: (game["ml"].get(away_name), f"{away_name} to win"),
-            "TIE":     (game["draw"],              "Draw (match ends level)"),
-        }
-        for mkt in (evt.get("markets") or []):
-            suffix = mkt.get("ticker", "").split("-")[-1]
-            fair_title = outcome_fair.get(suffix)
-            if not fair_title or fair_title[0] is None:
-                continue
-            fair, title = fair_title
-            e = _price_market(mkt, fair, "mls_moneyline", title, matchup,
-                              game.get("commence_time"), None, None)
-            if e:
-                edges.append(e)
-
-    # ── Total goals (KXMLSTOTAL) — Poisson off Pinnacle's line ───────────────
-    try:
-        tot_events = fetch_kalshi_events("KXMLSTOTAL")
-    except Exception as e:
-        print(f"  ERROR — Kalshi KXMLSTOTAL: {e}")
-        tot_events = []
-    for evt in tot_events:
-        if _event_live_or_expired(evt):
-            continue
-        codes = _mls_teams_from_event(evt)
-        # KXMLSTOTAL markets carry no team codes; parse from the event segment.
-        if not codes:
-            m = re.search(r"KXMLSTOTAL-\d{2}[A-Z]{3}\d{2}([A-Z]+)-", evt.get("event_ticker", "").upper())
-            if not m:
-                continue
-            seg = m.group(1)
-            # split against known codes (longest-first to disambiguate)
-            found = None
-            for n in (4, 3, 2):
-                a, h = seg[:n], seg[n:]
-                if a in MLS_TEAMS and h in MLS_TEAMS:
-                    found = (a, h)
-                    break
-            if not found:
-                continue
-            codes = found
-        game = _find_game(codes[0], codes[1])
-        if not game or not game.get("total"):
-            continue
-        lam = fit_poisson_lambda(game["total"]["line"], game["total"]["over_prob"])
-        if lam is None:
-            continue
-        matchup = f"{game['away']} @ {game['home']}"
-        for mkt in (evt.get("markets") or []):
-            # Kalshi over-x.5 line lives in yes_sub_title ("Over 2.5 goals scored")
-            sub = mkt.get("yes_sub_title", "") or mkt.get("title", "")
-            m = re.search(r"([0-9]+\.5)", sub)
-            if not m:
-                continue
-            line = float(m.group(1))
-            if abs(line - game["total"]["line"]) > MLS_MAX_TOTAL_RUNGS:
-                continue   # too far from the anchor — Poisson tail unreliable
-            fair = poisson_over_prob(line, lam)
-            e = _price_market(mkt, fair, "mls_total", f"Over {line} goals",
-                              matchup, game.get("commence_time"),
-                              game["total"]["line"], line)
-            if e:
-                edges.append(e)
-
-    edges.sort(key=lambda x: x["edge"], reverse=True)
-
-    # Correlation control: the 3 moneyline outcomes (home/away/tie) plus their
-    # NO/double-chance sides are all mutually-exclusive positions on one game,
-    # and adjacent total-goal rungs move together. Never stack correlated soccer
-    # bets — keep only the single best edge per (game, group), same as MLB's
-    # moneyline cap=1. One moneyline + one total per game may still both surface
-    # (weakly correlated, consistent with how MLB flags total & ML together).
-    best_per_group: Dict[Tuple[str, str], dict] = {}
-    for e in edges:   # already sorted best-first, so first seen per key wins
-        group = "total" if e["mkt_type"] == "mls_total" else "moneyline"
-        key = (e["matchup"], group)
-        if key not in best_per_group:
-            best_per_group[key] = e
-    edges = sorted(best_per_group.values(), key=lambda x: x["edge"], reverse=True)
-
-    print(f"  MLS edges ≥{EDGE_THRESHOLD:.0%}: {len(edges)}")
-    return edges, remaining
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────

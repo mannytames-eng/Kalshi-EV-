@@ -3620,6 +3620,14 @@ MLS_MAX_TOTAL_RUNGS = 2.5   # only price Kalshi over-x.5 rungs within this many
 SOCCER_LOOKAHEAD_H = 12   # zero-game short-circuit: only spend the paid odds
                           # call when a league has a game commencing within this
                           # many hours (checked via the FREE /events endpoint).
+SOCCER_MIN_KALSHI_PRICE = 0.30   # soccer-only price floor (vs the 0.15 global).
+                          # Sub-30¢ longshot rungs are where a 2-3¢ book gap
+                          # balloons into a huge % edge AND where the book is
+                          # thinnest — they manufacture the inflated edges that
+                          # crowd out the real mid-priced edge on the same game
+                          # (correlation-collapse keeps one per game). Removing
+                          # them is the surgical fix, vs capping MAX_EDGE (which
+                          # would also throw away genuine large edges).
 
 
 def fetch_soccer_odds(odds_key: str) -> Tuple[List[dict], str]:
@@ -3798,7 +3806,7 @@ def _soccer_price_market(mkt: dict, fair: float, mkt_type: str, title: str,
         side, k_side, f_side, raw_edge, adj = "YES", yes_ask, fair, yes_raw, yes_adj
     else:
         side, k_side, f_side, raw_edge, adj = "NO", 1 - yes_bid, 1 - fair, no_raw, no_adj
-    if k_side < MIN_KALSHI_PRICE:
+    if k_side < SOCCER_MIN_KALSHI_PRICE:   # soccer 30¢ floor (see constant)
         return None
     books_detail = {"pinnacle": round(fair, 4)}
     cons_yes, cons_no = round(fair, 4), round(1 - fair, 4)
@@ -3888,7 +3896,7 @@ def scan_soccer(cfg: dict, games: Optional[List[dict]] = None) -> Tuple[List[dic
     now_utc = datetime.now(timezone.utc)
     edges: List[dict] = []
 
-    def find_game(evt: dict) -> Optional[dict]:
+    def _locate_game(evt: dict) -> Optional[dict]:
         if is_map:
             codes = _mls_teams_from_event(evt)
             if not codes:
@@ -3914,6 +3922,21 @@ def scan_soccer(cfg: dict, games: Optional[List[dict]] = None) -> Tuple[List[dic
         if not tt:
             return None
         return _soccer_safe_match(tt, _soccer_ticker_date(evt.get("event_ticker", "")), games)
+
+    def find_game(evt: dict) -> Optional[dict]:
+        g = _locate_game(evt)
+        # Robust no-live guard: never flag a game that has already kicked off.
+        # Soccer tickers carry no start time, so the event-level heuristic can't
+        # be trusted alone — gate on the accurate Pinnacle commence_time.
+        if g is not None:
+            ct = g.get("commence_time")
+            if ct:
+                try:
+                    if datetime.fromisoformat(ct.replace("Z", "+00:00")) <= now_utc:
+                        return None
+                except (ValueError, AttributeError):
+                    pass
+        return g
 
     def outcome_fair(mkt: dict, game: dict):
         """(fair_prob, title) for a moneyline market, or None."""

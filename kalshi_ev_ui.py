@@ -50,6 +50,9 @@ from kalshi_ev_scanner import (
     scan_soccer,
     SOCCER_LEAGUES,
     MLS_TEAMS,
+    total_market_resolved,
+    poisson_live_over_prob,
+    fit_poisson_lambda,
     kalshi_get,
     fetch_game_scores,
     fetch_odds_index,
@@ -2222,6 +2225,65 @@ def _lookup_soccer_state(bet: dict):
     return (scoreline, clock, logos[0], logos[1])
 
 
+def _soccer_clock_minutes(ev: dict):
+    """(minutes_elapsed, is_final) from an ESPN soccer event. 'Full Time'/post →
+    (90, True); half → (45, False); '45'+4'' → 49; plain '51'' → 51."""
+    if ev.get("state") == "post":
+        return 90.0, True
+    det = (ev.get("detail") or "").lower()
+    if "half" in det:
+        return 45.0, False
+    import re as _re
+    nums = _re.findall(r"\d+", ev.get("clock") or "")
+    return (float(sum(int(x) for x in nums)) if nums else 0.0), False
+
+
+def _soccer_total_live_status(bet: dict, ev: dict) -> Optional[dict]:
+    """For an in-play/finished soccer TOTALS bet, decide from the live score
+    whether the market is already resolved (→ must be excluded from the active
+    feed) or, if still live, its correctly time-adjusted fair/edge (goals scored
+    for sure + λ scaled by minutes remaining). None for pre-game / non-totals.
+
+    Returns {"resolved": True, "over_won": bool} for decided markets, or
+    {"resolved": False, "live_fair": f, "live_edge_pct": e} for live ones."""
+    if not bet.get("mkt_type", "").endswith("_total") or ev is None:
+        return None
+    hs, as_ = ev.get("home_score"), ev.get("away_score")
+    if ev.get("state") == "pre" or hs is None or as_ is None:
+        return None
+    try:
+        goals = int(hs) + int(as_)
+    except (TypeError, ValueError):
+        return None
+    # rung line from the bet
+    line = bet.get("kalshi_line")
+    if line is None:
+        import re as _re
+        m = _re.search(r"([0-9]+\.5)", bet.get("title", "") or "")
+        if not m:
+            return None
+        line = float(m.group(1))
+    minutes, is_final = _soccer_clock_minutes(ev)
+    resolved, over_won = total_market_resolved(float(line), goals, is_final)
+    if resolved:
+        return {"resolved": True, "over_won": bool(over_won)}
+    # still live & undecided — re-price off remaining goals. Recover the pregame
+    # λ from the rung + the stored pregame over-prob (fair is the bet SIDE fair).
+    side = bet.get("side", "YES")
+    fair = bet.get("fair")
+    kalshi = bet.get("kalshi")
+    if fair is None or kalshi is None:
+        return None
+    p_over_pre = fair if side == "YES" else 1.0 - fair
+    lam = fit_poisson_lambda(float(line), p_over_pre)
+    if lam is None:
+        return None
+    p_over_live = poisson_live_over_prob(float(line), lam, goals, minutes)
+    side_fair = p_over_live if side == "YES" else 1.0 - p_over_live
+    return {"resolved": False, "live_fair": round(side_fair, 4),
+            "live_edge_pct": round((side_fair - kalshi) * 100, 1)}
+
+
 def _is_soccer_bet(b: dict) -> bool:
     """True for any MLS/Argentina/Brazil moneyline or total bet."""
     mt = b.get("mkt_type", "")
@@ -2265,11 +2327,26 @@ def _live_stats_loop():
             fresh = {}
             for b in inplay:
                 if _is_soccer_bet(b):
-                    # Game lines: live tracker = scoreline + match clock + logos (ESPN)
+                    # Game lines: live tracker = scoreline + match clock + logos (ESPN).
+                    # For totals, also compute live resolution / time-adjusted fair
+                    # so the feed can drop decided markets and re-price live ones
+                    # (the ESPN scoreboard is cached, so the extra lookup is free).
+                    ev = _soccer_espn_event(b)
                     st = _lookup_soccer_state(b)
+                    entry = {}
                     if st:
-                        fresh[b["id"]] = {"stat": st[0], "inning": st[1],
-                                          "home_logo": st[2], "away_logo": st[3]}
+                        entry = {"stat": st[0], "inning": st[1],
+                                 "home_logo": st[2], "away_logo": st[3]}
+                    ts = _soccer_total_live_status(b, ev)
+                    if ts:
+                        entry["total_status"] = ts
+                    # A finished match decides EVERY market on it (moneyline,
+                    # totals, BTTS) — flag it so the feed drops the row instead
+                    # of showing a pregame edge on a completed game.
+                    if ev is not None and ev.get("state") == "post":
+                        entry["game_final"] = True
+                    if entry:
+                        fresh[b["id"]] = entry
                 else:
                     r = _lookup_box_stat(b)
                     inning = _fetch_game_inning(b)
@@ -7191,12 +7268,30 @@ class Handler(BaseHTTPRequestHandler):
             # Attach live in-game stat (from the background cache) for IN PLAY bets
             with _live_stats_lock:
                 _ls = dict(_live_stats)
-            open_bets = [{**b,
-                          "live_stat":   (_ls.get(b["id"]) or {}).get("stat"),
-                          "live_inning": (_ls.get(b["id"]) or {}).get("inning"),
-                          "home_logo":   (_ls.get(b["id"]) or {}).get("home_logo"),
-                          "away_logo":   (_ls.get(b["id"]) or {}).get("away_logo")}
-                         for b in open_bets]
+            _feed = []
+            for b in open_bets:
+                cache = _ls.get(b["id"]) or {}
+                # Soccer totals: a market decided by the live score is NOT an
+                # opportunity — its true fair is 0 or 1, so its stored pregame
+                # edge is a mathematical artifact. Drop it from the active feed
+                # entirely (never show a fake edge on a settled market). For a
+                # still-live total, override the stale pregame edge/fair with the
+                # time-adjusted live values so the number shown is honest.
+                ts = cache.get("total_status")
+                if cache.get("game_final") or (ts and ts.get("resolved")):
+                    continue
+                row = {**b,
+                       "live_stat":   cache.get("stat"),
+                       "live_inning": cache.get("inning"),
+                       "home_logo":   cache.get("home_logo"),
+                       "away_logo":   cache.get("away_logo")}
+                if ts and not ts.get("resolved") and ts.get("live_fair") is not None:
+                    row["fair"]        = ts["live_fair"]
+                    row["fair_pct"]    = round(ts["live_fair"] * 100, 1)
+                    row["edge_pct"]    = ts["live_edge_pct"]
+                    row["live_repriced"] = True
+                _feed.append(row)
+            open_bets = _feed
             print(f"  /api/today_edges: found {len(open_bets)} open positions")
             try:
                 payload = json.dumps(open_bets).encode()

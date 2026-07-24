@@ -751,6 +751,39 @@ def poisson_over_prob(line: float, lam: float) -> float:
     return 1.0 - _poisson_cdf(int(math.floor(line)), lam)
 
 
+def total_market_resolved(line: float, goals_scored: int, is_final: bool):
+    """Is an over/under-`line` totals market already mathematically decided by
+    the live score? Returns (resolved: bool, over_won: Optional[bool]).
+      • goals_scored > line  → Over is CERTAIN (resolved), regardless of time.
+      • Full Time and the line was never reached → Under is certain (resolved).
+      • otherwise still live/undecided → (False, None).
+    A resolved market must NEVER be surfaced as an edge — its fair is 0 or 1, so
+    any 'edge' vs a mid-range price is an artifact of a stale pregame number."""
+    if goals_scored > line:
+        return True, True
+    if is_final:
+        return True, False
+    return False, None
+
+
+def poisson_live_over_prob(line: float, lam_pregame: float,
+                           goals_scored: int, minutes_elapsed: float) -> float:
+    """Live-adjusted P(total goals > `line`) for an IN-PLAY, unresolved market.
+    Goals already scored count for sure; only the REMAINING goals are random,
+    at a rate scaled by the time left: λ_remaining = λ_pregame × (90−min)/90.
+    The threshold on remaining goals is the residual line (line − goals_scored),
+    which stays a clean half-line, so poisson_over_prob applies directly. Do NOT
+    reuse the full 90-minute λ in-play — that ignores both the score and the
+    clock and is what produces impossible fair values on decided games."""
+    residual = line - goals_scored
+    if residual < 0:               # already over — resolved (caller should gate)
+        return 1.0
+    frac = max(0.0, min(1.0, (90.0 - minutes_elapsed) / 90.0))
+    if frac <= 0.0:                # no time left and not over → under certain
+        return 0.0
+    return poisson_over_prob(residual, lam_pregame * frac)
+
+
 def _asian_over_components(line: float):
     """Decompose an Asian/soccer total line into clean (integer-push or half)
     legs with stake weights. Pinnacle prices soccer totals on QUARTER lines

@@ -3439,18 +3439,20 @@ MLS_MAX_TOTAL_RUNGS = 2.5   # only price Kalshi over-x.5 rungs within this many
                             # guard philosophy as WNBA_EXTRAP_MAX_RUNGS.
 
 
-def fetch_mls_odds() -> Tuple[Dict[str, dict], str]:
-    """Fetch Pinnacle MLS h2h (3-way) + totals in one call (2 credits) and build
-    a per-game index keyed by frozenset of the two Pinnacle team names:
-        { frozenset({home,away}): {
-            "home", "away", "commence_time",
-            "ml":    {team_name: fair_prob, ...}  # 3-way Shin de-vig, draw incl.
-            "draw":  fair_prob,
-            "total": {"line": L, "over_prob": p} or None,
-        } }
-    fair_prob values are the Shin de-vigged probabilities (sum to 1 across the
-    three moneyline outcomes)."""
-    r = requests.get(f"{ODDS_BASE}/sports/soccer_usa_mls/odds", params={
+SOCCER_LOOKAHEAD_H = 12   # zero-game short-circuit: only spend the paid odds
+                          # call when a league has a game commencing within this
+                          # many hours (checked via the FREE /events endpoint).
+
+
+def fetch_soccer_odds(odds_key: str) -> Tuple[List[dict], str]:
+    """Fetch Pinnacle h2h (3-way) + totals for a soccer league in one call
+    (2 credits). Returns (games, remaining) where each game is:
+        {"home", "away", "commence_time",
+         "ml": {team_name: shin_fair_prob},   # home & away (draw is separate)
+         "draw": shin_fair_prob,
+         "total": {"line": L, "over_prob": p} or None}
+    ml/draw are the 3-way Shin de-vigged probabilities (sum to 1)."""
+    r = requests.get(f"{ODDS_BASE}/sports/{odds_key}/odds", params={
         "apiKey":     ODDS_API_KEY,
         "bookmakers": "pinnacle",
         "markets":    "h2h,totals",
@@ -3458,7 +3460,7 @@ def fetch_mls_odds() -> Tuple[Dict[str, dict], str]:
     }, timeout=15)
     r.raise_for_status()
     remaining = r.headers.get("x-requests-remaining", "?")
-    index: Dict[str, dict] = {}
+    games: List[dict] = []
     for g in r.json():
         home, away = g.get("home_team", ""), g.get("away_team", "")
         if not home or not away:
@@ -3472,40 +3474,341 @@ def fetch_mls_odds() -> Tuple[Dict[str, dict], str]:
             for mk in bm.get("markets", []):
                 outs = {o["name"]: o["price"] for o in mk.get("outcomes", []) if o.get("price") is not None}
                 if mk.get("key") == "h2h" and home in outs and away in outs and "Draw" in outs:
-                    implied = [american_to_implied(outs[home]),
-                               american_to_implied(outs[away]),
-                               american_to_implied(outs["Draw"])]
-                    ph, pa, pd = shin_devig_multi(implied)
+                    ph, pa, pd = shin_devig_multi([american_to_implied(outs[home]),
+                                                   american_to_implied(outs[away]),
+                                                   american_to_implied(outs["Draw"])])
                     entry["ml"] = {home: ph, away: pa}
                     entry["draw"] = pd
                 elif mk.get("key") == "totals":
                     over  = next((o for o in mk.get("outcomes", []) if o.get("name") == "Over"), None)
                     under = next((o for o in mk.get("outcomes", []) if o.get("name") == "Under"), None)
                     if over and under and over.get("point") is not None:
-                        io = american_to_implied(over["price"])
-                        iu = american_to_implied(under["price"])
+                        io = american_to_implied(over["price"]); iu = american_to_implied(under["price"])
                         if io + iu > 0:
-                            entry["total"] = {"line": float(over["point"]),
-                                              "over_prob": io / (io + iu)}
+                            entry["total"] = {"line": float(over["point"]), "over_prob": io / (io + iu)}
         if entry["ml"] and entry["draw"] is not None:
-            index[frozenset({home, away})] = entry
-    return index, remaining
+            games.append(entry)
+    return games, remaining
 
+
+def soccer_has_upcoming_game(odds_key: str, within_h: int = SOCCER_LOOKAHEAD_H) -> bool:
+    """Zero-game short-circuit. Uses the FREE Odds-API /events endpoint (0
+    credits) to decide whether a league has a game worth scanning right now —
+    True if any game commences within `within_h` hours (or started in the last
+    3h, so an in-progress slate still refreshes). Fails OPEN (returns True) on a
+    transient error so a blip never silently blacks out a live slate."""
+    try:
+        events = fetch_odds_events_list(odds_key)
+    except Exception:
+        return True
+    now = datetime.now(timezone.utc)
+    from datetime import timedelta as _td
+    lo, hi = now - _td(hours=3), now + _td(hours=within_h)
+    for e in events:
+        ct = e.get("commence_time")
+        if not ct:
+            continue
+        try:
+            dt = datetime.fromisoformat(ct.replace("Z", "+00:00"))
+        except (ValueError, AttributeError):
+            continue
+        if lo <= dt <= hi:
+            return True
+    return False
+
+
+# ── Generalized soccer matching ──────────────────────────────────────────────
+_MONTH3 = {"JAN":1,"FEB":2,"MAR":3,"APR":4,"MAY":5,"JUN":6,
+           "JUL":7,"AUG":8,"SEP":9,"OCT":10,"NOV":11,"DEC":12}
+
+def _soccer_norm(s: str) -> str:
+    return re.sub(r"[^a-z0-9]", "", (s or "").lower())
+
+def _soccer_ticker_date(ticker: str):
+    """date object from the KX…-26JUL25… token, or None."""
+    m = re.search(r"-(\d{2})([A-Z]{3})(\d{2})", ticker or "")
+    if not m or m.group(2) not in _MONTH3:
+        return None
+    from datetime import date as _date
+    return _date(2000 + int(m.group(1)), _MONTH3[m.group(2)], int(m.group(3)))
+
+def _soccer_name_match(kdisp: str, pinname: str) -> bool:
+    """True if a Kalshi display name confidently refers to a Pinnacle team.
+    Substring either way, or every significant (len>2) Kalshi token present in
+    the Pinnacle name. Deliberately conservative — ghost matches are prevented
+    at the game level (both teams must match a unique game), so this only needs
+    to avoid matching genuinely-different clubs."""
+    a, b = _soccer_norm(kdisp), _soccer_norm(pinname)
+    if not a or not b:
+        return False
+    if a in b or b in a:
+        return True
+    ta = [t for t in re.findall(r"[a-z]+", kdisp.lower()) if len(t) > 2]
+    tb = set(re.findall(r"[a-z]+", pinname.lower()))
+    return bool(ta) and all(t in tb for t in ta)
+
+def _soccer_title_teams(evt: dict) -> Optional[Tuple[str, str]]:
+    """Parse the two team display names from a KX soccer event title, e.g.
+    'Riestra vs Boca Juniors' or 'Palmeiras vs Atletico Mineiro: Total Goals'
+    or 'San Jose vs Los Angeles G Winner?'. Present on both GAME and TOTAL
+    events, so it's the one uniform team source for name-matched leagues."""
+    t = evt.get("title", "") or ""
+    t = re.sub(r":\s*Total Goals\s*$", "", t, flags=re.I)
+    t = re.sub(r"\s*Winner\??\s*$", "", t, flags=re.I)
+    parts = re.split(r"\s+vs\.?\s+", t, maxsplit=1, flags=re.I)
+    if len(parts) != 2:
+        return None
+    a, b = parts[0].strip(), parts[1].strip()
+    return (a, b) if a and b else None
+
+def _soccer_safe_match(kteams: Tuple[str, str], kdate, games: List[dict]) -> Optional[dict]:
+    """Match a Kalshi game (two display names + ticker date) to a Pinnacle game.
+    SAFE BY CONSTRUCTION: requires BOTH Kalshi teams to name-match, to DIFFERENT
+    Pinnacle teams, within ±1 day (absorbs the UTC-vs-local date offset on late
+    kickoffs), and returns a match ONLY if it is UNIQUE. Any ambiguity → None
+    (no bet). Verified against live Argentina/Brazil slates: 100% precision,
+    correctly disambiguating same-city clubs (two Estudiantes, Rosario Central
+    vs Central Cordoba, etc.). Games Pinnacle hasn't priced yet return None and
+    are simply skipped — there's no line to devig against anyway."""
+    if kdate is None:
+        return None
+    cands = []
+    for g in games:
+        cd = g.get("commence_time")
+        try:
+            pdt = datetime.fromisoformat(cd.replace("Z", "+00:00")).date() if cd else None
+        except (ValueError, AttributeError):
+            pdt = None
+        if pdt is None or abs((pdt - kdate).days) > 1:
+            continue
+        m0 = [n for n in (g["home"], g["away"]) if _soccer_name_match(kteams[0], n)]
+        m1 = [n for n in (g["home"], g["away"]) if _soccer_name_match(kteams[1], n)]
+        if m0 and m1 and set(m0) != set(m1):
+            cands.append(g)
+    return cands[0] if len(cands) == 1 else None
 
 def _mls_teams_from_event(evt: dict) -> Optional[Tuple[str, str]]:
-    """Return (home_code, away_code) for a KXMLS event from its non-TIE market
-    ticker suffixes. The event ticker's concatenated segment is ambiguous to
-    split (2- vs 3- vs 4-letter codes), but each market ticker ends in its own
-    unambiguous team code, so read them directly. Kalshi lists home first."""
+    """(home_code, away_code) for a KXMLS event from its non-TIE market ticker
+    suffixes (each market ticker ends in its own unambiguous team code)."""
     codes = []
     for m in (evt.get("markets") or []):
         suffix = m.get("ticker", "").split("-")[-1]
         if suffix and suffix != "TIE" and suffix in MLS_TEAMS:
             codes.append(suffix)
-    # de-dupe preserving order (KXMLSTOTAL markets all share the game, no codes)
     seen: set = set()
     codes = [c for c in codes if not (c in seen or seen.add(c))]
     return (codes[0], codes[1]) if len(codes) == 2 else None
+
+
+def _soccer_price_market(mkt: dict, fair: float, mkt_type: str, title: str,
+                         matchup: str, commence_time, pin_line, threshold,
+                         now_utc: datetime) -> Optional[dict]:
+    """Shared YES/NO edge builder for all soccer — identical EV math to
+    scan_sport (fee then haircut), single Pinnacle anchor. The NO side is where
+    double chance lives (NO team = the other team or draw)."""
+    prices = kalshi_prices(mkt)
+    if prices is None:
+        return None
+    yes_bid, yes_ask = prices
+    yes_raw = fair - yes_ask
+    no_raw  = (1 - fair) - (1 - yes_bid)
+    yes_adj = (yes_raw - KALSHI_FEE_RATE * fair       * (1 - yes_ask)) * (1 - EV_HAIRCUT)
+    no_adj  = (no_raw  - KALSHI_FEE_RATE * (1 - fair) * yes_bid)       * (1 - EV_HAIRCUT)
+    best_adj = max(yes_adj, no_adj)
+    if best_adj < EDGE_THRESHOLD or best_adj > MAX_EDGE:
+        return None
+    if yes_adj >= no_adj:
+        side, k_side, f_side, raw_edge, adj = "YES", yes_ask, fair, yes_raw, yes_adj
+    else:
+        side, k_side, f_side, raw_edge, adj = "NO", 1 - yes_bid, 1 - fair, no_raw, no_adj
+    if k_side < MIN_KALSHI_PRICE:
+        return None
+    books_detail = {"pinnacle": round(fair, 4)}
+    cons_yes, cons_no = round(fair, 4), round(1 - fair, 4)
+    return {
+        "ticker": mkt.get("ticker", ""), "title": title, "kalshi_line": threshold,
+        "matchup": matchup, "side": side, "kalshi": round(k_side, 4), "fair": round(f_side, 4),
+        "raw_edge": round(raw_edge, 4), "edge": round(adj, 4), "confidence": 1.0,
+        "mkt_type": mkt_type, "pin_line": pin_line, "fair_source": "exact",
+        "books_used": ["pinnacle"], "books_detail": books_detail,
+        "per_book_novig": _build_per_book_novig(books_detail, side),
+        "consensus_yes": cons_yes, "consensus_no": cons_no,
+        "consensus_yes_american": prob_to_american(cons_yes),
+        "consensus_no_american": prob_to_american(cons_no),
+        "consensus_prob": cons_yes, "is_valid_consensus": True,
+        "consensus_reason": "Pinnacle (sole sharp anchor)",
+        "kalshi_price_ts": now_utc.isoformat(), "commence_time": commence_time,
+    }
+
+
+def _soccer_event_live_or_expired(evt: dict, now_utc: datetime) -> bool:
+    """True if the game has started / the event expired (skip it)."""
+    mkts = evt.get("markets") or []
+    exp_str = (mkts[0].get("expected_expiration_time") or mkts[0].get("close_time")) if mkts else ""
+    game_dt = _parse_ticker_game_time(evt.get("event_ticker", ""))
+    if game_dt is None and exp_str:
+        try:
+            from datetime import timedelta as _tde
+            game_dt = datetime.fromisoformat(exp_str.replace("Z", "+00:00")) - _tde(hours=2.5)
+        except (ValueError, AttributeError):
+            game_dt = None
+    return game_dt is not None and now_utc >= game_dt
+
+
+# Config-driven soccer leagues. `match`: 'map' = hardcoded code→Pinnacle-name
+# map (MLS only — its Kalshi display names are odd abbreviations like
+# "Los Angeles G" that name-matching can't resolve). 'name' = the safe runtime
+# name-matcher (works wherever Kalshi uses full club names — Argentina, Brazil).
+# All launch SHADOW-first (KX* prefixes in SHADOW_MARKETS on the UI side).
+SOCCER_LEAGUES: List[dict] = [
+    {"label": "MLS", "prefix": "mls", "match": "map", "team_map": MLS_TEAMS,
+     "game_series": "KXMLSGAME", "total_series": "KXMLSTOTAL",
+     "odds_key": "soccer_usa_mls", "espn": "usa.1"},
+    {"label": "Argentina Primera", "prefix": "arg", "match": "name",
+     "game_series": "KXARGPREMDIVGAME", "total_series": "KXARGPREMDIVTOTAL",
+     "odds_key": "soccer_argentina_primera_division", "espn": "arg.1"},
+    {"label": "Brazil Serie A", "prefix": "bra", "match": "name",
+     "game_series": "KXBRASILEIROGAME", "total_series": "KXBRASILEIROTOTAL",
+     "odds_key": "soccer_brazil_campeonato", "espn": "bra.1"},
+]
+
+
+def scan_soccer(cfg: dict, games: Optional[List[dict]] = None) -> Tuple[List[dict], str]:
+    """Generalized soccer scanner (moneyline 3-way + total goals) for one league
+    config. Zero-game short-circuit first (free /events), then one paid Pinnacle
+    fetch feeds both markets. Same edge-dict format as scan_sport. Double chance
+    is the NO side of team/tie markets (priced automatically by the 3-way fair)."""
+    label, prefix = cfg["label"], cfg["prefix"]
+    ml_type, tot_type = f"{prefix}_moneyline", f"{prefix}_total"
+    remaining = "?"
+
+    if games is None:
+        if not soccer_has_upcoming_game(cfg["odds_key"]):
+            print(f"  {label}: no game within {SOCCER_LOOKAHEAD_H}h — skip (0 credits)")
+            return [], remaining
+        try:
+            games, remaining = fetch_soccer_odds(cfg["odds_key"])
+        except Exception as exc:
+            print(f"  ERROR — {label} book odds: {exc}")
+            return [], remaining
+
+    print(f"\n{'═'*70}\n  {label} — Moneyline (3-way) & Total Goals  —  "
+          f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n{'═'*70}")
+    print(f"  Pinnacle {label} games: {len(games)}")
+
+    is_map = cfg["match"] == "map"
+    tmap = cfg.get("team_map") or {}
+    index = {frozenset({g["home"], g["away"]}): g for g in games} if is_map else {}
+    now_utc = datetime.now(timezone.utc)
+    edges: List[dict] = []
+
+    def find_game(evt: dict) -> Optional[dict]:
+        if is_map:
+            codes = _mls_teams_from_event(evt)
+            if not codes:
+                m = re.search(cfg["total_series"] + r"-\d{2}[A-Z]{3}\d{2}([A-Z]+)-",
+                              evt.get("event_ticker", "").upper())
+                if not m:
+                    return None
+                seg, found = m.group(1), None
+                for n in (4, 3, 2):
+                    a, h = seg[:n], seg[n:]
+                    if a in tmap and h in tmap:
+                        found = (a, h); break
+                if not found:
+                    return None
+                codes = found
+            hp, ap = tmap.get(codes[0], {}).get("pin"), tmap.get(codes[1], {}).get("pin")
+            return index.get(frozenset({hp, ap})) if hp and ap else None
+        # name strategy — teams from the event title, safe unique match
+        tt = _soccer_title_teams(evt)
+        if not tt:
+            return None
+        return _soccer_safe_match(tt, _soccer_ticker_date(evt.get("event_ticker", "")), games)
+
+    def outcome_fair(mkt: dict, game: dict):
+        """(fair_prob, title) for a moneyline market, or None."""
+        suffix = mkt.get("ticker", "").split("-")[-1]
+        if suffix == "TIE":
+            return (game["draw"], "Draw (match ends level)")
+        if is_map:
+            name = tmap.get(suffix, {}).get("pin")
+            if name and name in game["ml"]:
+                return (game["ml"][name], f"{name} to win")
+            return None
+        disp = mkt.get("yes_sub_title", "")
+        for name in (game["home"], game["away"]):
+            if _soccer_name_match(disp, name):
+                return (game["ml"][name], f"{name} to win")
+        return None
+
+    # ── Moneyline ────────────────────────────────────────────────────────────
+    try:
+        ml_events = fetch_kalshi_events(cfg["game_series"])
+    except Exception as e:
+        print(f"  ERROR — Kalshi {cfg['game_series']}: {e}")
+        ml_events = []
+    for evt in ml_events:
+        if _soccer_event_live_or_expired(evt, now_utc):
+            continue
+        game = find_game(evt)
+        if not game:
+            continue
+        matchup = f"{game['away']} @ {game['home']}"
+        for mkt in (evt.get("markets") or []):
+            of = outcome_fair(mkt, game)
+            if not of or of[0] is None:
+                continue
+            e = _soccer_price_market(mkt, of[0], ml_type, of[1], matchup,
+                                     game.get("commence_time"), None, None, now_utc)
+            if e:
+                edges.append(e)
+
+    # ── Total goals (Poisson off Pinnacle's line) ────────────────────────────
+    try:
+        tot_events = fetch_kalshi_events(cfg["total_series"])
+    except Exception as e:
+        print(f"  ERROR — Kalshi {cfg['total_series']}: {e}")
+        tot_events = []
+    for evt in tot_events:
+        if _soccer_event_live_or_expired(evt, now_utc):
+            continue
+        game = find_game(evt)
+        if not game or not game.get("total"):
+            continue
+        lam = fit_poisson_lambda(game["total"]["line"], game["total"]["over_prob"])
+        if lam is None:
+            continue
+        matchup = f"{game['away']} @ {game['home']}"
+        for mkt in (evt.get("markets") or []):
+            m = re.search(r"([0-9]+\.5)", mkt.get("yes_sub_title", "") or mkt.get("title", ""))
+            if not m:
+                continue
+            line = float(m.group(1))
+            if abs(line - game["total"]["line"]) > MLS_MAX_TOTAL_RUNGS:
+                continue
+            e = _soccer_price_market(mkt, poisson_over_prob(line, lam), tot_type,
+                                     f"Over {line} goals", matchup,
+                                     game.get("commence_time"), game["total"]["line"],
+                                     line, now_utc)
+            if e:
+                edges.append(e)
+
+    # Correlation control — one best moneyline + one best total per game (the 3
+    # ML outcomes are mutually exclusive; adjacent rungs correlate).
+    edges.sort(key=lambda x: x["edge"], reverse=True)
+    best: Dict[Tuple[str, str], dict] = {}
+    for e in edges:
+        key = (e["matchup"], "total" if e["mkt_type"].endswith("_total") else "moneyline")
+        best.setdefault(key, e)
+    edges = sorted(best.values(), key=lambda x: x["edge"], reverse=True)
+    print(f"  {label} edges ≥{EDGE_THRESHOLD:.0%}: {len(edges)}")
+    return edges, remaining
+
+
+def scan_mls(mls_index: Optional[List[dict]] = None) -> Tuple[List[dict], str]:
+    """Back-compat wrapper — MLS is SOCCER_LEAGUES[0]."""
+    return scan_soccer(SOCCER_LEAGUES[0], games=mls_index)
 
 
 def scan_mls(mls_index: Optional[Dict[str, dict]] = None) -> Tuple[List[dict], str]:

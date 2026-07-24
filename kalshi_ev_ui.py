@@ -398,7 +398,10 @@ SHADOW_MARKETS: list[str] = [
     "KXARGPREMDIV",   # Argentina Primera (KXARGPREMDIVGAME/TOTAL) — added
                       # 2026-07-23, safe name-matched. Shadow-first.
     "KXBRASILEIRO",   # Brazil Serie A (KXBRASILEIROGAME/TOTAL) — added
-                      # 2026-07-23, safe name-matched. Shadow-first.
+                      # 2026-07-23, safe name-matched. Shadow-first. NOTE: this
+                      # prefix also covers Brazil Serie B (KXBRASILEIROB*).
+    "KXLIGAMX",       # Liga MX (KXLIGAMXGAME/TOTAL) — added 2026-07-23.
+    "KXCONMEBOLSUD",  # Copa Sudamericana (KXCONMEBOLSUDGAME/TOTAL) — 2026-07-23.
 ]
 
 def _is_shadow(ticker: str) -> bool:
@@ -2102,14 +2105,25 @@ def _fetch_wnba_quarter(bet: dict) -> Optional[str]:
 # — the same safe name approach the scanner uses. The ESPN league key is chosen
 # from the ticker prefix. ESPN's scoreboard carries team logo URLs directly, so
 # one match yields score, clock, AND logos for every league uniformly.
-_SOCCER_ESPN_LEAGUE = {"KXMLS": "usa.1", "KXARGPREMDIV": "arg.1", "KXBRASILEIRO": "bra.1"}
+_SOCCER_ESPN_LEAGUE = {
+    "KXMLS": "usa.1", "KXARGPREMDIV": "arg.1",
+    "KXBRASILEIROB": "bra.2", "KXBRASILEIRO": "bra.1",   # longest-first (see below)
+    "KXLIGAMX": "mex.1", "KXCONMEBOLSUD": "conmebol.sudamericana",
+}
+# Match longest prefix first so KXBRASILEIROB* (Serie B) resolves to bra.2 before
+# the shorter KXBRASILEIRO (Serie A → bra.1) prefix can shadow it.
+_SOCCER_ESPN_PREFIXES = sorted(_SOCCER_ESPN_LEAGUE, key=len, reverse=True)
+# mkt_type prefix → display league name (mkt_type is "<prefix>_moneyline/_total").
+_SOCCER_LEAGUE_NAMES = {"mls": "MLS", "arg": "Argentina", "bra": "Brazil",
+                        "lmx": "Liga MX", "brb": "Brazil B", "sud": "Sudamericana"}
 _soccer_sb_cache: dict = {}   # (espn_league, "YYYYMMDD") → (ts, events) 60s TTL
 
 
 def _soccer_espn_league_for_ticker(ticker: str) -> Optional[str]:
-    for pfx, lg in _SOCCER_ESPN_LEAGUE.items():
-        if ticker.upper().startswith(pfx):
-            return lg
+    tu = ticker.upper()
+    for pfx in _SOCCER_ESPN_PREFIXES:
+        if tu.startswith(pfx):
+            return _SOCCER_ESPN_LEAGUE[pfx]
     return None
 
 
@@ -2211,7 +2225,7 @@ def _lookup_soccer_state(bet: dict):
 def _is_soccer_bet(b: dict) -> bool:
     """True for any MLS/Argentina/Brazil moneyline or total bet."""
     mt = b.get("mkt_type", "")
-    if mt.split("_")[0] in ("mls", "arg", "bra") and (mt.endswith("_moneyline") or mt.endswith("_total")):
+    if mt.split("_")[0] in _SOCCER_LEAGUE_NAMES and (mt.endswith("_moneyline") or mt.endswith("_total")):
         return True
     return _soccer_espn_league_for_ticker(b.get("ticker", "")) is not None
 
@@ -2973,19 +2987,20 @@ def _get_performance(since: Optional[str] = None) -> dict:
             return "NBA Props"
         if mtype == "wnba_prop":
             return "WNBA Props"
-        # Soccer leagues (MLS / Argentina / Brazil): mkt_type is <prefix>_moneyline
-        # or <prefix>_total; ticker prefixes map to a display league name.
-        _SOCCER_TICKER = {"KXMLSGAME": "MLS", "KXMLSTOTAL": "MLS",
-                          "KXARGPREMDIVGAME": "Argentina", "KXARGPREMDIVTOTAL": "Argentina",
-                          "KXBRASILEIROGAME": "Brazil", "KXBRASILEIROTOTAL": "Brazil"}
-        _SOCCER_PREFIX = {"mls": "MLS", "arg": "Argentina", "bra": "Brazil"}
-        if mtype.endswith("_moneyline") and mtype.split("_")[0] in _SOCCER_PREFIX:
-            return f"{_SOCCER_PREFIX[mtype.split('_')[0]]} Moneyline"
-        if mtype.endswith("_total") and mtype.split("_")[0] in _SOCCER_PREFIX:
-            return f"{_SOCCER_PREFIX[mtype.split('_')[0]]} Total"
-        for _pfx, _lg in _SOCCER_TICKER.items():
-            if ticker.startswith(_pfx):
-                return f"{_lg} {'Total' if 'TOTAL' in _pfx else 'Moneyline'}"
+        # Soccer leagues: mkt_type is "<prefix>_moneyline"/"<prefix>_total"
+        # (prefix in _SOCCER_LEAGUE_NAMES). Fall back to the ticker's ESPN-league
+        # prefix (longest-first) + GAME/TOTAL for bets without a stored mkt_type.
+        _pfx = mtype.split("_")[0]
+        if _pfx in _SOCCER_LEAGUE_NAMES and mtype.endswith("_moneyline"):
+            return f"{_SOCCER_LEAGUE_NAMES[_pfx]} Moneyline"
+        if _pfx in _SOCCER_LEAGUE_NAMES and mtype.endswith("_total"):
+            return f"{_SOCCER_LEAGUE_NAMES[_pfx]} Total"
+        for _tk_pfx in _SOCCER_ESPN_PREFIXES:
+            if ticker.startswith(_tk_pfx):
+                _lg = {"usa.1": "MLS", "arg.1": "Argentina", "bra.1": "Brazil",
+                       "bra.2": "Brazil B", "mex.1": "Liga MX",
+                       "conmebol.sudamericana": "Sudamericana"}[_SOCCER_ESPN_LEAGUE[_tk_pfx]]
+                return f"{_lg} {'Total' if 'TOTAL' in ticker else 'Moneyline'}"
         if mtype == "prop":
             for prefix, label in _PROP_SERIES_LABELS.items():
                 if ticker.startswith(prefix):
@@ -6442,7 +6457,7 @@ function renderPerformance(d) {
 
   // By-type breakdown table
   const PROP_LABELS = new Set(['Strikeouts (K)', 'Hits', 'Total Bases', 'RBIs', 'MLB Props', 'NBA Props', 'WNBA Props']);
-  const TYPE_ORDER  = ['MLB Total', 'MLB Spread', 'Strikeouts (K)', 'Hits', 'Total Bases', 'RBIs', 'MLB Props', 'NBA Props', 'WNBA Total', 'WNBA Spread', 'WNBA Props', 'MLS Moneyline', 'MLS Total', 'Argentina Moneyline', 'Argentina Total', 'Brazil Moneyline', 'Brazil Total'];
+  const TYPE_ORDER  = ['MLB Total', 'MLB Spread', 'Strikeouts (K)', 'Hits', 'Total Bases', 'RBIs', 'MLB Props', 'NBA Props', 'WNBA Total', 'WNBA Spread', 'WNBA Props', 'MLS Moneyline', 'MLS Total', 'Argentina Moneyline', 'Argentina Total', 'Brazil Moneyline', 'Brazil Total', 'Liga MX Moneyline', 'Liga MX Total', 'Brazil B Moneyline', 'Brazil B Total', 'Sudamericana Moneyline', 'Sudamericana Total'];
   // Markets no longer scanned — settled record frozen & still shown, but tagged
   // so it's clear no new bets are being placed. Total Bases terminated 2026-07-23.
   const TERMINATED_LABELS = new Set(['Total Bases']);

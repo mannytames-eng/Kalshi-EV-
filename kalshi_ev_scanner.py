@@ -3670,6 +3670,15 @@ SOCCER_LEAGUES: List[dict] = [
     {"label": "Brazil Serie A", "prefix": "bra", "match": "name",
      "game_series": "KXBRASILEIROGAME", "total_series": "KXBRASILEIROTOTAL",
      "odds_key": "soccer_brazil_campeonato", "espn": "bra.1"},
+    {"label": "Liga MX", "prefix": "lmx", "match": "name",
+     "game_series": "KXLIGAMXGAME", "total_series": "KXLIGAMXTOTAL",
+     "odds_key": "soccer_mexico_ligamx", "espn": "mex.1"},
+    {"label": "Brazil Serie B", "prefix": "brb", "match": "name",
+     "game_series": "KXBRASILEIROBGAME", "total_series": "KXBRASILEIROBTOTAL",
+     "odds_key": "soccer_brazil_serie_b", "espn": "bra.2"},
+    {"label": "Copa Sudamericana", "prefix": "sud", "match": "name",
+     "game_series": "KXCONMEBOLSUDGAME", "total_series": "KXCONMEBOLSUDTOTAL",
+     "odds_key": "soccer_conmebol_copa_sudamericana", "espn": "conmebol.sudamericana"},
 ]
 
 

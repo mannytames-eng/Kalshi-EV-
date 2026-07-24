@@ -4069,6 +4069,10 @@ def scan_soccer(cfg: dict, games: Optional[List[dict]] = None) -> Tuple[List[dic
                 e = _soccer_price_market(mkt, btts_yes, btts_type, "Both teams to score",
                                          matchup, game.get("commence_time"), None, None, now_utc)
                 if e:
+                    # Persist the per-team rates so an in-play BTTS can be
+                    # re-priced later (P(team scores again) needs λ_H/λ_A, which
+                    # can't be recovered from the single stored BTTS fair).
+                    e["lambda_home"], e["lambda_away"] = round(fit[0], 4), round(fit[1], 4)
                     edges.append(e)
 
     # Correlation control — one best edge per (game, market group). The 3 ML

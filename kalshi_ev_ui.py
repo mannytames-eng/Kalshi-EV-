@@ -2284,6 +2284,40 @@ def _soccer_total_live_status(bet: dict, ev: dict) -> Optional[dict]:
             "live_edge_pct": round((side_fair - kalshi) * 100, 1)}
 
 
+def _soccer_btts_live_status(bet: dict, ev: dict) -> Optional[dict]:
+    """BTTS counterpart of _soccer_total_live_status. BTTS is DECIDED the moment
+    both teams have scored (YES certain) — showing a pregame NO edge on a 1-1
+    game is the same impossible-fair bug as a decided total. While undecided,
+    re-price off the per-team rates scaled by time left: a team that hasn't
+    scored needs P(≥1 goal in the remaining minutes)."""
+    if not bet.get("mkt_type", "").endswith("_btts") or ev is None:
+        return None
+    hs, as_ = ev.get("home_score"), ev.get("away_score")
+    if ev.get("state") == "pre" or hs is None or as_ is None:
+        return None
+    try:
+        hs, as_ = int(hs), int(as_)
+    except (TypeError, ValueError):
+        return None
+    if hs >= 1 and as_ >= 1:
+        return {"resolved": True, "over_won": True}      # both scored — YES certain
+    minutes, is_final = _soccer_clock_minutes(ev)
+    if is_final:
+        return {"resolved": True, "over_won": False}     # FT without both scoring
+    lh, la = bet.get("lambda_home"), bet.get("lambda_away")
+    kalshi = bet.get("kalshi")
+    if lh is None or la is None or kalshi is None:
+        return None      # legacy bet flagged before λ was stored — can't re-price
+    import math as _math
+    frac = max(0.0, min(1.0, (90.0 - minutes) / 90.0))
+    p_h = 1.0 if hs >= 1 else (1.0 - _math.exp(-lh * frac))
+    p_a = 1.0 if as_ >= 1 else (1.0 - _math.exp(-la * frac))
+    p_yes = p_h * p_a
+    side_fair = p_yes if bet.get("side", "YES") == "YES" else 1.0 - p_yes
+    return {"resolved": False, "live_fair": round(side_fair, 4),
+            "live_edge_pct": round((side_fair - kalshi) * 100, 1)}
+
+
 def _is_soccer_bet(b: dict) -> bool:
     """True for any MLS/Argentina/Brazil moneyline or total bet."""
     mt = b.get("mkt_type", "")
@@ -2337,9 +2371,10 @@ def _live_stats_loop():
                     if st:
                         entry = {"stat": st[0], "inning": st[1],
                                  "home_logo": st[2], "away_logo": st[3]}
-                    ts = _soccer_total_live_status(b, ev)
-                    if ts:
-                        entry["total_status"] = ts
+                    ms = (_soccer_total_live_status(b, ev)
+                          or _soccer_btts_live_status(b, ev))
+                    if ms:
+                        entry["market_status"] = ms
                     # A finished match decides EVERY market on it (moneyline,
                     # totals, BTTS) — flag it so the feed drops the row instead
                     # of showing a pregame edge on a completed game.
@@ -7277,7 +7312,7 @@ class Handler(BaseHTTPRequestHandler):
                 # entirely (never show a fake edge on a settled market). For a
                 # still-live total, override the stale pregame edge/fair with the
                 # time-adjusted live values so the number shown is honest.
-                ts = cache.get("total_status")
+                ts = cache.get("market_status")
                 if cache.get("game_final") or (ts and ts.get("resolved")):
                     continue
                 row = {**b,

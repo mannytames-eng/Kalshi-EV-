@@ -1365,6 +1365,34 @@ if _drop_ids:
           f"{_drop_price} under 30¢, {_drop_dupe} duplicate-on-same-match, "
           f"{_drop_early} flagged before the 12h scan window")
 
+# --- One-time purge: the pre-fix soccer cohort (user call, 2026-07-24) --------
+# Every soccer position flagged before this cutoff was produced by logic we have
+# since fixed — flagged IN-PLAY off a stale pregame line, some sub-30¢, some
+# days ahead of the scan window. They'd otherwise settle into the track record
+# as artifacts and pollute the shadow calibration soccer is being run to build.
+# NOT an outcome-tuning removal (see feedback-no-outcome-tuning): none had
+# settled, all were $0 shadow with zero P&L, and it drops the entire cohort
+# rather than selecting on result — so the immutable settled record is untouched
+# (freeze-settled-bets holds). Bounded by a fixed cutoff, so soccer flagged
+# after the fix is kept and this never fires again.
+_SOCCER_PURGE_BEFORE = "2026-07-24T02:00:00+00:00"
+_purge_soccer = [
+    _b for _b in _bets
+    if (_b.get("mkt_type", "").split("_")[0] in _SOCCER_PREFIXES_CLEAN
+        or _b.get("ticker", "").upper().startswith(
+            ("KXMLS", "KXARGPREMDIV", "KXBRASILEIRO", "KXLIGAMX", "KXCONMEBOLSUD")))
+    and _b.get("flagged_at", "") < _SOCCER_PURGE_BEFORE
+]
+if _purge_soccer:
+    _purge_ids = {_b["id"] for _b in _purge_soccer}
+    _settled_hit = [_b for _b in _purge_soccer if _b.get("status") in ("won", "lost", "void")]
+    _staked_hit  = [_b for _b in _purge_soccer if (_b.get("paper_stake") or 0) > 0]
+    _bets[:] = [_b for _b in _bets if _b["id"] not in _purge_ids]
+    _data_fixed = True
+    print(f"  Soccer purge: removed {len(_purge_ids)} pre-fix soccer bet(s) "
+          f"(settled={len(_settled_hit)}, real-staked={len(_staked_hit)} — both "
+          f"expected 0; all were $0 shadow flagged by the since-fixed in-play path)")
+
 if _data_fixed:
     _save_bets(_bets)
     print("  Applied one-time data corrections (CLV/pin_entry upgrades)")

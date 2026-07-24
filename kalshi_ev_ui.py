@@ -1310,6 +1310,48 @@ if _gtnone_clv_fixed:
     print(f"  Neutralized CLV on {_gtnone_clv_fixed} WNBA/NBA prop bet(s) with no "
           f"game-start anchor (game_time=None) — untrustworthy in-game close")
 
+def _soccer_game_key(ticker: str) -> Optional[str]:
+    """The date+teams segment shared by every market on one soccer match —
+    KXARGPREMDIVTOTAL-26JUL23DYJCAA-2, KXARGPREMDIVBTTS-26JUL23DYJCAA and
+    KXARGPREMDIVGAME-26JUL23DYJCAA-BOC all key to '26JUL23DYJCAA'. Used to
+    enforce ONE open position per match across every market type."""
+    parts = (ticker or "").split("-")
+    return parts[1] if len(parts) > 1 else None
+
+
+# --- Cleanup: drop OPEN soccer positions that violate the current rules ------
+# Runs every load and is self-idempotent (once clean it removes nothing).
+#   (a) entry price < 30¢ — SOCCER_MIN_KALSHI_PRICE now rejects these at flag
+#       time, but positions taken before that shipped are still open. Sub-30¢
+#       longshot rungs are where thin books manufacture inflated % edges.
+#   (b) more than one open position on the SAME match — one match, one position
+#       (best edge survives). Across market types and across scan cycles.
+# OPEN soccer only: every soccer bet is shadow ($0), so nothing here touches
+# real P&L, and SETTLED bets are never modified (freeze-settled-bets).
+_SOCCER_PREFIXES_CLEAN = ("mls", "arg", "bra", "lmx", "brb", "sud")
+_open_soccer_clean = [
+    _b for _b in _bets
+    if _b.get("status") == "open"
+    and (_b.get("mkt_type", "").split("_")[0] in _SOCCER_PREFIXES_CLEAN)
+]
+_drop_ids, _drop_price, _drop_dupe = set(), 0, 0
+for _b in _open_soccer_clean:
+    if (_b.get("kalshi") or 0) < 0.30:
+        _drop_ids.add(_b["id"]); _drop_price += 1
+_seen_match: dict = {}
+for _b in sorted([x for x in _open_soccer_clean if x["id"] not in _drop_ids],
+                 key=lambda x: -(x.get("edge_pct") or 0)):
+    _gk = _soccer_game_key(_b.get("ticker", "")) or _b["id"]
+    if _gk in _seen_match:
+        _drop_ids.add(_b["id"]); _drop_dupe += 1
+    else:
+        _seen_match[_gk] = _b["id"]
+if _drop_ids:
+    _bets[:] = [_b for _b in _bets if _b["id"] not in _drop_ids]
+    _data_fixed = True
+    print(f"  Soccer cleanup: dropped {len(_drop_ids)} open position(s) — "
+          f"{_drop_price} under 30¢, {_drop_dupe} duplicate-on-same-match")
+
 if _data_fixed:
     _save_bets(_bets)
     print("  Applied one-time data corrections (CLV/pin_entry upgrades)")
@@ -1501,6 +1543,18 @@ def _add_new_bets(edges: list) -> list:
         # bets in this cycle add to it so the daily cap holds within one scan too.
         _committed_today = _todays_committed_exposure()
         _daily_cap_dollars = DAILY_EXPOSURE_CAP * PAPER_START_BALANCE
+        # ONE open position per soccer MATCH, across every market type and across
+        # scan cycles. The scanner's per-cycle collapse only dedupes within a
+        # single scan, so without this a match could accumulate several positions
+        # over successive cycles (e.g. Over 1.5 at 00:59 then Over 3.5 at 01:12,
+        # or a total plus a BTTS). Edges arrive best-first, so the survivor is the
+        # strongest one for that match.
+        _open_soccer_games = {
+            _soccer_game_key(b.get("ticker", ""))
+            for b in _bets
+            if b.get("status") == "open" and _is_soccer_bet(b)
+        }
+        _open_soccer_games.discard(None)
         # Per-bucket calibration multipliers (0.5x for markets running
         # overconfident, e.g. TB) — computed once, applied to each new stake.
         _stake_mults = _get_clv_multipliers()
@@ -1514,6 +1568,13 @@ def _add_new_bets(edges: list) -> list:
                 continue   # exact same market already logged
             if bid in _bad_match_ids:
                 continue   # permanently suppressed ghost/bad-match edge — never re-flag
+            # One open position per soccer match (see _open_soccer_games above)
+            if _is_soccer_bet(e):
+                _gk = _soccer_game_key(e.get("ticker", ""))
+                if _gk and _gk in _open_soccer_games:
+                    continue
+                if _gk:
+                    _open_soccer_games.add(_gk)
 
             # ── Prop-specific edge floor ──────────────────────────────────────
             # MLB props (KS, HIT, TB, RBI) are less liquid than game lines —

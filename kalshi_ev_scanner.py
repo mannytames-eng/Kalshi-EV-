@@ -3669,7 +3669,46 @@ SOCCER_LOOKAHEAD_H = 12   # outer bound for the FREE /events short-circuit — n
 # (game_id, checkpoint) -> cycle_id of the scan that fired it. A checkpoint may
 # only fire ONCE per game; entries from the same cycle are allowed through so
 # every market loop (moneyline/totals/BTTS) sees the game within that one scan.
-_soccer_fired: Dict[Tuple[str, int], str] = {}
+#
+# PERSISTED to disk so a restart can't re-fire a checkpoint that already ran —
+# without this, redeploying while a game sat in a band cost an extra scan. Uses
+# the same volume as the rest of the state (/data on Railway, script dir local).
+_SOCCER_STATE_DIR = ("/data" if (os.path.isdir("/data") and os.environ.get("RAILWAY_ENVIRONMENT"))
+                     else os.path.dirname(os.path.abspath(__file__)))
+SOCCER_FIRED_FILE = os.path.join(_SOCCER_STATE_DIR, "ev_soccer_fired.json")
+
+
+def _load_soccer_fired() -> Dict[Tuple[str, int], str]:
+    """Restore fired checkpoints. Stored as [game_id, checkpoint, cycle_id]
+    triples because JSON can't key on tuples. A restored cycle_id can never
+    equal the current cycle's, which is exactly the behaviour we want: a
+    checkpoint fired before the restart stays fired."""
+    try:
+        import json as _json
+        with open(SOCCER_FIRED_FILE, "r") as f:
+            rows = _json.load(f)
+        return {(str(g), int(c)): str(cy) for g, c, cy in rows}
+    except FileNotFoundError:
+        return {}
+    except Exception as exc:
+        print(f"  WARNING: could not load soccer checkpoint state: {exc}")
+        return {}
+
+
+def _save_soccer_fired() -> None:
+    """Atomic write (temp file + rename) so a crash mid-save can't corrupt it."""
+    try:
+        import json as _json, tempfile as _tempfile
+        rows = [[g, c, cy] for (g, c), cy in _soccer_fired.items()]
+        fd, tmp = _tempfile.mkstemp(dir=_SOCCER_STATE_DIR, suffix=".tmp")
+        with os.fdopen(fd, "w") as f:
+            _json.dump(rows, f)
+        os.replace(tmp, SOCCER_FIRED_FILE)
+    except Exception as exc:
+        print(f"  WARNING: could not save soccer checkpoint state: {exc}")
+
+
+_soccer_fired: Dict[Tuple[str, int], str] = _load_soccer_fired()
 
 
 def _soccer_game_id(home: str, away: str, commence_time) -> str:
@@ -3973,6 +4012,7 @@ def scan_soccer(cfg: dict, games: Optional[List[dict]] = None) -> Tuple[List[dic
     # to every market loop below, while one fired by an earlier cycle blocks.
     cycle_id = f"{label}-{datetime.now(timezone.utc).timestamp()}"
     _prune_soccer_fired()
+    _fired_before = dict(_soccer_fired)   # persist only if this cycle changes it
 
     if games is None:
         if not soccer_has_upcoming_game(cfg["odds_key"], cycle_id):
@@ -4159,6 +4199,8 @@ def scan_soccer(cfg: dict, games: Optional[List[dict]] = None) -> Tuple[List[dic
               "btts" if e["mkt_type"].endswith("_btts") else "moneyline")
         best.setdefault((e["matchup"], grp), e)
     edges = sorted(best.values(), key=lambda x: x["edge"], reverse=True)
+    if _soccer_fired != _fired_before:
+        _save_soccer_fired()   # checkpoint(s) fired this cycle — survive restarts
     print(f"  {label} edges ≥{EDGE_THRESHOLD:.0%}: {len(edges)}")
     return edges, remaining
 

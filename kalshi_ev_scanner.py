@@ -3711,6 +3711,48 @@ def _save_soccer_fired() -> None:
 _soccer_fired: Dict[Tuple[str, int], str] = _load_soccer_fired()
 
 
+# ── Path-B instrumentation: per-checkpoint Pinnacle-fair vs Kalshi-book log ────
+# Append-only JSONL time series. At every checkpoint scan we record, for each
+# priced soccer market, the sharp de-vigged fair AND the Kalshi bid/ask. This is
+# the raw data to answer the open question: when Pinnacle's line moves around the
+# lineup (the 70/55/40 cluster), does Kalshi LAG it — and would entering that lag
+# have been +EV at settlement? Purely observational; it never affects a bet.
+# JSONL (one line per observation) is chosen over the MLB dict-history: it's
+# append-only (no read-modify-write of the whole file), naturally a time series,
+# and trivial to analyze. Joins to settlement via `ticker`.
+SOCCER_LINES_FILE = os.path.join(_SOCCER_STATE_DIR, "ev_soccer_lines.jsonl")
+_SOCCER_LINES_MAX_BYTES = 200 * 1024 * 1024   # ~200MB hard cap; stop appending
+                                              # rather than grow unbounded (Phase 1
+                                              # is a few weeks of collection).
+
+
+def _log_soccer_line(fair: float, yes_bid: float, yes_ask: float, commence_time,
+                     mkt_type: str, ticker: str, title: str, now: datetime) -> None:
+    """Append one (Pinnacle fair, Kalshi book) observation. Best-effort — any
+    failure is swallowed so instrumentation can never break a scan."""
+    try:
+        import json as _json
+        if os.path.exists(SOCCER_LINES_FILE) and os.path.getsize(SOCCER_LINES_FILE) > _SOCCER_LINES_MAX_BYTES:
+            return
+        ttk = minutes_to_kickoff(commence_time, now)
+        rec = {
+            "ts":     now.isoformat(),
+            "ttk":    round(ttk, 1) if ttk is not None else None,
+            "cp":     soccer_due_checkpoint(commence_time, now),
+            "ct":     commence_time,
+            "mkt":    mkt_type,
+            "ticker": ticker,
+            "title":  title,
+            "fair":   round(fair, 4),      # sharp de-vigged YES-side probability
+            "kbid":   round(yes_bid, 4),   # Kalshi YES bid / ask → mid + spread
+            "kask":   round(yes_ask, 4),
+        }
+        with open(SOCCER_LINES_FILE, "a") as f:   # single-line append: atomic on POSIX
+            f.write(_json.dumps(rec) + "\n")
+    except Exception:
+        pass
+
+
 def _soccer_game_id(home: str, away: str, commence_time) -> str:
     """Stable per-match key. commence_time leads so stale entries can be pruned
     by parsing it back out. Built from the Odds-API game identity, which is the
@@ -3928,6 +3970,11 @@ def _soccer_price_market(mkt: dict, fair: float, mkt_type: str, title: str,
     if prices is None:
         return None
     yes_bid, yes_ask = prices
+    # Path-B instrumentation: record the sharp fair vs the Kalshi book for EVERY
+    # priced market at this checkpoint — before any floor/threshold filter, so
+    # the time series is complete (movement analysis needs the losers too).
+    _log_soccer_line(fair, yes_bid, yes_ask, commence_time, mkt_type,
+                     mkt.get("ticker", ""), title, now_utc)
     yes_raw = fair - yes_ask
     no_raw  = (1 - fair) - (1 - yes_bid)
     yes_adj = (yes_raw - KALSHI_FEE_RATE * fair       * (1 - yes_ask)) * (1 - EV_HAIRCUT)
@@ -4239,13 +4286,65 @@ def run_once() -> int:
     return total
 
 
+def analyze_soccer_lines(path: str = None) -> None:
+    """Phase-B read-out over the logged (Pinnacle-fair, Kalshi-book) series.
+    For each market, walk its checkpoint observations in order and measure, per
+    step, how far Pinnacle's fair MOVED and whether Kalshi's mid FOLLOWED. The
+    signal we're hunting: steps where |ΔPinnacle| is large but |ΔKalshi-mid| is
+    small (Kalshi lagging a sharp move) — and whether the resulting fair-vs-Kalshi
+    gap is big enough to bet. Purely descriptive; run whenever data accrues."""
+    import json as _json
+    from collections import defaultdict
+    path = path or SOCCER_LINES_FILE
+    try:
+        rows = [_json.loads(l) for l in open(path) if l.strip()]
+    except FileNotFoundError:
+        print(f"  no log yet at {path}"); return
+    by_mkt = defaultdict(list)
+    for r in rows:
+        by_mkt[(r["ticker"])].append(r)
+    n_steps = lag_events = 0
+    pin_moves = []; kalshi_follow = []; lag_gaps = []
+    for tk, obs in by_mkt.items():
+        obs.sort(key=lambda x: x["ts"])
+        for a, b in zip(obs, obs[1:]):
+            dpin = b["fair"] - a["fair"]
+            amid = (a["kbid"] + a["kask"]) / 2; bmid = (b["kbid"] + b["kask"]) / 2
+            dk = bmid - amid
+            n_steps += 1; pin_moves.append(abs(dpin)); kalshi_follow.append(abs(dk))
+            if abs(dpin) >= 0.03:   # Pinnacle moved ≥3pp between checkpoints
+                lag = abs(dpin) - abs(dk)          # unfollowed portion
+                gap = abs(b["fair"] - bmid)        # resulting fair-vs-Kalshi gap
+                if lag >= 0.02:
+                    lag_events += 1; lag_gaps.append(gap)
+    print(f"\n  Soccer line-lag read-out — {len(rows)} obs across {len(by_mkt)} markets, {n_steps} checkpoint steps")
+    if n_steps:
+        import statistics as _st
+        print(f"    mean |ΔPinnacle| per step : {_st.mean(pin_moves)*100:.2f}pp")
+        print(f"    mean |ΔKalshi mid| per step: {_st.mean(kalshi_follow)*100:.2f}pp")
+        print(f"    sharp moves (≥3pp) where Kalshi lagged ≥2pp: {lag_events}")
+        if lag_gaps:
+            print(f"    → resulting fair-vs-Kalshi gap on those: mean {_st.mean(lag_gaps)*100:.1f}pp, "
+                  f"max {max(lag_gaps)*100:.1f}pp   (this is the exploitable signal)")
+        else:
+            print(f"    → no lag events yet — either no sharp moves logged, or Kalshi tracks in step")
+
+
 def main():
     parser = argparse.ArgumentParser(description="Kalshi EV scanner — MLB & NBA")
     parser.add_argument(
         "--loop", type=int, default=0, metavar="SECONDS",
         help="Re-run every N seconds (0 = run once)",
     )
+    parser.add_argument(
+        "--analyze-soccer-lines", action="store_true",
+        help="Print the Path-B Pinnacle-vs-Kalshi line-lag read-out and exit",
+    )
     args = parser.parse_args()
+
+    if args.analyze_soccer_lines:
+        analyze_soccer_lines()
+        return
 
     print("╔══════════════════════════════════════════════════════════════════╗")
     print("║          Kalshi EV Scanner  —  MLB & NBA  (v2)                  ║")

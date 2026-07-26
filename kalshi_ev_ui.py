@@ -408,6 +408,7 @@ SHADOW_MARKETS: list[str] = [
                       # prefix also covers Brazil Serie B (KXBRASILEIROB*).
     "KXLIGAMX",       # Liga MX (KXLIGAMXGAME/TOTAL) — added 2026-07-23.
     "KXCONMEBOLSUD",  # Copa Sudamericana (KXCONMEBOLSUDGAME/TOTAL) — 2026-07-23.
+    "KXCHLLDP",       # Chile Primera (KXCHLLDPGAME/TOTAL) — added 2026-07-26.
 ]
 
 def _is_shadow(ticker: str) -> bool:
@@ -1331,7 +1332,7 @@ def _soccer_game_key(ticker: str) -> Optional[str]:
 #       (best edge survives). Across market types and across scan cycles.
 # OPEN soccer only: every soccer bet is shadow ($0), so nothing here touches
 # real P&L, and SETTLED bets are never modified (freeze-settled-bets).
-_SOCCER_PREFIXES_CLEAN = ("mls", "arg", "bra", "lmx", "brb", "sud")
+_SOCCER_PREFIXES_CLEAN = ("mls", "arg", "bra", "lmx", "brb", "sud", "chl")
 _open_soccer_clean = [
     _b for _b in _bets
     if _b.get("status") == "open"
@@ -2214,13 +2215,14 @@ _SOCCER_ESPN_LEAGUE = {
     "KXMLS": "usa.1", "KXARGPREMDIV": "arg.1",
     "KXBRASILEIROB": "bra.2", "KXBRASILEIRO": "bra.1",   # longest-first (see below)
     "KXLIGAMX": "mex.1", "KXCONMEBOLSUD": "conmebol.sudamericana",
+    "KXCHLLDP": "chi.1",
 }
 # Match longest prefix first so KXBRASILEIROB* (Serie B) resolves to bra.2 before
 # the shorter KXBRASILEIRO (Serie A → bra.1) prefix can shadow it.
 _SOCCER_ESPN_PREFIXES = sorted(_SOCCER_ESPN_LEAGUE, key=len, reverse=True)
 # mkt_type prefix → display league name (mkt_type is "<prefix>_moneyline/_total").
 _SOCCER_LEAGUE_NAMES = {"mls": "MLS", "arg": "Argentina", "bra": "Brazil",
-                        "lmx": "Liga MX", "brb": "Brazil B", "sud": "Sudamericana"}
+                        "lmx": "Liga MX", "brb": "Brazil B", "sud": "Sudamericana", "chl": "Chile"}
 _soccer_sb_cache: dict = {}   # (espn_league, "YYYYMMDD") → (ts, events) 60s TTL
 
 
@@ -3215,7 +3217,7 @@ def _get_performance(since: Optional[str] = None) -> dict:
             if ticker.startswith(_tk_pfx):
                 _lg = {"usa.1": "MLS", "arg.1": "Argentina", "bra.1": "Brazil",
                        "bra.2": "Brazil B", "mex.1": "Liga MX",
-                       "conmebol.sudamericana": "Sudamericana"}[_SOCCER_ESPN_LEAGUE[_tk_pfx]]
+                       "conmebol.sudamericana": "Sudamericana", "chi.1": "Chile"}[_SOCCER_ESPN_LEAGUE[_tk_pfx]]
                 _mk = "BTTS" if "BTTS" in ticker else ("Total" if "TOTAL" in ticker else "Moneyline")
                 return f"{_lg} {_mk}"
         if mtype == "prop":
@@ -6674,7 +6676,7 @@ function renderPerformance(d) {
 
   // By-type breakdown table
   const PROP_LABELS = new Set(['Strikeouts (K)', 'Hits', 'Total Bases', 'RBIs', 'MLB Props', 'NBA Props', 'WNBA Props']);
-  const TYPE_ORDER  = ['MLB Total', 'MLB Spread', 'Strikeouts (K)', 'Hits', 'Total Bases', 'RBIs', 'MLB Props', 'NBA Props', 'WNBA Total', 'WNBA Spread', 'WNBA Props', 'MLS Moneyline', 'MLS Total', 'MLS BTTS', 'Argentina Moneyline', 'Argentina Total', 'Argentina BTTS', 'Brazil Moneyline', 'Brazil Total', 'Brazil BTTS', 'Liga MX Moneyline', 'Liga MX Total', 'Liga MX BTTS', 'Brazil B Moneyline', 'Brazil B Total', 'Brazil B BTTS', 'Sudamericana Moneyline', 'Sudamericana Total', 'Sudamericana BTTS'];
+  const TYPE_ORDER  = ['MLB Total', 'MLB Spread', 'Strikeouts (K)', 'Hits', 'Total Bases', 'RBIs', 'MLB Props', 'NBA Props', 'WNBA Total', 'WNBA Spread', 'WNBA Props', 'MLS Moneyline', 'MLS Total', 'MLS BTTS', 'Argentina Moneyline', 'Argentina Total', 'Argentina BTTS', 'Brazil Moneyline', 'Brazil Total', 'Brazil BTTS', 'Liga MX Moneyline', 'Liga MX Total', 'Liga MX BTTS', 'Brazil B Moneyline', 'Brazil B Total', 'Brazil B BTTS', 'Sudamericana Moneyline', 'Sudamericana Total', 'Sudamericana BTTS', 'Chile Moneyline', 'Chile Total', 'Chile BTTS'];
   // Markets no longer scanned — settled record frozen & still shown, but tagged
   // so it's clear no new bets are being placed. Total Bases terminated 2026-07-23.
   const TERMINATED_LABELS = new Set(['Total Bases']);

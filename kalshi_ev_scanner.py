@@ -3997,6 +3997,9 @@ SOCCER_LEAGUES: List[dict] = [
     {"label": "Copa Sudamericana", "prefix": "sud", "match": "name",
      "game_series": "KXCONMEBOLSUDGAME", "total_series": "KXCONMEBOLSUDTOTAL", "btts_series": "KXCONMEBOLSUDBTTS",
      "odds_key": "soccer_conmebol_copa_sudamericana", "espn": "conmebol.sudamericana"},
+    {"label": "Chile Primera", "prefix": "chl", "match": "name",
+     "game_series": "KXCHLLDPGAME", "total_series": "KXCHLLDPTOTAL", "btts_series": "KXCHLLDPBTTS",
+     "odds_key": "soccer_chile_campeonato", "espn": "chi.1"},
 ]
 
 

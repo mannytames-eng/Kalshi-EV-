@@ -345,6 +345,22 @@ PAPER_START_BALANCE  = 1000.0    # starting virtual bankroll
 PAPER_START_DATE     = "2026-06-08"  # V2.0 reset — pre-throttle + Jun 7 bad-pipeline bets archived
 PAPER_KELLY_FRACTION = 0.25     # quarter-Kelly base fraction
 PAPER_KELLY_CAP      = 0.03     # max 3% of current balance per bet (validation-phase cap)
+# Per-market Kelly override. MLB totals staked at FULL Kelly (user call
+# 2026-07-26). The 3% cap would otherwise bind and make "full Kelly" meaningless
+# (full Kelly on a few-% edge is 5-12%), so MLB totals also get a looser cap —
+# still a hard disaster ceiling, not truly uncapped. CAUTION: full Kelly assumes
+# the edge estimate is exact; MLB totals is 10-2 but n=12 (unproven), so this is
+# an aggressive bet on a small-sample edge that will likely regress.
+MLB_TOTAL_KELLY_FRACTION = 1.0
+MLB_TOTAL_KELLY_CAP      = 0.20   # 20% disaster ceiling (vs 3% elsewhere)
+
+def _kelly_params(ticker: str):
+    """(fraction, per-bet cap) for a market. MLB totals → full Kelly; else the
+    quarter-Kelly validation defaults. Used by BOTH live staking and the
+    performance-tracker recompute so the two never drift apart."""
+    if (ticker or "").upper().startswith("KXMLBTOTAL"):
+        return MLB_TOTAL_KELLY_FRACTION, MLB_TOTAL_KELLY_CAP
+    return PAPER_KELLY_FRACTION, PAPER_KELLY_CAP
 # Total Bases: the 2026-07-07 investigation found the model's win-rate gap vs.
 # expectation concentrates in HIGH raw-edge bets (n=23, gap=-24.3pp, p=0.018) —
 # a big "edge" on a TB longshot line is exactly where the Poisson-on-compound-
@@ -1462,14 +1478,14 @@ def _compute_paper_balance() -> float:
 
 
 def _paper_kelly_stake(edge_pct: float, kalshi_price: float,
-                       game_time_iso: str | None = None) -> float:
+                       game_time_iso: str | None = None, ticker: str = "") -> float:
     """Calculate Kelly-sized paper stake against current portfolio balance.
 
     Sizing chain:
-      full_kelly  = edge / (1 − kalshi_price)          ← raw Kelly fraction
-      base        = full_kelly × PAPER_KELLY_FRACTION   ← quarter-Kelly
+      full_kelly  = edge / (1 − kalshi_price)           ← raw Kelly fraction
+      base        = full_kelly × kelly_fraction(ticker) ← quarter-Kelly (full for MLB totals)
       calibrated  = base × _time_kelly_mult(game_time)  ← time-to-game discount
-      capped      = min(calibrated, PAPER_KELLY_CAP)    ← 3% hard ceiling
+      capped      = min(calibrated, kelly_cap(ticker))  ← 3% ceiling (20% for MLB totals)
       stake       = capped × portfolio_balance
 
     High raw-edge Total Bases (>=7%) never reaches this function — it's
@@ -1483,7 +1499,8 @@ def _paper_kelly_stake(edge_pct: float, kalshi_price: float,
     balance    = _compute_paper_balance()
     full_kelly = e / (1.0 - k)
     time_mult  = _time_kelly_mult(game_time_iso)
-    frac       = min(full_kelly * PAPER_KELLY_FRACTION * time_mult, PAPER_KELLY_CAP)
+    fraction, cap = _kelly_params(ticker)
+    frac       = min(full_kelly * fraction * time_mult, cap)
     return round(frac * balance, 2)
 
 
@@ -1725,7 +1742,7 @@ def _add_new_bets(edges: list) -> list:
                            or _wnba_hypo(e))
             _cal_mult = _stake_mults.get(_calib_bucket(e), 1.0)
             paper_stake = 0.0 if shadow else round(_paper_kelly_stake(
-                e["edge_pct"], e["kalshi"], _game_time_iso,
+                e["edge_pct"], e["kalshi"], _game_time_iso, e.get("ticker", ""),
             ) * _cal_mult, 2)
 
             # ── Daily aggregate exposure gate (on TOP of per-bet Kelly) ──────
@@ -3003,7 +3020,10 @@ def _get_performance(since: Optional[str] = None) -> dict:
         # so this "what would current policy stake" column matches reality.
         if b.get("ticker", "").upper().startswith("KXMLBTB") and b.get("raw_edge_pct", 0) >= TB_HIGH_EDGE_THRESHOLD:
             return 0.0
-        return min(full_kelly * KELLY_FRACTION * time_mult * clv_mult, KELLY_SINGLE_CAP)
+        # Per-market fraction/cap (MLB totals = full Kelly), same helper as live
+        # staking so this "current-policy" column can't drift from what's staked.
+        _fraction, _cap = _kelly_params(b.get("ticker", ""))
+        return min(full_kelly * _fraction * time_mult * clv_mult, _cap)
 
     def _kelly_pnl(b: dict) -> Optional[float]:
         """P&L as fraction-of-bankroll under CLV-adjusted quarter-Kelly sizing."""
@@ -3413,10 +3433,19 @@ def _get_performance(since: Optional[str] = None) -> dict:
         xbar = sum(units) / len(units) if units else 0.0
         # cluster-robust SE of the mean: sqrt( Σ_g (Σ_i (x_i−x̄))² ) / N
         tstat = None
+        tstat_conf = None   # plain-language "% chance this edge is real (positive)"
         if len(units) > 1 and len(clusters) > 1:
             ss = sum((sum(u - xbar for u in us)) ** 2 for us in clusters.values())
             se = (ss ** 0.5) / len(units)
-            tstat = round(xbar / se, 2) if se > 0 else None
+            if se > 0:
+                _t = xbar / se
+                tstat = round(_t, 2)
+                # One-sided confidence that the true mean unit-P&L is above 0:
+                # Φ(t) = 0.5·(1+erf(t/√2)). This is the layperson reading of the
+                # t-stat — "how likely is this a real edge, not luck." t=1.65→95%,
+                # t=1.0→84%, t=0→50%. Not a claim the edge is proven; just P(>0).
+                import math as _m
+                tstat_conf = round(100 * 0.5 * (1 + _m.erf(_t / (2 ** 0.5))), 1)
         # cluster bootstrap 95% CI on the mean unit P&L (resample whole games)
         ci = None
         gk = list(clusters.keys())
@@ -3441,6 +3470,7 @@ def _get_performance(since: Optional[str] = None) -> dict:
             "total_kelly_dollars": round(sum(kdols), 2) if kdols else None,
             "roi_pct":             round(100 * sum(kdols) / PERF_BANKROLL, 2) if kdols else None,
             "unit_tstat":          tstat,     # game-clustered, on mean unit P&L
+            "unit_tstat_conf":     tstat_conf,  # Φ(t)·100 — "% chance edge is real"
             "unit_ci95":           ci,        # game-cluster bootstrap CI on mean unit P&L
         }
 
@@ -6531,6 +6561,16 @@ function renderPerformance(d) {
     const ss = d.slice_stats, L = ss.live, S = ss.shadowed, C = ss.combined;
     const uClr = v => v == null ? '' : v > 0 ? 'pnl-pos' : v < 0 ? 'pnl-neg' : '';
     const ciTxt = s => s && s.unit_ci95 ? `[${s.unit_ci95[0]}, ${s.unit_ci95[1]}]` : '—';
+    // Plain-language reading of the t-stat: Φ(t) = "% chance this is a real
+    // (positive) edge, not luck", with a word so non-stats readers get it.
+    const confTxt = s => {
+      if (!s || s.unit_tstat_conf == null) return '—';
+      const p = s.unit_tstat_conf;
+      const word = p >= 97.5 ? 'very strong' : p >= 95 ? 'strong' : p >= 84 ? 'moderate' : p >= 70 ? 'weak' : 'noise';
+      return `${p}% likely real · ${word}`;
+    };
+    const confClr = s => (!s || s.unit_tstat_conf == null) ? '' :
+      s.unit_tstat_conf >= 95 ? 'pnl-pos' : s.unit_tstat_conf < 70 ? 'pnl-neg' : '';
     const row = (label, get, cls) => `<tr>
       <td style="color:var(--muted);">${label}</td>
       <td class="num ${cls?cls(L):''}">${L&&L.n?get(L):'—'}</td>
@@ -6554,11 +6594,12 @@ function renderPerformance(d) {
             ${row('Kelly P&amp;L', s=>s.total_kelly_dollars!=null?`${s.total_kelly_dollars>=0?'+$':'-$'}${Math.abs(s.total_kelly_dollars).toFixed(2)}`:'—', s=>uClr(s.total_kelly_dollars))}
             ${row('ROI (of bank)', s=>s.roi_pct!=null?`${s.roi_pct>0?'+':''}${s.roi_pct}%`:'—', s=>uClr(s.roi_pct))}
             ${row('Unit t-stat', s=>s.unit_tstat!=null?s.unit_tstat:'—')}
+            ${row('↳ chance it\'s real', confTxt, confClr)}
             ${row('Unit 95% CI', s=>ciTxt(s))}
           </tbody>
         </table>
         <p style="font-size:10px;color:var(--muted);margin:4px 0 0;line-height:1.3;">
-          Shadowed = parallel HYPOTHETICAL ledger: $0 real stake, excluded from every headline stat, but sized/tracked exactly like live (¼-Kelly, 3% per-bet + 15%/day caps). t-stat &amp; 95% CI are game-clustered on flat-unit P&amp;L (same-game bets share an outcome). If Shadowed's units/CLV beat Live, the band is costing edge; if worse, it's protecting you.
+          Shadowed = parallel HYPOTHETICAL ledger: $0 real stake, excluded from every headline stat, but sized/tracked exactly like live (¼-Kelly, 3% per-bet + 15%/day caps). t-stat &amp; 95% CI are game-clustered on flat-unit P&amp;L (same-game bets share an outcome). "Chance it's real" = the t-stat translated to plain terms — the probability the true edge is positive, not luck (95%+ = strong, under 70% = still basically noise); it rises only as the sample grows. If Shadowed's units/CLV beat Live, the band is costing edge; if worse, it's protecting you.
         </p>
       </details>`;
   }

@@ -6855,7 +6855,12 @@ function renderPerformance(d) {
   const PERF_PREVIEW = 15;
   // Sort newest-first so most recent action is immediately visible
   const sortedBets   = [...d.bets].sort((a, b) => (b.flagged_at || '').localeCompare(a.flagged_at || ''));
-  const allPerfBets  = sortedBets.filter(b => b.clv_source !== 'corrupted_utc');
+  // Total Bases is terminated — hide its plays from this live results list.
+  // The settled TB record is untouched (still in the market-type breakdown,
+  // tagged TERMINATED, and in every aggregate); this only drops it from the
+  // running per-bet ledger so a dead market stops cluttering it.
+  const allPerfBets  = sortedBets.filter(b => b.clv_source !== 'corrupted_utc'
+                        && !(b.ticker || '').toUpperCase().startsWith('KXMLBTB'));
   const corruptBets  = sortedBets.filter(b => b.clv_source === 'corrupted_utc');
   const showAllPerf  = window._perfShowAll || false;
   const visiblePerf  = showAllPerf ? allPerfBets : allPerfBets.slice(0, PERF_PREVIEW);

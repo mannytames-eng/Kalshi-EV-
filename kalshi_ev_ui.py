@@ -454,6 +454,10 @@ SHADOW_MARKETS: list[str] = [
                       # Shadow-first until it has a clean settled sample (walkover/
                       # retirement void handling verified) and CLV/win-rate read.
     "KXWTAMATCH",     # WTA match-winner (moneyline) — added 2026-07-27. Same.
+    "KXMLBOUTS",      # Pitcher outs — added 2026-07-27, SHADOW. Pinnacle-covered
+                      # but thin (~20 contracts/slate, ~1 starter/game priced);
+                      # throttled hourly Odds fetch. Shadow until a settled sample
+                      # shows whether the occasional dislocation is real.
 ]
 
 def _is_shadow(ticker: str) -> bool:
@@ -3249,11 +3253,12 @@ def _get_performance(since: Optional[str] = None) -> dict:
         b["entry_discount"] = round(_paf - _ek, 1) if (_paf is not None and _ek) else None
 
     _PROP_SERIES_LABELS = {
-        "KXMLBKS":  "Strikeouts (K)",
-        "KXMLBHR":  "Home Runs",
-        "KXMLBHIT": "Hits",
-        "KXMLBTB":  "Total Bases",
-        "KXMLBRBI": "RBIs",
+        "KXMLBKS":   "Strikeouts (K)",
+        "KXMLBHR":   "Home Runs",
+        "KXMLBHIT":  "Hits",
+        "KXMLBTB":   "Total Bases",
+        "KXMLBRBI":  "RBIs",
+        "KXMLBOUTS": "Pitcher Outs",
     }
 
     def _perf_label(b: dict) -> str:
@@ -3666,6 +3671,12 @@ print(f"  Loaded {len(_alerted_keys)} previously alerted edge key(s) from disk")
 # period during game hours — indicates a silent data pipeline failure.
 _zero_edge_streak      = 0          # consecutive scans with no qualifying edges
 _last_props_scan: float = 0.0       # epoch seconds of last props scan
+_last_outs_scan: float = 0.0        # epoch seconds of last pitcher_outs (shadow) fetch — throttled
+OUTS_REFRESH_SECONDS   = 60 * 60    # pitcher_outs paid-fetch cadence: hourly. Keeps a
+                                    # ~20-contract shadow market off the 10-15min strikeouts
+                                    # cadence (~+5k credits/mo hourly vs ~+24k at full). Outs
+                                    # lines are stable; scratches move both and the K-scan
+                                    # already tracks those. Raise to trim credits further.
 _last_prop_snapshot: dict = {}      # persists between prop scan cycles so UI stays populated
 _last_soccer_scan: float = 0.0      # epoch seconds of last soccer sweep (all leagues)
 _last_tennis_scan: float = 0.0      # epoch seconds of last tennis sweep (ATP + WTA)
@@ -4262,15 +4273,25 @@ def _run_scan():
         nba_stats = {}
 
         # Player props — MLB only, interval set by _props_refresh_interval() per PDT window
-        global _last_props_scan
+        global _last_props_scan, _last_outs_scan
         now_ts = time.time()
         if now_ts - _last_props_scan >= _props_refresh_interval():
+            # pitcher_outs (SHADOW) is THROTTLED independently: it's an extra paid
+            # Odds-API market (+1 credit/event) on a ~20-contract market, so we
+            # only fold it into the markets string on its own hourly cadence
+            # rather than every 10-15min strikeouts scan. Outs lines are stable
+            # (they move on scratches, already caught by the strikeouts cadence).
+            _outs_due = now_ts - _last_outs_scan >= OUTS_REFRESH_SECONDS
+            _prop_markets = "pitcher_strikeouts" + (",pitcher_outs" if _outs_due else "")
             try:
-                mlb_props, _fresh_prop_snap = scan_player_props(odds_sport="baseball_mlb", abbr_map=MLB_ABBR)
+                mlb_props, _fresh_prop_snap = scan_player_props(
+                    odds_sport="baseball_mlb", abbr_map=MLB_ABBR, prop_markets=_prop_markets)
             except Exception as _prop_exc:
                 print(f"  Props scan error: {_prop_exc}")
                 mlb_props, _fresh_prop_snap = [], {}
             _last_props_scan = now_ts
+            if _outs_due:
+                _last_outs_scan = now_ts
         else:
             mlb_props, _fresh_prop_snap = [], {}
 
@@ -6798,7 +6819,7 @@ function renderPerformance(d) {
 
   // By-type breakdown table
   const PROP_LABELS = new Set(['Strikeouts (K)', 'Hits', 'Total Bases', 'RBIs', 'MLB Props', 'NBA Props', 'WNBA Props']);
-  const TYPE_ORDER  = ['MLB Total', 'MLB Spread', 'Strikeouts (K)', 'Hits', 'Total Bases', 'RBIs', 'MLB Props', 'NBA Props', 'WNBA Total', 'WNBA Spread', 'WNBA Props', 'MLS Moneyline', 'MLS Total', 'MLS BTTS', 'Argentina Moneyline', 'Argentina Total', 'Argentina BTTS', 'Brazil Moneyline', 'Brazil Total', 'Brazil BTTS', 'Liga MX Moneyline', 'Liga MX Total', 'Liga MX BTTS', 'Brazil B Moneyline', 'Brazil B Total', 'Brazil B BTTS', 'Sudamericana Moneyline', 'Sudamericana Total', 'Sudamericana BTTS', 'Chile Moneyline', 'Chile Total', 'Chile BTTS', 'ATP Moneyline', 'WTA Moneyline'];
+  const TYPE_ORDER  = ['MLB Total', 'MLB Spread', 'Strikeouts (K)', 'Pitcher Outs', 'Hits', 'Total Bases', 'RBIs', 'MLB Props', 'NBA Props', 'WNBA Total', 'WNBA Spread', 'WNBA Props', 'MLS Moneyline', 'MLS Total', 'MLS BTTS', 'Argentina Moneyline', 'Argentina Total', 'Argentina BTTS', 'Brazil Moneyline', 'Brazil Total', 'Brazil BTTS', 'Liga MX Moneyline', 'Liga MX Total', 'Liga MX BTTS', 'Brazil B Moneyline', 'Brazil B Total', 'Brazil B BTTS', 'Sudamericana Moneyline', 'Sudamericana Total', 'Sudamericana BTTS', 'Chile Moneyline', 'Chile Total', 'Chile BTTS', 'ATP Moneyline', 'WTA Moneyline'];
   // Markets no longer scanned — settled record frozen & still shown, but tagged
   // so it's clear no new bets are being placed. Total Bases terminated 2026-07-23.
   const TERMINATED_LABELS = new Set(['Total Bases']);

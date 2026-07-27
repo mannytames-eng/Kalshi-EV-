@@ -2876,8 +2876,17 @@ WNBA_EXTRAP_MAX_RUNGS  = 1.5
 WNBA_EXTRAP_CV = {"player_points": 0.45, "player_rebounds": 0.45, "player_assists": 0.55}
 
 MLB_PROP_SERIES: Dict[str, str] = {
-    "KXMLBKS":  "pitcher_strikeouts",
-    "KXMLBTB":  "batter_total_bases",
+    "KXMLBKS":   "pitcher_strikeouts",
+    "KXMLBTB":   "batter_total_bases",
+    "KXMLBOUTS": "pitcher_outs",   # added 2026-07-27, SHADOW. Pinnacle-covered
+                                   # (one of the few MLB props it prices besides
+                                   # K/TB/HR). Kalshi markets are collected every
+                                   # prop scan (free); the paid Odds-API
+                                   # pitcher_outs fetch is THROTTLED to an hourly
+                                   # cadence in the UI (outs lines are stable —
+                                   # they move on scratches, which the 10-15min
+                                   # strikeouts scan already tracks) so a ~20-
+                                   # contract market doesn't double prop credits.
 }
 
 NBA_PROP_SERIES: Dict[str, str] = {

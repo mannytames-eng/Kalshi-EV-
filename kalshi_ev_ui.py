@@ -49,6 +49,8 @@ from kalshi_ev_scanner import (
     scan_wnba_player_props,
     scan_soccer,
     SOCCER_LEAGUES,
+    scan_tennis,
+    TENNIS_LEAGUES,
     MLS_TEAMS,
     total_market_resolved,
     poisson_live_over_prob,
@@ -327,6 +329,28 @@ def _soccer_refresh_interval() -> int:
         return 6 * 60
     return 10 ** 9
 
+# ── Tennis scheduling (ATP/WTA moneyline, added 2026-07-27) ──────────────────
+# Like soccer, the real cost gate is FREE: scan_tennis's tennis_has_upcoming_match
+# short-circuit (only /sports + /events, 0 credits) returns fast when no match is
+# within TENNIS_LOOKAHEAD_H. Odds keys rotate weekly by tournament and are
+# discovered dynamically. Tour matches run nearly around the clock (US day →
+# European overnight during the majors), so the window is wide; the free
+# short-circuit does the precise gating. Only when a tour has a match inside the
+# window does it spend one 1-credit Pinnacle h2h call per tick. Shadow-first.
+TENNIS_SCANNING_ENABLED = True
+TENNIS_WINDOW_START_H   = 3    # 3am PDT (European/Asian tour mornings)
+TENNIS_WINDOW_END_H     = 23   # 11pm PDT (US night sessions)
+
+def _tennis_refresh_interval() -> int:
+    """Seconds between tennis scan sweeps (both tours). The free upcoming-match
+    short-circuit inside scan_tennis skips at zero cost when nothing is close."""
+    if not TENNIS_SCANNING_ENABLED:
+        return 10 ** 9
+    h = _pdt_hour()
+    if TENNIS_WINDOW_START_H <= h < TENNIS_WINDOW_END_H:
+        return 8 * 60
+    return 10 ** 9
+
 REFRESH_SECONDS       = 30         # re-scan Kalshi every 30 sec   (0 credits)
 # Monthly credit math (20k budget):
 #   Odds refresh : 2 × 144/day × 30 =  8,640
@@ -425,6 +449,11 @@ SHADOW_MARKETS: list[str] = [
     "KXLIGAMX",       # Liga MX (KXLIGAMXGAME/TOTAL) — added 2026-07-23.
     "KXCONMEBOLSUD",  # Copa Sudamericana (KXCONMEBOLSUDGAME/TOTAL) — 2026-07-23.
     "KXCHLLDP",       # Chile Primera (KXCHLLDPGAME/TOTAL) — added 2026-07-26.
+    "KXATPMATCH",     # ATP match-winner (moneyline) — added 2026-07-27. Binary
+                      # 2-way de-vig, fuzzy player-name matched (tennis_names.py).
+                      # Shadow-first until it has a clean settled sample (walkover/
+                      # retirement void handling verified) and CLV/win-rate read.
+    "KXWTAMATCH",     # WTA match-winner (moneyline) — added 2026-07-27. Same.
 ]
 
 def _is_shadow(ticker: str) -> bool:
@@ -3234,6 +3263,9 @@ def _get_performance(since: Optional[str] = None) -> dict:
             return "NBA Props"
         if mtype == "wnba_prop":
             return "WNBA Props"
+        # Tennis: mkt_type is "atp_moneyline"/"wta_moneyline" (binary match-winner).
+        if mtype == "atp_moneyline": return "ATP Moneyline"
+        if mtype == "wta_moneyline": return "WTA Moneyline"
         # Soccer leagues: mkt_type is "<prefix>_moneyline"/"<prefix>_total"
         # (prefix in _SOCCER_LEAGUE_NAMES). Fall back to the ticker's ESPN-league
         # prefix (longest-first) + GAME/TOTAL for bets without a stored mkt_type.
@@ -3424,8 +3456,19 @@ def _get_performance(since: Optional[str] = None) -> dict:
     # book. Uses the per-bet unit_pnl / kelly_pnl_dollars / clv computed above.
     import random as _rand
     def _game_key(b):
-        _p = b.get("ticker", "").split("-")
-        return _p[1] if len(_p) > 1 else b.get("ticker", "")
+        _tk = b.get("ticker", "")
+        _up = _tk.upper()
+        # Tennis has no shared game to cluster on, so cluster by TOURNAMENT-DAY
+        # (spec #6): same-tour, same-date matches share surface/weather/scheduling
+        # chaos. The ticker doesn't carry the tournament, but during a tour week
+        # all concurrent matches are the same event, so (series, date) is the
+        # right proxy. Keeps ATP and WTA in separate clusters.
+        if _up.startswith("KXATPMATCH") or _up.startswith("KXWTAMATCH"):
+            _series = _tk.split("-")[0]
+            _date = _parse_ticker_date(_tk) or ""
+            return f"{_series}:{_date}" if _date else _series
+        _p = _tk.split("-")
+        return _p[1] if len(_p) > 1 else _tk
 
     def _slice_stats(slice_bets):
         s = [b for b in slice_bets if b["status"] in ("won", "lost")]
@@ -3625,6 +3668,7 @@ _zero_edge_streak      = 0          # consecutive scans with no qualifying edges
 _last_props_scan: float = 0.0       # epoch seconds of last props scan
 _last_prop_snapshot: dict = {}      # persists between prop scan cycles so UI stays populated
 _last_soccer_scan: float = 0.0      # epoch seconds of last soccer sweep (all leagues)
+_last_tennis_scan: float = 0.0      # epoch seconds of last tennis sweep (ATP + WTA)
 # Props refresh interval is now dynamic — see _props_refresh_interval() above.
 _zero_edge_alerted     = False      # suppresses duplicate alerts per drought
 _ZERO_EDGE_ALERT_SCANS = 60         # 60 × 2-min scan = 2 hours of silence
@@ -4282,7 +4326,23 @@ def _run_scan():
                     print(f"  {_cfg['label']} scan error: {_soc_exc}")
             _last_soccer_scan = now_ts
 
-        all_edges = sorted(mlb + nba + mlb_props + wnba + wnba_props + soccer, key=lambda x: x["edge"], reverse=True)
+        # Tennis — ATP + WTA match-winner, one sweep on a shared cadence. Each
+        # tour self-gates via the FREE upcoming-match short-circuit inside
+        # scan_tennis (0 credits when nothing is close); only tours with a match
+        # in the window spend a 1-credit Pinnacle h2h call. All shadow-first via
+        # SHADOW_MARKETS.
+        global _last_tennis_scan
+        tennis: list = []
+        if now_ts - _last_tennis_scan >= _tennis_refresh_interval():
+            for _tcfg in TENNIS_LEAGUES:
+                try:
+                    _tour_edges, _ = scan_tennis(_tcfg)
+                    tennis.extend(_tour_edges)
+                except Exception as _ten_exc:
+                    print(f"  {_tcfg['label']} tennis scan error: {_ten_exc}")
+            _last_tennis_scan = now_ts
+
+        all_edges = sorted(mlb + nba + mlb_props + wnba + wnba_props + soccer + tennis, key=lambda x: x["edge"], reverse=True)
 
         # Deduplicate: keep only best edge per (matchup, mkt_type, side)
         edges = _best_edge_per_game(all_edges)
@@ -6738,7 +6798,7 @@ function renderPerformance(d) {
 
   // By-type breakdown table
   const PROP_LABELS = new Set(['Strikeouts (K)', 'Hits', 'Total Bases', 'RBIs', 'MLB Props', 'NBA Props', 'WNBA Props']);
-  const TYPE_ORDER  = ['MLB Total', 'MLB Spread', 'Strikeouts (K)', 'Hits', 'Total Bases', 'RBIs', 'MLB Props', 'NBA Props', 'WNBA Total', 'WNBA Spread', 'WNBA Props', 'MLS Moneyline', 'MLS Total', 'MLS BTTS', 'Argentina Moneyline', 'Argentina Total', 'Argentina BTTS', 'Brazil Moneyline', 'Brazil Total', 'Brazil BTTS', 'Liga MX Moneyline', 'Liga MX Total', 'Liga MX BTTS', 'Brazil B Moneyline', 'Brazil B Total', 'Brazil B BTTS', 'Sudamericana Moneyline', 'Sudamericana Total', 'Sudamericana BTTS', 'Chile Moneyline', 'Chile Total', 'Chile BTTS'];
+  const TYPE_ORDER  = ['MLB Total', 'MLB Spread', 'Strikeouts (K)', 'Hits', 'Total Bases', 'RBIs', 'MLB Props', 'NBA Props', 'WNBA Total', 'WNBA Spread', 'WNBA Props', 'MLS Moneyline', 'MLS Total', 'MLS BTTS', 'Argentina Moneyline', 'Argentina Total', 'Argentina BTTS', 'Brazil Moneyline', 'Brazil Total', 'Brazil BTTS', 'Liga MX Moneyline', 'Liga MX Total', 'Liga MX BTTS', 'Brazil B Moneyline', 'Brazil B Total', 'Brazil B BTTS', 'Sudamericana Moneyline', 'Sudamericana Total', 'Sudamericana BTTS', 'Chile Moneyline', 'Chile Total', 'Chile BTTS', 'ATP Moneyline', 'WTA Moneyline'];
   // Markets no longer scanned — settled record frozen & still shown, but tagged
   // so it's clear no new bets are being placed. Total Bases terminated 2026-07-23.
   const TERMINATED_LABELS = new Set(['Total Bases']);

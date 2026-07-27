@@ -4260,6 +4260,237 @@ def scan_mls(mls_index: Optional[List[dict]] = None) -> Tuple[List[dict], str]:
     return scan_soccer(SOCCER_LEAGUES[0], games=mls_index)
 
 
+# ── Tennis (ATP/WTA moneyline) ────────────────────────────────────────────────
+# Structurally a binary win/loss market (no draw), so it reuses the existing
+# 2-way de-vig (no_vig_prob) — no new probability model. The only genuinely
+# tennis-specific pieces are: (1) player-name matching (tennis_names.py, a
+# pair-first, side-verified fuzzy matcher that refuses to guess on ambiguity),
+# and (2) the Odds-API sport keys are TOURNAMENT-SPECIFIC and rotate weekly
+# (tennis_atp_washington_open, …), so we discover the active keys each scan via
+# the FREE /sports catalog rather than hardcoding one. Launches SHADOW-first.
+# Settlement (retirement/walkover) needs no special code: Kalshi settles those
+# to a non-yes/no result (observed 'scalar' on DC withdrawals), which the
+# existing _check_resolutions void path books as a VOID (no win/loss) — see
+# requirement #4. Main tour only for phase 1 (Odds-API has no challenger/ITF
+# keys); coverage drops off below tour level and the safe matcher skips anything
+# Pinnacle doesn't price.
+try:
+    from tennis_names import (
+        canonicalize as _tn_canon,
+        resolve_match as _tn_resolve,
+        extract_players_from_kalshi_event as _tn_extract,
+    )
+    _TENNIS_MATCHER_OK = True
+except Exception as _tn_exc:                       # never let a missing module crash the scanner
+    _TENNIS_MATCHER_OK = False
+    print(f"  tennis matcher unavailable — tennis scanning disabled: {_tn_exc}")
+
+TENNIS_LEAGUES: List[dict] = [
+    {"label": "ATP", "prefix": "atp", "kalshi_match": "KXATPMATCH", "odds_prefix": "tennis_atp_"},
+    {"label": "WTA", "prefix": "wta", "kalshi_match": "KXWTAMATCH", "odds_prefix": "tennis_wta_"},
+]
+TENNIS_LOOKAHEAD_H = 14   # only spend the paid odds call when a match commences
+                          # within this window (tennis start times slip a lot, so
+                          # a wide-ish pregame window rather than tight checkpoints).
+
+
+def discover_tennis_odds_keys(odds_prefix: str) -> List[str]:
+    """Active Odds-API tennis sport keys for a tour. They rotate weekly by
+    tournament, so we DISCOVER them (never hardcode) — FREE /sports catalog call."""
+    try:
+        r = requests.get(f"{ODDS_BASE}/sports", params={"apiKey": ODDS_API_KEY}, timeout=15)
+        r.raise_for_status()
+        return [s["key"] for s in r.json()
+                if s.get("key", "").startswith(odds_prefix) and s.get("active")]
+    except Exception:
+        return []
+
+
+def tennis_has_upcoming_match(odds_prefix: str, within_h: int = TENNIS_LOOKAHEAD_H) -> bool:
+    """Zero-cost short-circuit: any Pinnacle-tour match commencing within the
+    window? Uses only FREE endpoints (/sports + /events). Fails OPEN on error."""
+    keys = discover_tennis_odds_keys(odds_prefix)
+    if not keys:
+        return False
+    from datetime import timedelta as _td
+    now = datetime.now(timezone.utc)
+    hi = now + _td(hours=within_h)
+    for key in keys:
+        try:
+            for e in fetch_odds_events_list(key):
+                ct = e.get("commence_time")
+                if not ct:
+                    continue
+                try:
+                    dt = datetime.fromisoformat(ct.replace("Z", "+00:00"))
+                except (ValueError, AttributeError):
+                    continue
+                if now <= dt <= hi:
+                    return True
+        except Exception:
+            continue
+    return False
+
+
+def fetch_tennis_candidates(odds_keys: List[str]) -> Tuple[List[dict], str]:
+    """Pinnacle h2h across the active tournament keys → resolve_match candidates:
+    {"players": (a, b), "novig": {canonical_full: prob}, "commence_time"}.
+    2-way proportional de-vig (no_vig_prob) — the same binary method as MLB/WNBA
+    moneylines."""
+    cands: List[dict] = []
+    remaining = "?"
+    for key in odds_keys:
+        try:
+            r = requests.get(f"{ODDS_BASE}/sports/{key}/odds", params={
+                "apiKey": ODDS_API_KEY, "bookmakers": "pinnacle",
+                "markets": "h2h", "oddsFormat": "american",
+            }, timeout=15)
+            r.raise_for_status()
+            remaining = r.headers.get("x-requests-remaining", remaining)
+            games = r.json()
+        except Exception as exc:
+            print(f"  ERROR — tennis odds {key}: {exc}")
+            continue
+        for g in games:
+            for bm in g.get("bookmakers", []):
+                if bm.get("key") != "pinnacle":
+                    continue
+                mk = next((m for m in bm.get("markets", []) if m.get("key") == "h2h"), None)
+                if not mk:
+                    continue
+                outs = [o for o in mk.get("outcomes", []) if o.get("price") is not None]
+                if len(outs) != 2:
+                    continue
+                pa, pb = no_vig_prob(outs[0]["price"], outs[1]["price"])
+                cands.append({
+                    "players": (outs[0]["name"], outs[1]["name"]),
+                    "novig": {_tn_canon(outs[0]["name"]).ascii_full: pa,
+                              _tn_canon(outs[1]["name"]).ascii_full: pb},
+                    "commence_time": g.get("commence_time"),
+                })
+    return cands, remaining
+
+
+def _tennis_price_market(mkt: dict, fair: float, mkt_type: str, title: str,
+                         matchup: str, commence_time, now_utc: datetime) -> Optional[dict]:
+    """Binary YES/NO edge builder — same EV math (fee then haircut) and same
+    global thresholds/floor as every other market. NO on a player = the opponent
+    wins (the two players' markets are mutually exclusive; collapsed to one bet
+    per match by the caller)."""
+    prices = kalshi_prices(mkt)
+    if prices is None:
+        return None
+    yes_bid, yes_ask = prices
+    yes_raw = fair - yes_ask
+    no_raw  = (1 - fair) - (1 - yes_bid)
+    yes_adj = (yes_raw - KALSHI_FEE_RATE * fair       * (1 - yes_ask)) * (1 - EV_HAIRCUT)
+    no_adj  = (no_raw  - KALSHI_FEE_RATE * (1 - fair) * yes_bid)       * (1 - EV_HAIRCUT)
+    best_adj = max(yes_adj, no_adj)
+    if best_adj < EDGE_THRESHOLD or best_adj > MAX_EDGE:
+        return None
+    if yes_adj >= no_adj:
+        side, k_side, f_side, raw_edge, adj = "YES", yes_ask, fair, yes_raw, yes_adj
+    else:
+        side, k_side, f_side, raw_edge, adj = "NO", 1 - yes_bid, 1 - fair, no_raw, no_adj
+    if k_side < MIN_KALSHI_PRICE:
+        return None
+    books_detail = {"pinnacle": round(fair, 4)}
+    cons_yes, cons_no = round(fair, 4), round(1 - fair, 4)
+    return {
+        "ticker": mkt.get("ticker", ""), "title": title, "kalshi_line": None,
+        "matchup": matchup, "side": side, "kalshi": round(k_side, 4), "fair": round(f_side, 4),
+        "raw_edge": round(raw_edge, 4), "edge": round(adj, 4), "confidence": 1.0,
+        "mkt_type": mkt_type, "pin_line": None, "fair_source": "exact",
+        "books_used": ["pinnacle"], "books_detail": books_detail,
+        "per_book_novig": _build_per_book_novig(books_detail, side),
+        "consensus_yes": cons_yes, "consensus_no": cons_no,
+        "consensus_yes_american": prob_to_american(cons_yes),
+        "consensus_no_american": prob_to_american(cons_no),
+        "consensus_prob": cons_yes, "is_valid_consensus": True,
+        "consensus_reason": "Pinnacle (sole sharp anchor)",
+        "kalshi_price_ts": now_utc.isoformat(), "commence_time": commence_time,
+    }
+
+
+def scan_tennis(cfg: dict, candidates: Optional[List[dict]] = None) -> Tuple[List[dict], str]:
+    """Scan one tennis tour's Kalshi match-winner markets (KXATPMATCH /
+    KXWTAMATCH) against Pinnacle's 2-way de-vigged probabilities. Player matching
+    via tennis_names.resolve_match (pair-first, side-verified, refuses ambiguity).
+    Same edge-dict format as everything else. Shadow-first (UI side)."""
+    label, prefix = cfg["label"], cfg["prefix"]
+    ml_type = f"{prefix}_moneyline"
+    remaining = "?"
+    if not _TENNIS_MATCHER_OK:
+        return [], remaining
+    if candidates is None:
+        if not tennis_has_upcoming_match(cfg["odds_prefix"]):
+            print(f"  {label}: no match within {TENNIS_LOOKAHEAD_H}h — skip (0 credits)")
+            return [], remaining
+        candidates, remaining = fetch_tennis_candidates(discover_tennis_odds_keys(cfg["odds_prefix"]))
+
+    print(f"\n{'═'*70}\n  {label} — Match Winner (moneyline)  —  "
+          f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n{'═'*70}")
+    print(f"  Pinnacle {label} matches: {len(candidates)}")
+    now_utc = datetime.now(timezone.utc)
+    edges: List[dict] = []
+
+    try:
+        events = fetch_kalshi_events(cfg["kalshi_match"])
+    except Exception as e:
+        print(f"  ERROR — Kalshi {cfg['kalshi_match']}: {e}")
+        events = []
+
+    for evt in events:
+        try:
+            pa_name, pb_name, yes_by_ticker = _tn_extract(evt)
+        except ValueError:
+            continue   # not a clean binary pair — skip loudly-safe
+        # candidate window: same tournament week, ±1 day of the Kalshi ticker date
+        kdate = _parse_ticker_date(evt.get("event_ticker", ""))
+        cand_window = candidates
+        if kdate:
+            from datetime import date as _date
+            try:
+                kd = _date.fromisoformat(kdate)
+                cand_window = [c for c in candidates
+                               if c.get("commence_time")
+                               and abs((datetime.fromisoformat(c["commence_time"].replace("Z", "+00:00")).date() - kd).days) <= 1]
+            except (ValueError, AttributeError):
+                cand_window = candidates
+        if not cand_window:
+            continue
+        matchup = f"{pa_name} vs {pb_name}"
+        for mkt in (evt.get("markets") or []):
+            yes_player = yes_by_ticker.get(mkt.get("ticker", ""))
+            if not yes_player:
+                continue
+            dec = _tn_resolve((pa_name, pb_name), yes_player, cand_window)
+            if not dec.is_bettable or dec.yes_pinnacle_prob is None:
+                continue
+            # PREGAME ONLY: never price a match that has started (no reliable
+            # in-play model, and Kalshi live prices ≠ pregame).
+            ct = (dec.pinnacle_match or {}).get("commence_time")
+            if ct:
+                try:
+                    if datetime.fromisoformat(ct.replace("Z", "+00:00")) <= now_utc:
+                        continue
+                except (ValueError, AttributeError):
+                    pass
+            e = _tennis_price_market(mkt, dec.yes_pinnacle_prob, ml_type,
+                                     f"{yes_player} to win", matchup, ct, now_utc)
+            if e:
+                edges.append(e)
+
+    # One bet per match: the two players' markets (and their NO sides) are the
+    # same mutually-exclusive event, so keep only the single best edge per match.
+    edges.sort(key=lambda x: x["edge"], reverse=True)
+    best: dict = {}
+    for e in edges:
+        best.setdefault(e["ticker"].rsplit("-", 1)[0], e)   # event ticker w/o -PLAYER suffix
+    edges = sorted(best.values(), key=lambda x: x["edge"], reverse=True)
+    print(f"  {label} edges ≥{EDGE_THRESHOLD:.0%}: {len(edges)}")
+    return edges, remaining
+
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 def run_once() -> int:

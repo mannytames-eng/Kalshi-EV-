@@ -1824,6 +1824,12 @@ def _add_new_bets(edges: list) -> list:
                 "tb_no_experiment":   bool(e.get("tb_no_experiment")),  # flagged below global threshold for the TB under-side test
                 "daily_capped":       daily_capped,          # True = skipped (daily exposure cap), $0 stake
                 "time_mult_applied":  _time_kelly_mult(_game_time_iso),  # time-Kelly mult used at placement (1.0 since 2026-06-23)
+                # Kelly fraction/cap in force at placement, stamped so the perf
+                # recompute displays each bet at the policy it was ACTUALLY staked
+                # under (like time_mult_applied). Without this, changing a market's
+                # Kelly policy retroactively re-sizes its whole history on screen.
+                "kelly_fraction_applied": _kelly_params(e.get("ticker", ""))[0],
+                "kelly_cap_applied":      _kelly_params(e.get("ticker", ""))[1],
                 # TB-only cohort tag (2026-07-14): marks TB bets placed AFTER the
                 # calibration patch so they never blend with the pre-fix 57 in
                 # analysis. None for non-TB. Within post-fix TB, the shadow flag +
@@ -3020,9 +3026,13 @@ def _get_performance(since: Optional[str] = None) -> dict:
         # so this "what would current policy stake" column matches reality.
         if b.get("ticker", "").upper().startswith("KXMLBTB") and b.get("raw_edge_pct", 0) >= TB_HIGH_EDGE_THRESHOLD:
             return 0.0
-        # Per-market fraction/cap (MLB totals = full Kelly), same helper as live
-        # staking so this "current-policy" column can't drift from what's staked.
-        _fraction, _cap = _kelly_params(b.get("ticker", ""))
+        # Display each bet at the Kelly policy it was ACTUALLY staked under: use
+        # the fraction/cap stamped at placement; bets predating the stamp were all
+        # quarter-Kelly, so fall back to the base defaults. This is why a policy
+        # change (e.g. MLB totals → full Kelly) does NOT retroactively re-size the
+        # existing history's displayed Kelly P&L — only new bets show the new size.
+        _fraction = b.get("kelly_fraction_applied", PAPER_KELLY_FRACTION)
+        _cap      = b.get("kelly_cap_applied", PAPER_KELLY_CAP)
         return min(full_kelly * _fraction * time_mult * clv_mult, _cap)
 
     def _kelly_pnl(b: dict) -> Optional[float]:

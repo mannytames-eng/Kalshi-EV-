@@ -6604,7 +6604,7 @@ function renderPerformance(d) {
             ${row('Kelly P&amp;L', s=>s.total_kelly_dollars!=null?`${s.total_kelly_dollars>=0?'+$':'-$'}${Math.abs(s.total_kelly_dollars).toFixed(2)}`:'—', s=>uClr(s.total_kelly_dollars))}
             ${row('ROI (of bank)', s=>s.roi_pct!=null?`${s.roi_pct>0?'+':''}${s.roi_pct}%`:'—', s=>uClr(s.roi_pct))}
             ${row('Unit t-stat', s=>s.unit_tstat!=null?s.unit_tstat:'—')}
-            ${row('↳ chance it\'s real', confTxt, confClr)}
+            ${row('↳ chance real', confTxt, confClr)}
             ${row('Unit 95% CI', s=>ciTxt(s))}
           </tbody>
         </table>

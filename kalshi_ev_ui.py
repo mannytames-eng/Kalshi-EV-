@@ -3485,10 +3485,22 @@ def _get_performance(since: Optional[str] = None) -> dict:
         }
 
     _settled_all = [b for b in table_bets if b["status"] in ("won", "lost")]
+    # Terminated markets (Total Bases) are excluded from the LIVE slice: this
+    # ledger measures the strategy we're actually RUNNING, and a market we
+    # deliberately shut down (phantom-vig, ~0 true CLV — see project-tb-full-
+    # shadow) is not part of that. This is a scoping choice, NOT results-driven
+    # deletion: TB's full settled record stays in the by-type breakdown (tagged
+    # ⛔ TERMINATED) and in the immutable record. Shadowed slice keeps its TB
+    # (still part of the shadow band). It does lift the live numbers, so it's an
+    # active-markets view, stated as such.
+    def _is_terminated_mkt(b):
+        return (b.get("ticker", "") or "").upper().startswith("KXMLBTB")
+    _live_pop     = [b for b in _settled_all if not b.get("shadowed") and not _is_terminated_mkt(b)]
+    _shadowed_pop = [b for b in _settled_all if b.get("shadowed")]
     slice_stats = {
-        "live":     _slice_stats([b for b in _settled_all if not b.get("shadowed")]),
-        "shadowed": _slice_stats([b for b in _settled_all if b.get("shadowed")]),
-        "combined": _slice_stats(_settled_all),
+        "live":     _slice_stats(_live_pop),
+        "shadowed": _slice_stats(_shadowed_pop),
+        "combined": _slice_stats(_live_pop + _shadowed_pop),
     }
 
     return {
@@ -6855,12 +6867,7 @@ function renderPerformance(d) {
   const PERF_PREVIEW = 15;
   // Sort newest-first so most recent action is immediately visible
   const sortedBets   = [...d.bets].sort((a, b) => (b.flagged_at || '').localeCompare(a.flagged_at || ''));
-  // Total Bases is terminated — hide its plays from this live results list.
-  // The settled TB record is untouched (still in the market-type breakdown,
-  // tagged TERMINATED, and in every aggregate); this only drops it from the
-  // running per-bet ledger so a dead market stops cluttering it.
-  const allPerfBets  = sortedBets.filter(b => b.clv_source !== 'corrupted_utc'
-                        && !(b.ticker || '').toUpperCase().startsWith('KXMLBTB'));
+  const allPerfBets  = sortedBets.filter(b => b.clv_source !== 'corrupted_utc');
   const corruptBets  = sortedBets.filter(b => b.clv_source === 'corrupted_utc');
   const showAllPerf  = window._perfShowAll || false;
   const visiblePerf  = showAllPerf ? allPerfBets : allPerfBets.slice(0, PERF_PREVIEW);

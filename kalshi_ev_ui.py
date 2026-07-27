@@ -3485,18 +3485,17 @@ def _get_performance(since: Optional[str] = None) -> dict:
         }
 
     _settled_all = [b for b in table_bets if b["status"] in ("won", "lost")]
-    # Terminated markets (Total Bases) are excluded from the LIVE slice: this
-    # ledger measures the strategy we're actually RUNNING, and a market we
-    # deliberately shut down (phantom-vig, ~0 true CLV — see project-tb-full-
-    # shadow) is not part of that. This is a scoping choice, NOT results-driven
-    # deletion: TB's full settled record stays in the by-type breakdown (tagged
-    # ⛔ TERMINATED) and in the immutable record. Shadowed slice keeps its TB
-    # (still part of the shadow band). It does lift the live numbers, so it's an
-    # active-markets view, stated as such.
+    # Terminated markets (Total Bases) are excluded from BOTH slices: this ledger
+    # measures the active strategy, and a market we deliberately shut down
+    # (phantom-vig, ~0 true CLV — see project-tb-full-shadow) belongs to neither
+    # the live nor the shadow band going forward. Scoping choice, NOT results-
+    # driven deletion: TB's full settled record stays in the by-type breakdown
+    # (tagged ⛔ TERMINATED) and in the immutable record. It lifts both columns,
+    # so this is an active-markets view, stated as such.
     def _is_terminated_mkt(b):
         return (b.get("ticker", "") or "").upper().startswith("KXMLBTB")
     _live_pop     = [b for b in _settled_all if not b.get("shadowed") and not _is_terminated_mkt(b)]
-    _shadowed_pop = [b for b in _settled_all if b.get("shadowed")]
+    _shadowed_pop = [b for b in _settled_all if b.get("shadowed") and not _is_terminated_mkt(b)]
     slice_stats = {
         "live":     _slice_stats(_live_pop),
         "shadowed": _slice_stats(_shadowed_pop),

@@ -69,6 +69,7 @@ from kalshi_ev_scanner import (
     EDGE_THRESHOLD,
     _parse_ticker_start_time,
     _parse_ticker_date,
+    LAST_ODDS_USAGE,
 )
 
 PORT = int(os.environ.get("PORT", 8000))   # Railway injects PORT; falls back to 8000 locally
@@ -314,7 +315,13 @@ def _wnba_props_refresh_interval() -> int:
 # broad 08:00–23:00 PDT window covers them; the short-circuit does the precise
 # per-league gating. Each active league costs ONE 2-credit Pinnacle call per
 # 6-min tick only on days it actually plays.
-SOCCER_SCANNING_ENABLED = True
+SOCCER_SCANNING_ENABLED = False   # PAUSED 2026-07-27 — efficient market (Kalshi within
+                                  # ~0.94c of Pinnacle), shadow-only, no proven static edge.
+                                  # Was ~15-22k credits/mo (2cr × active league × 6-min tick)
+                                  # — the biggest discretionary drain against the 100k cap for
+                                  # ~zero edge. Settled shadow records stay frozen; open bets
+                                  # still settle. Re-enable only for a purpose-built latency
+                                  # (Path B) experiment, not the static-edge scan. See tennis flag.
 SOCCER_WINDOW_START_H   = 8    # 8am PDT (early SA / Liga MX afternoons)
 SOCCER_WINDOW_END_H     = 23   # 11pm PDT (late MLS west-coast)
 
@@ -337,7 +344,13 @@ def _soccer_refresh_interval() -> int:
 # European overnight during the majors), so the window is wide; the free
 # short-circuit does the precise gating. Only when a tour has a match inside the
 # window does it spend one 1-credit Pinnacle h2h call per tick. Shadow-first.
-TENNIS_SCANNING_ENABLED = True
+TENNIS_SCANNING_ENABLED = False   # PAUSED 2026-07-27, same day as launch — the build did its
+                                  # job (confirmed tennis moneyline is efficient, ~2% off
+                                  # Pinnacle on nearly every match, like soccer). Running it on
+                                  # shadow indefinitely (~6-9k credits/mo) to re-confirm zero
+                                  # static edge is a poor credit trade against the 100k cap.
+                                  # Code intact + reversible; re-enable for a latency experiment,
+                                  # not the static scan. Settled records frozen.
 TENNIS_WINDOW_START_H   = 3    # 3am PDT (European/Asian tour mornings)
 TENNIS_WINDOW_END_H     = 23   # 11pm PDT (US night sessions)
 
@@ -361,6 +374,7 @@ REFRESH_SECONDS       = 30         # re-scan Kalshi every 30 sec   (0 credits)
 HISTORY_FILE    = os.path.join(DATA_DIR, "ev_history.json")
 BETS_FILE       = os.path.join(DATA_DIR, "ev_bets.json")
 PIN_PRICES_FILE = os.path.join(DATA_DIR, "ev_pin_prices.json")
+CREDIT_USAGE_FILE = os.path.join(DATA_DIR, "ev_credit_usage.json")  # Odds API daily-spend baselines
 MAX_HISTORY     = 500       # cap stored scan snapshots
 PERF_BANKROLL        = 1000.0    # bankroll for ROI % display
 
@@ -510,6 +524,7 @@ _state   = {
     "error":           None,
     "last_scan_stats": None,   # diagnostic counters from last scan_sport call
     "market_snapshot": {},     # {ticker|side: {adj_edge, kalshi, fair, edge_pct}} — all scanned markets
+    "odds_credits":    None,    # {used, remaining, cap, pct, today, days:{d:spend}} — Odds API budget
 }
 
 # Tracks first-seen and last-seen YES price for each edge key (for staleness + CLV)
@@ -534,6 +549,59 @@ def _save_pin_prices():
         os.replace(tmp, PIN_PRICES_FILE)
     except Exception as exc:
         print(f"  WARNING: could not save pin prices: {exc}")
+
+
+def _update_credit_tracker() -> Optional[dict]:
+    """Fold the latest Odds API usage counters into a daily-spend record and
+    return a summary for the dashboard. The API's x-requests-used/remaining are
+    authoritative month-to-date counters (used + remaining = plan cap), so we
+    only derive TODAY's spend ourselves by diffing against the first reading of
+    the current UTC day. Persists a rolling 14-day baseline to CREDIT_USAGE_FILE.
+    Returns None until at least one Odds API call has been observed."""
+    used = LAST_ODDS_USAGE.get("used")
+    remaining = LAST_ODDS_USAGE.get("remaining")
+    if used is None and remaining is None:
+        return None
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    try:
+        with open(CREDIT_USAGE_FILE, "r") as f:
+            rec = json.load(f)
+    except Exception:
+        rec = {}
+    days = rec.get("days", {})
+    if used is not None:
+        d = days.get(today)
+        if d is None:
+            days[today] = {"first": used, "last": used}
+        else:
+            # first can only go DOWN if the billing period rolled over mid-day
+            # (used reset) — guard so today's spend never goes negative.
+            if used < d["first"]:
+                d["first"] = used
+            d["last"] = used
+        # keep the most recent 14 days
+        for k in sorted(days.keys())[:-14]:
+            days.pop(k, None)
+    rec["days"] = days
+    try:
+        import tempfile as _tempfile
+        fd, tmp = _tempfile.mkstemp(dir=DATA_DIR, suffix=".tmp")
+        with os.fdopen(fd, "w") as f:
+            json.dump(rec, f)
+        os.replace(tmp, CREDIT_USAGE_FILE)
+    except Exception as exc:
+        print(f"  WARNING: could not save credit usage: {exc}")
+    cap = (used + remaining) if (used is not None and remaining is not None) else None
+    today_spend = None
+    if today in days:
+        today_spend = days[today]["last"] - days[today]["first"]
+    day_spends = {k: v["last"] - v["first"] for k, v in sorted(days.items())}
+    return {
+        "used": used, "remaining": remaining, "cap": cap,
+        "pct": round(100 * used / cap, 1) if (cap and used is not None) else None,
+        "today": today_spend, "days": day_spends,
+        "at": LAST_ODDS_USAGE.get("at"),
+    }
 
 _edge_price_history: dict = _load_pin_prices()
 print(f"  Loaded {len(_edge_price_history)} Pinnacle price entries from disk")
@@ -4502,6 +4570,10 @@ def _run_scan():
             _state["last_scan"]       = now_iso
             _state["scanning"]        = False
             _state["last_scan_stats"] = mlb_stats   # diagnostic counters for /api/scan
+            try:
+                _state["odds_credits"] = _update_credit_tracker()
+            except Exception as _cred_exc:
+                print(f"  credit tracker error: {_cred_exc}")
 
             # ── Build full market snapshot: game lines + props ────────────────
             # scan_sport() already populates mlb_snapshot for game lines.
@@ -5450,6 +5522,10 @@ HTML = """<!DOCTYPE html>
     <span class="ss-dot ss-muted" id="ss-games-dot"></span>
     <span id="ss-games-txt">— games</span>
   </div>
+  <div class="ss-item" title="Odds API credits — month-to-date usage vs plan cap">
+    <span class="ss-dot ss-muted" id="ss-credits-dot"></span>
+    <span id="ss-credits-txt">Credits —</span>
+  </div>
   <div id="temp-wrap">
     <span id="temp-label">Best market</span>
     <div id="temp-track">
@@ -6033,6 +6109,25 @@ function updateStatusStrip(d) {
   } else {
     gamesTxt.textContent = '— games';
     gamesDot.className = 'ss-dot ss-muted';
+  }
+
+  // ── Odds API credits (month-to-date vs plan cap) ──────────────────────────
+  const credDot = document.getElementById('ss-credits-dot');
+  const credTxt = document.getElementById('ss-credits-txt');
+  const oc = d.odds_credits;
+  if (oc && oc.used != null && oc.cap != null) {
+    const pct = oc.pct != null ? oc.pct : Math.round(100 * oc.used / oc.cap);
+    const k = n => n >= 1000 ? (n/1000).toFixed(n >= 10000 ? 0 : 1) + 'k' : String(n);
+    const todayStr = oc.today != null ? `, +${k(oc.today)} today` : '';
+    credTxt.textContent = `Credits ${pct}% (${k(oc.remaining)} left${todayStr})`;
+    if      (pct >= 90) { credDot.className = 'ss-dot ss-red'; }
+    else if (pct >= 75) { credDot.className = 'ss-dot ss-yellow'; }
+    else                { credDot.className = 'ss-dot ss-green'; }
+    credTxt.title = `Odds API: ${oc.used} used / ${oc.cap} cap this billing period · ${oc.remaining} remaining` +
+                    (oc.today != null ? ` · ${oc.today} used today (UTC)` : '');
+  } else {
+    credTxt.textContent = 'Credits —';
+    credDot.className = 'ss-dot ss-muted';
   }
 
   // ── Temperature gauge ─────────────────────────────────────────────────────

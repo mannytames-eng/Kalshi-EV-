@@ -45,6 +45,27 @@ ODDS_API_KEY        = os.environ.get("ODDS_API_KEY", "85de0453dbc95b70936e6c1b5a
 KALSHI_BASE = "https://api.elections.kalshi.com/trade-api/v2"
 ODDS_BASE   = "https://api.the-odds-api.com/v4"
 
+# ── Odds API credit tracking ──────────────────────────────────────────────────
+# The Odds API returns cumulative usage counters on EVERY response
+# (x-requests-used / x-requests-remaining) for the current billing period, so a
+# single recent call gives the authoritative month-to-date total — we don't have
+# to count calls ourselves. _record_odds_usage() stashes the latest into
+# LAST_ODDS_USAGE; the UI reads it for the credit-usage panel and daily-spend
+# baseline. used + remaining = the plan cap.
+LAST_ODDS_USAGE: Dict[str, object] = {"remaining": None, "used": None, "at": None}
+
+def _record_odds_usage(resp) -> None:
+    try:
+        rem  = resp.headers.get("x-requests-remaining")
+        used = resp.headers.get("x-requests-used")
+        if rem is not None:
+            LAST_ODDS_USAGE["remaining"] = int(float(rem))
+        if used is not None:
+            LAST_ODDS_USAGE["used"] = int(float(used))
+        LAST_ODDS_USAGE["at"] = datetime.now(timezone.utc).isoformat()
+    except (ValueError, TypeError, AttributeError):
+        pass
+
 # ── EV / filtering constants ────────────────────────────────────────────────
 # All thresholds apply to the POST-fee, POST-haircut adjusted edge.
 #
@@ -487,6 +508,7 @@ def fetch_book_odds(sport: str, include_h2h: bool = False) -> Tuple[List[dict], 
         "oddsFormat": "american",
     }, timeout=15)
     r.raise_for_status()
+    _record_odds_usage(r)
     remaining = r.headers.get("x-requests-remaining", "?")
     return r.json(), remaining
 
@@ -539,6 +561,7 @@ def fetch_player_prop_odds_event(sport: str, event_id: str, markets: str = None)
     )
     if r.status_code not in (404, 422):
         r.raise_for_status()
+        _record_odds_usage(r)
         data = r.json()
         remaining = r.headers.get("x-requests-remaining", "?")
         if any(bm.get("markets") for bm in data.get("bookmakers", [])):

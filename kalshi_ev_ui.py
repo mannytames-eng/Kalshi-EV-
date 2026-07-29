@@ -468,10 +468,11 @@ SHADOW_MARKETS: list[str] = [
                       # Shadow-first until it has a clean settled sample (walkover/
                       # retirement void handling verified) and CLV/win-rate read.
     "KXWTAMATCH",     # WTA match-winner (moneyline) — added 2026-07-27. Same.
-    "KXMLBOUTS",      # Pitcher outs — added 2026-07-27, SHADOW. Pinnacle-covered
-                      # but thin (~20 contracts/slate, ~1 starter/game priced);
-                      # throttled hourly Odds fetch. Shadow until a settled sample
-                      # shows whether the occasional dislocation is real.
+    # KXMLBOUTS (pitcher outs) is NOT shadowed — user never wanted it shadow-first
+    # (my call when I added it; reversed 2026-07-29). It funds like any other MLB
+    # prop (2% floor, ¼-Kelly, 3% cap). The one already-settled shadow bet
+    # (Alcantara, won) stays frozen per freeze-settled-bets unless explicitly
+    # overridden — it has shadow=true stamped, so this removal doesn't touch it.
 ]
 
 def _is_shadow(ticker: str) -> bool:

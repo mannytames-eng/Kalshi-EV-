@@ -1141,6 +1141,40 @@ for _b in _bets:
         _b["shadow"] = False; _data_fixed = True
         print(f"  WNBA exact-match → funded: {_b.get('id','?')} stake ${_b.get('paper_stake',0):.2f}")
 
+# EXPLICIT FREEZE EXCEPTION (2026-07-29, user-directed). The Sandy Alcantara
+# pitcher-outs bet was flagged $0 shadow ONLY because KXMLBOUTS was briefly in
+# SHADOW_MARKETS — a classification the user never requested (it was my call when
+# I added pitcher_outs, reversed the same session). It settled WON before the
+# reversal. The user explicitly directed funding it as a logged exception ("was
+# never supposed to be shadow") — an outcome-independent misclassification fix,
+# not a cherry-pick. This is a DELIBERATE, one-off override of freeze-settled-bets
+# (which otherwise stands: no other settled bet is ever retroactively re-staked).
+# Reconstructed on the standard flat-$1000 / quarter-Kelly / 3%-cap correction
+# basis (matches the bet's stamped kelly_fraction_applied 0.25): edge 5.1% @ 0.37
+# → stake $20.24; won → pnl +$34.46. Idempotent (guarded on shadow still True).
+_alcantara_outs_id = "KXMLBOUTS-26JUL281840PHIMIA-MIASALCANTARA22-19|YES"
+for _b in _bets:
+    if _b.get("id") == _alcantara_outs_id and _b.get("shadow"):
+        _e = (_b.get("edge_pct") or 0) / 100.0
+        _k = _b.get("kalshi_price") or 0
+        if 0 < _k < 1 and _e > 0:
+            _stake = round(min(_e / (1 - _k) * PAPER_KELLY_FRACTION,
+                               PAPER_KELLY_CAP) * PAPER_START_BALANCE, 2)
+            if _b.get("status") == "won":
+                _pnl = round(_stake * (1 - _k) / _k, 2)
+            elif _b.get("status") == "lost":
+                _pnl = round(-_stake, 2)
+            else:
+                _pnl = _b.get("pnl")
+            _b["paper_stake"]      = _stake
+            _b["shadow"]           = False
+            _b["pnl"]              = _pnl
+            _b["paper_pnl"]        = _pnl
+            _b["freeze_exception"] = "unshadow_20260729_user_directed"
+            _data_fixed = True
+            print(f"  FREEZE EXCEPTION (user-directed): funded Alcantara pitcher-outs "
+                  f"— stake ${_stake:.2f}, pnl ${_pnl:+.2f} (was $0 shadow)")
+
 # Fix: bets silently halved by the retroactive-resize migration (now removed
 # above). That migration was a one-time historical correction for the June
 # 2026 time-Kelly-multiplier flip (_time_kelly_mult() -> flat 1.0x), but kept

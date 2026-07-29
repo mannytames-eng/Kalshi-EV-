@@ -4073,19 +4073,33 @@ def _alert_top10(newly_logged: list = None):
         parts = key.split("|")
         matchup, title, side = parts[0], parts[1], parts[2]
 
-        # Check if it was Pinnacle-invalidated (line moved) or just fell below threshold
+        # Gate (2026-07-29, user request): only fire "LINE CORRECTED" when KALSHI's
+        # own price actually moved >= 1 cent. An edge drops out of the scan for many
+        # reasons that are NOT a Kalshi line move — a Pinnacle shift, threshold
+        # noise, or a scan cycle that simply didn't include the market — and those
+        # were firing a false "line corrected" ping right after the edge alert.
+        # kalshi_pct is the bet-side price in cents (kalshi * 100), so a >=1c change
+        # in it IS the Kalshi line moving 1 cent. Exact-key lookup (alerted key ==
+        # edge-history key, both from _edge_key); matchup-prefix only as a fallback.
         with _edge_history_lock:
-            hist = next(
+            hist = _edge_price_history.get(key) or next(
                 (h for k2, h in _edge_price_history.items() if k2.startswith(f"{matchup}|")),
                 None,
             )
-        _last_pin  = hist.get("last_pin_pct")  if hist else None
+        _first_k = hist.get("first_kalshi_pct") if hist else None
+        _last_k  = hist.get("last_kalshi_pct")  if hist else None
+        kalshi_shift = (_last_k - _first_k) if (_first_k is not None and _last_k is not None) else None
+        if kalshi_shift is None or abs(kalshi_shift) < 1.0:
+            # Kalshi line hasn't moved >= 1c → not a real correction. Don't alert,
+            # and don't mark it gone-alerted, so a genuine >=1c move later can still fire.
+            continue
+
         _first_pin = hist.get("first_pin_pct") if hist else None
-        pin_shift  = (_last_pin - _first_pin) if (_last_pin is not None and _first_pin is not None) else None
-        if pin_shift is not None and hist.get("first_pin_pct") is not None:
-            reason = f"Pinnacle shifted {pin_shift:+.1f}pp" if abs(pin_shift) >= 1 else "Kalshi price corrected"
-        else:
-            reason = "Edge no longer qualifies"
+        _last_pin  = hist.get("last_pin_pct")  if hist else None
+        pin_shift  = (_last_pin - _first_pin) if (_first_pin is not None and _last_pin is not None) else None
+        reason = f"Kalshi line moved {kalshi_shift:+.0f}¢"
+        if pin_shift is not None and abs(pin_shift) >= 1:
+            reason += f" (Pinnacle also shifted {pin_shift:+.1f}pp)"
 
         ts = datetime.now().strftime("%I:%M %p")
         content_gone = f"🚫 **EDGE GONE** — {title} ({side}) | {reason}"
@@ -8126,7 +8140,11 @@ if __name__ == "__main__":
             ("wnba-odds",   _background_wnba_odds_loop),
             ("resolution",  _background_resolution_loop),
             ("clv-capture", _background_clv_capture_loop),
-            ("wc-watcher",  _background_wc_watcher_loop),
+            # wc-watcher REMOVED 2026-07-29: was spamming Discord (its keyword
+            # search hit the generic /events feed and matched any "soccer"/
+            # "football" title). Obsolete anyway — it existed to prompt building
+            # the soccer scanner, which is built (and paused), and the next World
+            # Cup is ~4 years out. Loop fn + state file left in place, just not started.
         ]
         _bg_threads.clear()
         for name, target in specs:

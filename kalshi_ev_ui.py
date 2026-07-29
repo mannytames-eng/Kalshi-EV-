@@ -3494,6 +3494,27 @@ def _get_performance(since: Optional[str] = None) -> dict:
             "delta":    round(_bw / len(_bb) * 100 - _avg_k * 100, 1),
         })
 
+    # Win rate vs implied across ALL edge buckets, EXCLUDING terminated Total
+    # Bases (KXMLBTB). This is the headline "is the model beating the price"
+    # readout over the whole active book, not just the 2-4% bucket. TB is scoped
+    # out the same way it's dropped from the live/shadow ledger (terminated +
+    # known phantom-calibration) — its settled record stays frozen in the by-type
+    # breakdown; this is a display scoping choice, not a record change. Actual win
+    # rate vs the avg Kalshi price paid (the break-even implied prob).
+    _wri_pop = [b for b in all_settled
+                if b.get("edge_pct", 0) >= _ALPHA_BUCKETS[0][1]           # >=2% — real flagged edges (all buckets combined)
+                and not b.get("ticker", "").upper().startswith("KXMLBTB")]  # excl. terminated Total Bases
+    win_rate_vs_implied = None
+    if _wri_pop:
+        _wri_won = sum(1 for b in _wri_pop if b["status"] == "won")
+        _wri_exp = sum(b["kalshi_price"] for b in _wri_pop) / len(_wri_pop)
+        win_rate_vs_implied = {
+            "n":        len(_wri_pop),
+            "win_rate": round(_wri_won / len(_wri_pop) * 100, 1),
+            "expected": round(_wri_exp * 100, 1),
+            "delta":    round(_wri_won / len(_wri_pop) * 100 - _wri_exp * 100, 1),
+        }
+
     # ── Win-rate audit by (market type, CLV source) ───────────────────────────
     # Detects data-quality bugs: a CLV source with <38% win rate (N≥10) signals
     # the reference price was wrong (wrong game, wrong line, stale data).
@@ -3651,6 +3672,7 @@ def _get_performance(since: Optional[str] = None) -> dict:
         "avg_true_alpha":       avg_true_alpha,     # avg Kalshi-only close-vs-entry move, side-aware — the confirmed/realized alpha
         "true_alpha_n":         true_alpha_n,
         "alpha_buckets":        alpha_buckets,      # win rate vs expected by edge bucket
+        "win_rate_vs_implied":  win_rate_vs_implied, # all edges excl. Total Bases — aggregate actual vs implied
     }
 
 
@@ -7222,17 +7244,18 @@ async function fetchPaper() {
       : `${flatUnits >= 0 ? '+' : ''}${flatUnits.toFixed(2)}u`;
     const unitsSubTxt = avgUnits == null ? '' : `${avgUnits >= 0 ? '+' : ''}${avgUnits.toFixed(3)}/bet`;
 
-    // Win rate vs implied — restricted to the 2-4% edge bucket only. It's the
-    // only bucket with a meaningful sample (~110 bets); the 4%+ buckets have
-    // 1-4 bets each and are pure noise, so including them was misleading.
-    const coreBucket   = (perf.alpha_buckets || []).find(b => b.label && b.label.startsWith('2'));
-    const winRate      = coreBucket ? coreBucket.win_rate : null;   // actual
-    const impliedAvg   = coreBucket ? coreBucket.expected : null;   // market-implied
-    const vsMarket     = coreBucket ? coreBucket.delta.toFixed(1) : null;
+    // Win rate vs implied — ALL edge buckets aggregated, excluding terminated
+    // Total Bases (server computes perf.win_rate_vs_implied over all_settled
+    // minus KXMLBTB). The whole active book's actual win rate vs the avg price
+    // paid, not just the 2-4% slice.
+    const wri          = perf.win_rate_vs_implied || null;
+    const winRate      = wri ? wri.win_rate : null;   // actual
+    const impliedAvg   = wri ? wri.expected : null;   // market-implied
+    const vsMarket     = wri ? wri.delta.toFixed(1) : null;
     const vsMarketTxt  = vsMarket == null ? '—'
       : `${vsMarket >= 0 ? '+' : ''}${vsMarket}%`;
     const vsMarketColor = vsMarket == null ? 'var(--muted)' : vsMarket >= 0 ? 'var(--green)' : 'var(--red)';
-    const coreN        = coreBucket ? coreBucket.n : null;
+    const coreN        = wri ? wri.n : null;
 
     // Avg CLV — PIN source only for honest number
     const clvSrc    = perf.clv_by_source || {};
@@ -7292,12 +7315,12 @@ async function fetchPaper() {
         <div style="font-size:9px;color:var(--muted);opacity:0.75;margin-top:2px;line-height:1.2;">how far below fair we bought</div>
       </div>`;
       })()}
-      <!-- 3. Win Rate vs Implied (2-4% edge bucket only) -->
+      <!-- 3. Win Rate vs Implied (all edges, excl. Total Bases) -->
       <div style="background:var(--surface);padding:14px 16px;text-align:center;">
         <div style="font-size:24px;font-weight:800;color:${vsMarketColor};">${vsMarketTxt}</div>
         <div style="font-size:11px;color:var(--muted);margin-top:1px;">${winRate != null ? winRate + '%' : '—'} actual vs ${impliedAvg != null ? impliedAvg.toFixed(1) + '%' : '—'} implied</div>
-        <div style="font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:0.06em;margin-top:3px;" title="Actual win rate minus Kalshi-implied win probability, restricted to the 2-4% edge bucket (the only one with a meaningful sample). Positive = beating the market.">Win Rate vs Implied</div>
-        <div style="font-size:9px;color:var(--muted);opacity:0.75;margin-top:2px;line-height:1.2;">2–4% edge bucket${coreN != null ? ' (' + coreN + ' bets)' : ''}</div>
+        <div style="font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:0.06em;margin-top:3px;" title="Actual win rate minus the average Kalshi-implied win probability (the price paid = break-even), across ALL edges except terminated Total Bases. Positive = beating the market price you paid.">Win Rate vs Implied</div>
+        <div style="font-size:9px;color:var(--muted);opacity:0.75;margin-top:2px;line-height:1.2;">all edges · excl. Total Bases${coreN != null ? ' (' + coreN + ' bets)' : ''}</div>
       </div>
       <!-- 5. Record -->
       <div style="background:var(--surface);padding:14px 16px;text-align:center;">

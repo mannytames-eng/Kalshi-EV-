@@ -3797,11 +3797,11 @@ print(f"  Loaded {len(_alerted_keys)} previously alerted edge key(s) from disk")
 _zero_edge_streak      = 0          # consecutive scans with no qualifying edges
 _last_props_scan: float = 0.0       # epoch seconds of last props scan
 _last_outs_scan: float = 0.0        # epoch seconds of last pitcher_outs (shadow) fetch — throttled
-OUTS_REFRESH_SECONDS   = 60 * 60    # pitcher_outs paid-fetch cadence: hourly. Keeps a
-                                    # ~20-contract shadow market off the 10-15min strikeouts
-                                    # cadence (~+5k credits/mo hourly vs ~+24k at full). Outs
-                                    # lines are stable; scratches move both and the K-scan
-                                    # already tracks those. Raise to trim credits further.
+OUTS_REFRESH_SECONDS   = 15 * 60    # pitcher_outs paid-fetch cadence: 15 min (user call
+                                    # 2026-07-29, now that outs is FUNDED not shadow and the
+                                    # soccer/tennis pause freed ~20-30k cr/mo). Was hourly.
+                                    # ~+15-18k cr/mo at 15min for a funded market — catches
+                                    # dislocations closer to real time. Raise to trim credits.
 _last_prop_snapshot: dict = {}      # persists between prop scan cycles so UI stays populated
 _last_soccer_scan: float = 0.0      # epoch seconds of last soccer sweep (all leagues)
 _last_tennis_scan: float = 0.0      # epoch seconds of last tennis sweep (ATP + WTA)

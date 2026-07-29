@@ -3542,9 +3542,12 @@ def _get_performance(since: Optional[str] = None) -> dict:
     win_rate_vs_implied = None
     if _wri_pop:
         _wri_won = sum(1 for b in _wri_pop if b["status"] == "won")
+        _wri_lost = len(_wri_pop) - _wri_won
         _wri_exp = sum(b["kalshi_price"] for b in _wri_pop) / len(_wri_pop)
         win_rate_vs_implied = {
             "n":        len(_wri_pop),
+            "won":      _wri_won,
+            "lost":     _wri_lost,
             "win_rate": round(_wri_won / len(_wri_pop) * 100, 1),
             "expected": round(_wri_exp * 100, 1),
             "delta":    round(_wri_won / len(_wri_pop) * 100 - _wri_exp * 100, 1),
@@ -7354,8 +7357,8 @@ async function fetchPaper() {
       <div style="background:var(--surface);padding:14px 16px;text-align:center;">
         <div style="font-size:24px;font-weight:800;color:${vsMarketColor};">${vsMarketTxt}</div>
         <div style="font-size:11px;color:var(--muted);margin-top:1px;">${winRate != null ? winRate + '%' : '—'} actual vs ${impliedAvg != null ? impliedAvg.toFixed(1) + '%' : '—'} implied</div>
-        <div style="font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:0.06em;margin-top:3px;" title="Actual win rate minus the average Kalshi-implied win probability (the price paid = break-even), across ALL edges except terminated Total Bases. Positive = beating the market price you paid.">Win Rate vs Implied</div>
-        <div style="font-size:9px;color:var(--muted);opacity:0.75;margin-top:2px;line-height:1.2;">all edges · excl. Total Bases${coreN != null ? ' (' + coreN + ' bets)' : ''}</div>
+        <div style="font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:0.06em;margin-top:3px;" title="Actual win rate minus the average Kalshi-implied win probability (the price paid = break-even), across ALL edges except terminated Total Bases. Positive = beating the market price you paid. Its own won-loss record is shown below — it is NOT the full portfolio record (which includes Total Bases).">Win Rate vs Implied</div>
+        <div style="font-size:9px;color:var(--muted);opacity:0.75;margin-top:2px;line-height:1.2;">${wri && wri.won != null ? wri.won + '–' + wri.lost + ' · ' : ''}all edges · excl. Total Bases${coreN != null ? ' (' + coreN + ' bets)' : ''}</div>
       </div>
       <!-- 5. Record -->
       <div style="background:var(--surface);padding:14px 16px;text-align:center;">

@@ -2144,11 +2144,22 @@ def _parse_moneyline_team(
     for name in [away_name, home_name]:
         if name is None:
             continue
-        if _norm(name) in _norm(title):
+        nn, nt = _norm(name), _norm(title)
+        # yes_sub_title is typically the CITY only ("San Francisco"), while name is
+        # the full "City Nickname" ("San Francisco Giants"). Match in BOTH directions:
+        #   name-in-title  → title carries the full name
+        #   title-in-name  → title is the city portion of the full name (the usual
+        #                    MLB case). The old code only did name-in-title, which
+        #                    ALWAYS failed for a city-only sub-title and fell through
+        #                    to the word-scan fallback below — where a shared first
+        #                    word ("San" in San Francisco vs San Diego) resolved to
+        #                    the WRONG team via the city lookup, tagging the SF market
+        #                    with SD's win prob and manufacturing a phantom ~14% edge.
+        if nn and nt and (nn in nt or nt in nn):
             return name
-        # Also check city name or nickname (last word)
+        # Also check the nickname (last word) appears in the title
         last = _norm(name.split()[-1])
-        if len(last) > 3 and last in _norm(title):
+        if len(last) > 3 and last in nt:
             return name
     # Fallback: check each word in the title against the city lookup
     for word in re.split(r"[\s\?\-]+", title):

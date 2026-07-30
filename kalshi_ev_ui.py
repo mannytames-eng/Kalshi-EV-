@@ -4050,6 +4050,39 @@ def _sms_kelly(e: dict) -> float:
     return min(full_kelly * 0.25 * clv_mult, 0.05)
 
 
+# ── Ready-to-post tweet drafts ────────────────────────────────────────────────
+# When a FUNDED edge alert fires, also emit a formatted, ready-to-post tweet to
+# Discord for the user to review and post MANUALLY. Deliberately NOT auto-posted:
+# publishing to a public account is a per-post human decision, and these are
+# still-validating edges. Only rides the funded-edge alert path (shadow/$0 bets
+# never reach here), so drafts are only for picks worth standing behind.
+TWEET_DRAFTS_ENABLED = True
+
+def _pick_phrase(e: dict) -> str:
+    """Readable pick text, e.g. 'Spencer Strider: 6+ Ks — NO' or 'ATL @ NYM — YES'."""
+    title = (e.get("title") or e.get("matchup") or "").strip()
+    side  = e.get("side", "")
+    return f"{title} — {side}" if title else (side or "—")
+
+def _format_edge_tweet(group_edges: list, best: dict) -> str:
+    """Build a <=280-char tweet draft for a game's best edge. Punchy but honest —
+    the hook is the sharp-fair-vs-market-price gap, no tout language."""
+    ep   = round(best.get("edge_pct", 0), 1)
+    kc   = round(best.get("kalshi", 0.5) * 100)
+    fair = best.get("fair")
+    fc   = round(fair * 100) if fair is not None else None
+    stars = "🔥" if ep >= 10 else "⚡" if ep >= 7 else "📈"
+    lines = [f"{stars} EV edge — {best.get('matchup','')}", "",
+             f"Pick: {_pick_phrase(best)}"]
+    lines.append(f"Sharp fair {fc}% vs Kalshi {kc}¢  →  +{ep}% edge"
+                 if fc is not None else f"Kalshi {kc}¢  →  +{ep}% edge")
+    if len(group_edges) > 1:
+        lines.append(f"(+{len(group_edges)-1} more on this game)")
+    lines += ["", "Fair value = Pinnacle no-vig. Tracking to close. #Kalshi"]
+    txt = "\n".join(lines)
+    return txt if len(txt) <= 280 else txt[:279] + "…"
+
+
 def _alert_top10(newly_logged: list = None):
     """
     After each scan, alert on newly logged bets + gone-edge follow-ups.
@@ -4206,6 +4239,13 @@ def _alert_top10(newly_logged: list = None):
                 key = _edge_key(e)
                 _alerted_keys.add(key)
             _save_alerted_keys(_alerted_keys, _gone_alerted_keys)
+            # Ready-to-post tweet draft (manual post — never auto-published)
+            if TWEET_DRAFTS_ENABLED:
+                try:
+                    _tw = _format_edge_tweet(group_edges, best)
+                    send_discord(None, f"🐦 **Draft tweet** ({len(_tw)}/280) — review & post manually:\n```\n{_tw}\n```")
+                except Exception as _tw_exc:
+                    print(f"  tweet draft error: {_tw_exc}")
 
     # ── Follow-up: alert when a previously flagged edge is gone ──────────────
     # Fires once per edge when it drops out of the current scan results,

@@ -381,23 +381,24 @@ PERF_BANKROLL        = 1000.0    # bankroll for ROI % display
 # ── Paper trading portfolio ────────────────────────────────────────────────────
 PAPER_START_BALANCE  = 1000.0    # starting virtual bankroll
 PAPER_START_DATE     = "2026-06-08"  # V2.0 reset — pre-throttle + Jun 7 bad-pipeline bets archived
-PAPER_KELLY_FRACTION = 0.25     # quarter-Kelly base fraction
+PAPER_KELLY_FRACTION = 0.25     # quarter-Kelly base fraction (default for all markets)
 PAPER_KELLY_CAP      = 0.03     # max 3% of current balance per bet (validation-phase cap)
-# Per-market Kelly override. MLB totals staked at FULL Kelly (user call
-# 2026-07-26). The 3% cap would otherwise bind and make "full Kelly" meaningless
-# (full Kelly on a few-% edge is 5-12%), so MLB totals also get a looser cap —
-# still a hard disaster ceiling, not truly uncapped. CAUTION: full Kelly assumes
-# the edge estimate is exact; MLB totals is 10-2 but n=12 (unproven), so this is
-# an aggressive bet on a small-sample edge that will likely regress.
-MLB_TOTAL_KELLY_FRACTION = 1.0
-MLB_TOTAL_KELLY_CAP      = 0.20   # 20% disaster ceiling (vs 3% elsewhere)
+# Per-market Kelly override (user calls, 2026-07-29):
+#  • Strikeouts (KXMLBKS) → HALF Kelly. It's the one validated edge (calibrated
+#    +3.1pp, real hold), so size it up 2x vs the base; keeps the 3% disaster cap.
+#  • MLB totals moved BACK to quarter-Kelly (was full Kelly 2026-07-26). The
+#    full-Kelly experiment was an aggressive bet on a small (n≈12) sample; totals
+#    now just use the default, no special case.
+# FORWARD-ONLY: settled bets keep the fraction/cap stamped at placement
+# (kelly_fraction_applied/_cap), so this never re-sizes historical P&L.
+STRIKEOUT_KELLY_FRACTION = 0.50
 
 def _kelly_params(ticker: str):
-    """(fraction, per-bet cap) for a market. MLB totals → full Kelly; else the
-    quarter-Kelly validation defaults. Used by BOTH live staking and the
-    performance-tracker recompute so the two never drift apart."""
-    if (ticker or "").upper().startswith("KXMLBTOTAL"):
-        return MLB_TOTAL_KELLY_FRACTION, MLB_TOTAL_KELLY_CAP
+    """(fraction, per-bet cap) for a market. Strikeouts → half-Kelly (validated
+    edge); everything else (incl MLB totals) → quarter-Kelly defaults. Used by
+    BOTH live staking and the performance-tracker recompute so they never drift."""
+    if (ticker or "").upper().startswith("KXMLBKS"):
+        return STRIKEOUT_KELLY_FRACTION, PAPER_KELLY_CAP
     return PAPER_KELLY_FRACTION, PAPER_KELLY_CAP
 # Total Bases: the 2026-07-07 investigation found the model's win-rate gap vs.
 # expectation concentrates in HIGH raw-edge bets (n=23, gap=-24.3pp, p=0.018) —
@@ -433,11 +434,11 @@ TB_HIGH_EDGE_THRESHOLD = 7.0     # pp, on raw_edge_pct — matches the original 
 # fix, done separately. TB-only; Strikeouts et al. untouched. On the pre-fix 57
 # this ceiling would have shadowed ~68% (39/57) of TB volume.
 TB_CAL_FAIR_CEILING = 0.45       # shadow TB bets with side model-fair >= this (overconfident tail)
-# Aggregate daily gate (on TOP of per-bet Kelly sizing — does not change it).
-# Rejects any new bet that would push today's committed Kelly stake above this
-# fraction of the starting bankroll. Resets at midnight Pacific. Guards against
-# over-exposure on high-volume days when many correctly-sized bets stack up.
-DAILY_EXPOSURE_CAP   = 0.15     # max 15% of bankroll committed per PT day
+# NOTE: the live daily-exposure CAP was removed 2026-07-29 (user call) — it never
+# bound in practice at quarter/half Kelly on a $1k bank. This constant is retained
+# only as (a) the notional ceiling for the WNBA HYPOTHETICAL shadow-P&L sizing and
+# (b) a reference figure in the /api/paper readout. It no longer $0-s any funded bet.
+DAILY_EXPOSURE_CAP   = 0.15
 
 # ── Shadow markets ─────────────────────────────────────────────────────────────
 # Markets listed here are fully tracked (logged, CLV captured, win/loss recorded)
@@ -1932,23 +1933,15 @@ def _add_new_bets(edges: list) -> list:
                 e["edge_pct"], e["kalshi"], _game_time_iso, e.get("ticker", ""),
             ) * _cal_mult, 2)
 
-            # ── Daily aggregate exposure gate (on TOP of per-bet Kelly) ──────
-            # Per-bet sizing above is untouched. If funding this bet would push
-            # today's committed Kelly stake past DAILY_EXPOSURE_CAP of bankroll,
-            # log it at $0 stake and flag it as daily_capped (visible, no P&L).
+            # ── Daily aggregate exposure ─────────────────────────────────────
+            # The 15%-of-bankroll daily CAP was REMOVED 2026-07-29 (user call):
+            # at quarter/half Kelly on a $1k bank, committed exposure never
+            # approaches 15% in practice, so the gate only ever risked silently
+            # $0-ing a legitimate bet. We still TRACK committed exposure for the
+            # dashboard readout — we just never cap a funded bet on it now.
             daily_capped = False
             if not shadow and not is_correlated and paper_stake > 0:
-                if _committed_today + paper_stake > _daily_cap_dollars + 1e-9:
-                    print(
-                        f"  DAILY CAP: {e.get('title','')} {e.get('side','')} "
-                        f"— stake ${paper_stake:.2f} skipped (today "
-                        f"${_committed_today:.2f} + ${paper_stake:.2f} > cap "
-                        f"${_daily_cap_dollars:.2f} = {DAILY_EXPOSURE_CAP:.0%} of bank)"
-                    )
-                    daily_capped = True
-                    paper_stake  = 0.0
-                else:
-                    _committed_today += paper_stake
+                _committed_today += paper_stake
 
             # Pinnacle probability at flag time — the baseline for line-shift detection
             bd = e.get("books_detail", {})
@@ -7582,7 +7575,7 @@ async function fetchPaper() {
       </div>
     </div>
     <div style="padding:6px 12px;border-bottom:1px solid var(--border);background:#0d1117;">
-      <span style="font-size:11px;color:var(--muted);">📊 V2.0 reset Jun 8 2026 ·<strong style="color:var(--text);">props ≥2.5% · games ≥3%</strong> · Quarter-Kelly · 3% max stake · 15% daily cap · CLV captured every 2 min until game start</span>
+      <span style="font-size:11px;color:var(--muted);">📊 V2.0 reset Jun 8 2026 ·<strong style="color:var(--text);">props ≥2.5% · games ≥3%</strong> · Quarter-Kelly (½ on strikeouts) · 3% max stake · CLV captured every 2 min until game start</span>
     </div>`;
 
     // ── Bet table ──────────────────────────────────────────────────────────

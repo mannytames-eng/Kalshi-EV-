@@ -1575,9 +1575,19 @@ def _best_edge_per_game(edges: list) -> list:
         return e.get("edge_pct", e.get("edge", 0) * 100)
 
     def _key(e: dict) -> tuple:
-        if e.get("mkt_type") == "prop":
+        mt = e.get("mkt_type", "")
+        if mt == "prop":
             return ("prop", e.get("matchup", ""))          # one slot per player
-        return (e.get("matchup", ""), e.get("mkt_type", ""), e.get("side", ""))
+        if mt == "moneyline":
+            # 2-way moneyline: a game has TWO Kalshi markets (one per team), and
+            # "back team A" is the SAME position whether expressed as YES on A's
+            # market or NO on B's market. Collapse to ONE slot per game so we never
+            # log the same wager twice. Key on the event code (ticker minus the
+            # -TEAM suffix) — includes the start-time code, so a doubleheader's two
+            # games stay SEPARATE (each can still carry its own moneyline bet).
+            _ev = e.get("ticker", "").rsplit("-", 1)[0]
+            return ("ml", _ev or e.get("matchup", ""))
+        return (e.get("matchup", ""), mt, e.get("side", ""))
 
     best: dict = {}
     for e in edges:
@@ -1710,6 +1720,16 @@ def _add_new_bets(edges: list) -> list:
             if b["status"] == "open"
             and not b.get("shadow") and not _is_shadow(b.get("ticker", ""))
         }
+        # One moneyline bet per GAME, across scan cycles — and INCLUDING shadow
+        # bets (open_slots deliberately excludes shadow, but MLB moneyline is
+        # shadow, so its duplicates would otherwise never be caught cross-cycle).
+        # A game's two team-markets collapse to one event code (ticker minus the
+        # -TEAM suffix); the start-time code keeps a doubleheader's games separate.
+        _open_ml_games = {
+            b.get("ticker", "").rsplit("-", 1)[0]
+            for b in _bets
+            if b.get("status") == "open" and b.get("mkt_type") == "moneyline"
+        }
         # Map each occupied slot to its holder bet(s) so a same-ticker,
         # opposite-side reversal (Pinnacle flipped after the first bet was
         # placed) can demote the stale bet instead of blocking the fresh one.
@@ -1799,6 +1819,21 @@ def _add_new_bets(edges: list) -> list:
                 continue
 
             existing_ids.add(bid)   # prevent same ticker appearing twice in one cycle
+
+            # ── One moneyline bet per game (2-way collapse, cross-cycle) ─────
+            # Skip a moneyline edge if this game already has an open moneyline bet
+            # — even a shadow one. Catches the case where the same position shows
+            # up on the other team's market (YES-on-A vs NO-on-B) in a later scan
+            # cycle, which _best_edge_per_game (single-scan) can't see. Event code
+            # = ticker minus -TEAM suffix; doubleheader games stay separate.
+            if e.get("mkt_type") == "moneyline":
+                _ml_ev = e.get("ticker", "").rsplit("-", 1)[0]
+                if _ml_ev in _open_ml_games:
+                    print(f"  DUP MONEYLINE: {e.get('matchup','')} {e.get('side','')} "
+                          f"{e.get('edge_pct',0):.1f}% — game already has an open "
+                          f"moneyline bet; skipped")
+                    continue
+                _open_ml_games.add(_ml_ev)
 
             game_date = _parse_ticker_date(e.get("ticker", ""))
             if e.get("mkt_type") == "prop":

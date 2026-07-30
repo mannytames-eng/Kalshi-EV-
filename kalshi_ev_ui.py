@@ -1069,6 +1069,22 @@ for _b in _bets:
         _b.pop("correlation_reason", None)
         _data_fixed = True
 
+# Fix: duplicate Braves moneyline (Jul 29) — the ATL@NYM game-1 moneyline was
+# logged twice as the SAME position: YES on the -ATL market (4.5%) and NO on the
+# -NYM market (2.7%). In a 2-way market those are identical ("Braves win"). Dedup
+# missed it (keyed on side, and shadow bets skip the correlation slot); fixed
+# going forward in _best_edge_per_game + _add_new_bets (one moneyline bet per
+# game). Keep the higher-edge ATL-YES; mark the NYM-NO duplicate correlated so it
+# drops out of every count. Both are settled shadow losses — win/loss/PnL frozen,
+# this only de-duplicates the ledger.
+for _b in _bets:
+    if (_b.get("ticker") == "KXMLBGAME-26JUL291310ATLNYM-NYM"
+            and _b.get("side") == "NO" and not _b.get("correlated")):
+        _b["correlated"] = True
+        _b["correlation_reason"] = ("Duplicate of the ATL-YES moneyline on the same 2-way game "
+                                    "(YES-on-ATL == NO-on-NYM); de-duplicated 2026-07-29")
+        _data_fixed = True
+
 # Fix: Jesús Luzardo 7+ Ks (Jul 18) — ticker-encoded game time (20:05 UTC) was
 # a full hour later than the real MLB-scheduled start (19:05 UTC, verified
 # against statsapi.mlb.com's own game feed). The CLV freeze mechanism trusts
@@ -2398,6 +2414,97 @@ def _fetch_wnba_quarter(bet: dict) -> Optional[str]:
     return f"{lab} {ev.get('clock') or ''}".strip()
 
 
+# ── MLB (ESPN) — live score + inning for moneyline bets ──────────────────────
+# Moneyline bets (KXMLBGAME) show a live scoreline + inning just like soccer
+# game lines do, sourced from ESPN's public MLB scoreboard (free, no key, same
+# endpoint live and final). Matched to the bet by team names + game date, with
+# start-time disambiguation for doubleheaders (two events, same teams, same day).
+_mlb_sb_cache: dict = {}   # "YYYYMMDD" → (fetched_ts, events list) — 60s TTL
+
+def _mlb_scoreboard(date_iso: str) -> list:
+    """ESPN MLB scoreboard for a YYYY-MM-DD date, cached 60s. Serves stale cache
+    on fetch failure."""
+    key = date_iso.replace("-", "")
+    now = time.time()
+    hit = _mlb_sb_cache.get(key)
+    if hit and now - hit[0] < 60:
+        return hit[1]
+    try:
+        import urllib.request as _ur
+        url = f"https://site.api.espn.com/apis/site/v2/sports/baseball/mlb/scoreboard?dates={key}"
+        with _ur.urlopen(url, timeout=5) as r:
+            data = json.loads(r.read())
+        events = []
+        for ev in data.get("events", []):
+            comp   = (ev.get("competitions") or [{}])[0]
+            byside = {c.get("homeAway"): c for c in comp.get("competitors", [])}
+            a, h   = byside.get("away", {}), byside.get("home", {})
+            at, ht = (a.get("team") or {}), (h.get("team") or {})
+            st     = ev.get("status", {}) or {}
+            events.append({
+                "away":       at.get("abbreviation", ""),
+                "home":       ht.get("abbreviation", ""),
+                "away_full":  at.get("displayName", ""),
+                "home_full":  ht.get("displayName", ""),
+                "away_score": a.get("score"),
+                "home_score": h.get("score"),
+                "start":      ev.get("date"),
+                "state":      (st.get("type") or {}).get("state", ""),   # pre / in / post
+                "detail":     (st.get("type") or {}).get("shortDetail", ""),
+                "home_logo":  ht.get("logo", ""),
+                "away_logo":  at.get("logo", ""),
+            })
+    except Exception:
+        return hit[1] if hit else []
+    _mlb_sb_cache[key] = (now, events)
+    return events
+
+
+def _lookup_mlb_score(bet: dict):
+    """Live state for an MLB moneyline bet: (scoreline, status, home_logo,
+    away_logo) or None. Matches the bet's matchup ('Away @ Home') to the ESPN
+    MLB scoreboard by team name + date; picks the closest start time so a
+    doubleheader's two games don't collide."""
+    import re
+    def _n(s): return re.sub(r"[^a-z0-9]", "", (s or "").lower())
+    matchup = bet.get("matchup", "")
+    if " @ " not in matchup:
+        return None
+    away_m, home_m = (p.strip() for p in matchup.split(" @ ", 1))
+    game_date = _parse_ticker_date(bet.get("ticker", ""))
+    if not game_date:
+        return None
+    an, hn = _n(away_m), _n(home_m)
+    cands = [ev for ev in _mlb_scoreboard(game_date)
+             if ev["away_full"] and ev["home_full"]
+             and (an in _n(ev["away_full"]) or _n(ev["away_full"]) in an)
+             and (hn in _n(ev["home_full"]) or _n(ev["home_full"]) in hn)]
+    if not cands:
+        return None
+    if len(cands) > 1 and bet.get("game_time"):
+        try:
+            _bt = datetime.fromisoformat(bet["game_time"].replace("Z", "+00:00"))
+            cands.sort(key=lambda ev: abs(
+                (datetime.fromisoformat(ev["start"].replace("Z", "+00:00")) - _bt).total_seconds()
+            ) if ev.get("start") else 9e9)
+        except (ValueError, AttributeError):
+            pass
+    ev = cands[0]
+    as_, hs_ = ev.get("away_score"), ev.get("home_score")
+    aabbr, habbr = ev["away"] or away_m, ev["home"] or home_m
+    score  = f"{aabbr} {as_} – {hs_} {habbr}" if (as_ is not None and hs_ is not None) else None
+    state  = ev.get("state")
+    status = "Final" if state == "post" else (ev.get("detail") if state == "in" else None)
+    if not score and not status:
+        return None   # pregame — nothing live to show yet
+    return (score or "—", status or "", ev.get("home_logo", ""), ev.get("away_logo", ""))
+
+
+def _is_mlb_moneyline_bet(b: dict) -> bool:
+    return (b.get("mkt_type") == "moneyline"
+            and b.get("ticker", "").upper().startswith("KXMLBGAME"))
+
+
 # ── Soccer (ESPN) — live score, match clock, logos for ALL leagues ───────────
 # Generalized over MLS + Argentina + Brazil. The bet's `matchup` is always
 # Pinnacle-canonical team names (scan_soccer sets it from the matched game), so
@@ -2642,7 +2749,7 @@ def _live_stats_loop():
                 for b in _bets:
                     if b.get("status") != "open" or not (
                             b.get("mkt_type") in ("prop", "wnba_prop", "nba_prop")
-                            or _is_soccer_bet(b)):
+                            or _is_soccer_bet(b) or _is_mlb_moneyline_bet(b)):
                         continue
                     gt = b.get("game_time")
                     started = False
@@ -2680,6 +2787,12 @@ def _live_stats_loop():
                         entry["game_final"] = True
                     if entry:
                         fresh[b["id"]] = entry
+                elif _is_mlb_moneyline_bet(b):
+                    # MLB moneyline: live scoreline + inning + logos from ESPN.
+                    st = _lookup_mlb_score(b)
+                    if st:
+                        fresh[b["id"]] = {"stat": st[0], "inning": st[1],
+                                          "home_logo": st[2], "away_logo": st[3]}
                 else:
                     r = _lookup_box_stat(b)
                     inning = _fetch_game_inning(b)

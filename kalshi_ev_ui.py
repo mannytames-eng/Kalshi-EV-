@@ -7803,6 +7803,12 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 key_src = "key file on disk (no env var set)"
 
+            # Diagnostic: is KALSHI_API_KEY actually reaching the app, and under
+            # what name? Show NAMES only (never values) of Kalshi-related vars.
+            api_key_set = "KALSHI_API_KEY" in os.environ and bool(os.environ["KALSHI_API_KEY"].strip())
+            kalshi_var_names = sorted(n for n in os.environ if "KALSHI" in n.upper())
+            names_str = ", ".join(f"<code>{n}</code>" for n in kalshi_var_names) or "(none found)"
+
             ok, big, detail = False, "❌ NOT WORKING", ""
             try:
                 r = _rq.get(KALSHI_BASE + "/portfolio/balance",
@@ -7834,7 +7840,9 @@ class Handler(BaseHTTPRequestHandler):
   <hr style="border:none;border-top:1px solid #ddd;margin:24px 0">
   <p style="font-size:14px;color:#555">
     API key ID in use: <code>{kid_masked}</code><br>
-    Private key source: <code>{key_src}</code>
+    Private key source: <code>{key_src}</code><br>
+    <code>KALSHI_API_KEY</code> received by app: <b style="color:{'#137333' if api_key_set else '#c5221f'}">{'YES' if api_key_set else 'NO — app is using the built-in default'}</b><br>
+    Kalshi-related variables the app can see: {names_str}
   </p>
   <p style="font-size:13px;color:#888">Reload this page after changing Railway variables and redeploying.</p>
 </div>"""

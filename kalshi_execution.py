@@ -62,6 +62,15 @@ DRY_RUN           = _env_bool("KALSHI_EXECUTION_DRY_RUN", True)
 MAX_POSITION_FRAC = 0.03    # ≤3% of bankroll per single position
 MAX_DAILY_FRAC    = 0.15    # ≤15% of bankroll committed across a calendar day (PT)
 
+# Go-live SCOPE: only these Kalshi series prefixes may execute. Strikeouts-only
+# for the initial live phase — it's the one calibrated/confirmed edge. Any other
+# non-shadow bet fed in is skipped, never ordered. Empty list = allow all markets.
+MARKET_ALLOWLIST  = ["KXMLBKS"]
+# Multiplier on the scanner's Kelly-stamped stake (half-Kelly for strikeouts).
+# 1.0 = full half-Kelly as sized by the scanner. Dial DOWN to ramp in more slowly
+# (e.g. 0.5 → quarter-Kelly-effective) and raise as realized live P&L confirms.
+LIVE_SIZE_FRACTION = 1.0
+
 MIN_CONTRACTS     = 1       # skip if Kelly size rounds to <1 contract
 FILL_POLL_TRIES   = 6       # times to poll order status before giving up
 FILL_POLL_SLEEP   = 1.0     # seconds between fill-status polls
@@ -183,10 +192,13 @@ def already_attempted(bet_id: str) -> bool:
 
 # ── Order construction / fill verification ────────────────────────────────────
 def _order_size(bet: dict, price: float) -> Tuple[int, float]:
-    """(count, cost_dollars) from the scanner's Kelly-sized paper_stake. paper_stake
-    already encodes the sizing policy (quarter-Kelly base, half on strikeouts) and
-    the 3% cap — this module does not re-derive Kelly, it just converts $ → contracts."""
-    stake = float(bet.get("paper_stake") or 0.0)
+    """(count, cost_dollars). Live stake = the scanner's Kelly-stamped paper_stake
+    (half-Kelly for strikeouts) × LIVE_SIZE_FRACTION. Anchored to the paper bankroll
+    the track record was built on — i.e. ≈ the same unit that's been working manually
+    — so go-live REPLICATES the proven sizing rather than auto-scaling up to a larger
+    real balance. The 3%-of-real-balance cap in pre_trade_checks still ceilings it
+    (and correctly shrinks it on a small account). Ramp via LIVE_SIZE_FRACTION."""
+    stake = float(bet.get("paper_stake") or 0.0) * LIVE_SIZE_FRACTION
     if price <= 0:
         return 0, 0.0
     count = int(stake // price)          # each contract costs `price` dollars
@@ -235,6 +247,9 @@ def pre_trade_checks(bet: dict, bankroll: float, daily_committed: float,
         return False, "kill switch engaged (EXECUTION_ENABLED=False)"
     if bet.get("shadow"):
         return False, "shadow bet — not a real position"           # spec #1
+    if MARKET_ALLOWLIST and not any(
+            (bet.get("ticker", "") or "").upper().startswith(p) for p in MARKET_ALLOWLIST):
+        return False, f"market not in allowlist {MARKET_ALLOWLIST}"
     if bet.get("correlated") or bet.get("daily_capped"):
         return False, "correlated / capped bet — excluded"
     if count < MIN_CONTRACTS:
@@ -337,6 +352,9 @@ def execute_flagged_bets(bets: list, bankroll: Optional[float] = None) -> list:
             continue
         if b.get("shadow"):                       # spec #1 — real positions only
             continue
+        if MARKET_ALLOWLIST and not any(          # go-live scope: strikeouts only
+                (b.get("ticker", "") or "").upper().startswith(p) for p in MARKET_ALLOWLIST):
+            continue                              # silent skip (not a rejection to log)
         if already_attempted(b.get("id", "")):
             continue
         rec = place_order_for_bet(b, bankroll, daily)
@@ -352,6 +370,7 @@ if __name__ == "__main__":
     print("kalshi_execution config:")
     print(f"  EXECUTION_ENABLED = {EXECUTION_ENABLED}  (kill switch; must be True to trade)")
     print(f"  DRY_RUN           = {DRY_RUN}  (must be False to submit real orders)")
+    print(f"  MARKET_ALLOWLIST  = {MARKET_ALLOWLIST}   LIVE_SIZE_FRACTION = {LIVE_SIZE_FRACTION}")
     print(f"  MAX_POSITION_FRAC = {MAX_POSITION_FRAC:.0%}   MAX_DAILY_FRAC = {MAX_DAILY_FRAC:.0%}")
     print(f"  log → {EXECUTION_LOG_FILE}")
     if EXECUTION_ENABLED and not DRY_RUN:

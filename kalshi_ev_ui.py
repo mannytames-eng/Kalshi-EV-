@@ -7787,6 +7787,61 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, "application/json", b'{"ok":true}')
             return
 
+        if path == "/authcheck":
+            # Human-readable Kalshi auth verifier — open in a browser, no terminal.
+            # Signs a real /portfolio/balance request and reports the result.
+            # Never prints the private key; the key ID is masked.
+            import requests as _rq
+            from kalshi_ev_scanner import KALSHI_BASE, _sign_headers, KALSHI_API_KEY
+
+            kid = KALSHI_API_KEY or ""
+            kid_masked = (kid[:8] + "…" + kid[-4:]) if len(kid) > 12 else (kid or "(unset)")
+            if os.environ.get("KALSHI_PRIVATE_KEY"):
+                key_src = "KALSHI_PRIVATE_KEY (raw PEM env var)"
+            elif os.environ.get("KALSHI_PRIVKEY_B64"):
+                key_src = "KALSHI_PRIVKEY_B64 (base64 env var)"
+            else:
+                key_src = "key file on disk (no env var set)"
+
+            ok, big, detail = False, "❌ NOT WORKING", ""
+            try:
+                r = _rq.get(KALSHI_BASE + "/portfolio/balance",
+                            headers=_sign_headers("GET", "/portfolio/balance"), timeout=15)
+                if r.status_code == 200:
+                    bal = r.json().get("balance")
+                    ok, big = True, "✅ WORKING"
+                    detail = (f"Kalshi authenticated successfully. Account balance: "
+                              f"<b>${bal/100:,.2f}</b>" if bal is not None
+                              else "Authenticated (200) but no balance field returned.")
+                elif r.status_code in (401, 403):
+                    detail = (f"Kalshi rejected the signature (HTTP {r.status_code}). This almost "
+                              "always means the API key ID and the private key are from "
+                              "<b>different</b> Kalshi keys — they must be the matching pair created "
+                              "together. Double-check that KALSHI_API_KEY is the new key's ID and "
+                              "KALSHI_PRIVATE_KEY is that same key's downloaded PEM.")
+                else:
+                    detail = f"Unexpected HTTP {r.status_code} from Kalshi: {r.text[:300]}"
+            except Exception as exc:
+                detail = f"Could not complete the request: {type(exc).__name__}: {exc}"
+
+            color = "#137333" if ok else "#c5221f"
+            html = f"""<!doctype html><meta charset=utf-8>
+<meta name=viewport content="width=device-width, initial-scale=1">
+<title>Kalshi auth check</title>
+<div style="font-family:system-ui,sans-serif;max-width:640px;margin:8vh auto;padding:0 20px;line-height:1.5">
+  <div style="font-size:44px;font-weight:700;color:{color};margin-bottom:12px">{big}</div>
+  <p style="font-size:17px;color:#222">{detail}</p>
+  <hr style="border:none;border-top:1px solid #ddd;margin:24px 0">
+  <p style="font-size:14px;color:#555">
+    API key ID in use: <code>{kid_masked}</code><br>
+    Private key source: <code>{key_src}</code>
+  </p>
+  <p style="font-size:13px;color:#888">Reload this page after changing Railway variables and redeploying.</p>
+</div>"""
+            self._send(200, "text/html; charset=utf-8", html.encode(),
+                       {"Cache-Control": "no-store"})
+            return
+
         if path == "/":
             # Force-bust browser cache: redirect bare / to /?v=<timestamp>
             from urllib.parse import urlparse, parse_qs

@@ -18,16 +18,16 @@ once before arming anything.
 | `KALSHI_EXECUTION_APPROVAL_REQUIRED` | `1` (on) | `1` = each order waits for your explicit `--approve`. `0` = fully autonomous. |
 
 Hard limits always on: **strikeouts only** (`KXMLBKS`), the scanner's stake
-placed **as-is** (no %-of-funds cap — user call 2026-07-31), an absolute
-per-bet **$ sanity ceiling** (`KALSHI_MAX_POSITION_DOLLARS`, default $50) + an
-optional absolute **daily $ ceiling** (`KALSHI_MAX_DAILY_DOLLARS`, default off) +
-an insufficient-balance guard, fill verification, full logging, Discord alert on
+placed **as-is** (no %-of-funds cap — user call 2026-07-31), an absolute per-bet
+**$ ceiling** (`KALSHI_MAX_POSITION_DOLLARS`, default $50) + an absolute **daily
+$ circuit breaker** (`KALSHI_MAX_DAILY_DOLLARS`, default **$200/day**) + an
+insufficient-balance guard, fill verification, full logging, Discord alert on
 every fill/failure.
 
 > ⚠ Fixed-dollar sizing on a sub-$1000 account is **not** Kelly-of-your-bankroll
 > — a $12–28 bet is a large fraction of a small balance, so variance and ruin
-> risk are higher than the paper track implies. Consider setting
-> `KALSHI_MAX_DAILY_DOLLARS` to a real number as a circuit breaker.
+> risk are higher than the paper track implies. The **$200/day** ceiling is your
+> circuit breaker; lower it if you fund light.
 
 Nothing trades until: `ENABLED=1` **and** `DRY_RUN=0` **and** a runner calls the
 module **and** valid trading credentials are set.
@@ -60,31 +60,57 @@ Kalshi API docs:
 
 ---
 
-## 3. The runner (the piece that makes it act "by itself")
+## 3. The runner (`run_executor.py` — the piece that makes it act "by itself")
 
-The module is a library — something has to call it on a loop. Run this as a
-**separate process** from the scanner (a second Railway worker, or locally).
-A bug here still can't touch flagging.
+`run_executor.py` is committed. It reads the flagged bets, calls
+`execute_flagged_bets` + `process_approved_orders` every `EXECUTOR_INTERVAL_SEC`
+(default 60), and self-gates on the switches — inert until armed. Run it as its
+**own process, separate from the scanner** (a bug here still can't touch flagging).
 
-```python
-# run_executor.py — standalone runner (separate process from the scanner)
-import json, time
-from kalshi_execution import execute_flagged_bets, process_approved_orders
+Locally: `python run_executor.py` (set `BETS_FILE=./ev_bets.json`).
 
-BETS_FILE = "/data/ev_bets.json"   # Railway; locally: ./ev_bets.json
+### Deploy as a separate Railway worker
 
-while True:
-    try:
-        bets = json.load(open(BETS_FILE))
-        execute_flagged_bets(bets)      # approval mode: queues + alerts. autonomous: places.
-        process_approved_orders()        # places APPROVED, unexpired orders; expires stale
-    except Exception as e:
-        print(f"[runner] error: {e}")
-    time.sleep(60)
-```
+1. **New service** in the same Railway project, same GitHub repo (`main`).
+2. **Start command:** `python run_executor.py`
+3. **Attach a Volume** to this service and set `DATA_DIR` to its mount path (e.g.
+   `/data`). The worker is a *separate* service, so it does **not** share the
+   scanner's volume — it needs its own for `execution_log.jsonl` (audit +
+   daily-total tracking) and `pending_orders.json` (approval queue) to survive
+   restarts. Without a volume those are ephemeral: the daily-$ tracker resets on
+   restart and pending approvals are lost.
+4. **Bets source — use HTTP, not the file.** Since the worker can't see the
+   scanner's `/data/ev_bets.json`, set:
+   ```
+   BETS_URL = https://evscanner-production.up.railway.app/api/today_edges
+   ```
+   (That endpoint returns the open positions with `paper_stake`, `shadow`,
+   `ticker`, `side`, `id` — everything the executor needs.)
+5. **Env vars on the worker service:**
+   ```
+   KALSHI_API_KEY        = <trading key ID>          # same key as the scanner
+   KALSHI_PRIVATE_KEY    = <raw PEM>                 # (or KALSHI_PRIVKEY_B64)
+   DISCORD_WEBHOOK       = <your webhook>            # fill/approval alerts
+   BETS_URL              = https://evscanner-production.up.railway.app/api/today_edges
+   DATA_DIR              = /data                     # the attached volume mount
 
-Run: `python run_executor.py`. It self-gates on the switches above, so it's
-harmless until you arm it.
+   # switches — START INERT, arm later per the go-live sequence
+   KALSHI_EXECUTION_ENABLED           = 0            # kill switch (0 = off)
+   KALSHI_EXECUTION_DRY_RUN           = 1            # 1 = simulate only
+   KALSHI_EXECUTION_APPROVAL_REQUIRED = 1            # 1 = approve each order
+
+   # risk (absolute $, not % of funds)
+   KALSHI_MAX_POSITION_DOLLARS = 50                  # per-bet ceiling (bug guard)
+   KALSHI_MAX_DAILY_DOLLARS    = 200                 # daily circuit breaker
+   EXECUTOR_INTERVAL_SEC       = 60
+   ```
+6. Deploy. Logs should print `[runner] start … NOTE: inert config …` until armed.
+
+> **Approving orders on a Railway worker** (approval-gated phase): the approve
+> CLI must run in the worker's environment (same volume/pending file):
+> `railway run --service <worker> python kalshi_execution.py --approve <bet_id>`
+> (or use the service's shell). Fully autonomous mode (`APPROVAL_REQUIRED=0`)
+> needs no approvals.
 
 ---
 

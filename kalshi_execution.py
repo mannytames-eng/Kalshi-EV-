@@ -68,11 +68,12 @@ APPROVAL_TTL_MIN  = 20   # a queued order EXPIRES (never fires) if not approved 
 # the order is placed at the scanner's stake as-is, NOT scaled/capped to account
 # size. What remains are ABSOLUTE-DOLLAR guards (not % of funds): a per-bet sanity
 # ceiling (catches a runaway sizing bug — set well above the scanner's ~$28 max),
-# and an OPTIONAL daily circuit breaker (default 0 = off). Env-overridable.
+# and a daily circuit breaker (default $200/day — max total committed per PT day).
+# Env-overridable; set either to 0 to disable.
 # ⚠ Fixed-dollar sizing on a small account is NOT Kelly-of-your-bankroll — it's a
 # larger fraction, with higher variance/ruin risk. The daily cap is your friend.
-MAX_POSITION_DOLLARS = float(os.environ.get("KALSHI_MAX_POSITION_DOLLARS", "50"))  # abs $/bet ceiling; 0 = off
-MAX_DAILY_DOLLARS    = float(os.environ.get("KALSHI_MAX_DAILY_DOLLARS", "0"))      # abs $/day ceiling; 0 = off
+MAX_POSITION_DOLLARS = float(os.environ.get("KALSHI_MAX_POSITION_DOLLARS", "50"))   # abs $/bet ceiling; 0 = off
+MAX_DAILY_DOLLARS    = float(os.environ.get("KALSHI_MAX_DAILY_DOLLARS", "200"))     # abs $/day circuit breaker (user 2026-07-31); 0 = off
 
 # Go-live SCOPE: only these Kalshi series prefixes may execute. Strikeouts-only
 # for the initial live phase — it's the one calibrated/confirmed edge. Any other

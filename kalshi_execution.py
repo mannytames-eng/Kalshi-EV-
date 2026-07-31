@@ -55,6 +55,12 @@ def _env_bool(name: str, default: bool) -> bool:
 EXECUTION_ENABLED = _env_bool("KALSHI_EXECUTION_ENABLED", False)
 # DRY_RUN — default ON. Even when enabled, simulate/log the order but submit none.
 DRY_RUN           = _env_bool("KALSHI_EXECUTION_DRY_RUN", True)
+# APPROVAL_REQUIRED — when live (armed + not dry-run), do NOT place automatically:
+# queue each order for explicit human approval (Discord alert + approve()/CLI), and
+# place only the approved ones via process_approved_orders(). Recommended ON for the
+# first weeks of real money. False = fully autonomous placement, no per-order sign-off.
+APPROVAL_REQUIRED = _env_bool("KALSHI_EXECUTION_APPROVAL_REQUIRED", True)
+APPROVAL_TTL_MIN  = 20   # a queued order EXPIRES (never fires) if not approved in time
 
 # Hard pre-trade risk limits (independent safety net on TOP of the scanner's
 # Kelly sizing — a circuit breaker, not a resizer; an order that breaches these
@@ -75,10 +81,9 @@ MIN_CONTRACTS     = 1       # skip if Kelly size rounds to <1 contract
 FILL_POLL_TRIES   = 6       # times to poll order status before giving up
 FILL_POLL_SLEEP   = 1.0     # seconds between fill-status polls
 
-EXECUTION_LOG_FILE = os.path.join(
-    os.environ.get("DATA_DIR", os.path.dirname(os.path.abspath(__file__))),
-    "execution_log.jsonl",
-)
+_DATA_DIR = os.environ.get("DATA_DIR", os.path.dirname(os.path.abspath(__file__)))
+EXECUTION_LOG_FILE = os.path.join(_DATA_DIR, "execution_log.jsonl")
+PENDING_FILE       = os.path.join(_DATA_DIR, "pending_orders.json")  # awaiting-approval queue
 _DISCORD_WEBHOOK = os.environ.get("DISCORD_WEBHOOK", "")
 
 
@@ -135,11 +140,12 @@ def _log_attempt(record: dict) -> None:
           f"— {record.get('detail','')}")
 
 
-def _alert(title: str, detail: str, ok: bool) -> None:
-    """Fire a Discord alert on every fill and every failure (spec #6)."""
+def _alert(title: str, detail: str, ok) -> None:
+    """Fire a Discord alert on every fill and every failure (spec #6). ok=None →
+    neutral (an approval request, neither success nor failure)."""
     if not _DISCORD_WEBHOOK:
         return
-    emoji = "✅" if ok else "🛑"
+    emoji = "⏳" if ok is None else ("✅" if ok else "🛑")
     try:
         requests.post(_DISCORD_WEBHOOK, json={
             "content": f"{emoji} **[EXECUTION] {title}**\n{detail}",
@@ -187,6 +193,83 @@ def already_attempted(bet_id: str) -> bool:
                     return True
     except FileNotFoundError:
         pass
+    return False
+
+
+# ── Pending-approval queue (human-in-the-loop) ────────────────────────────────
+def _load_pending() -> dict:
+    try:
+        with open(PENDING_FILE) as f:
+            return json.load(f)
+    except (FileNotFoundError, ValueError):
+        return {}
+
+def _save_pending(d: dict) -> None:
+    import tempfile
+    fd, tmp = tempfile.mkstemp(dir=_DATA_DIR, suffix=".tmp")
+    with os.fdopen(fd, "w") as f:
+        json.dump(d, f, indent=1)
+    os.replace(tmp, PENDING_FILE)
+
+def is_pending(bet_id: str) -> bool:
+    return bet_id in _load_pending()
+
+def _queue_pending(bet: dict, count: int, price: float, cost: float, client_order_id: str) -> None:
+    """Record an order awaiting human approval — a snapshot with just what's needed
+    to place it later (never the live account, never keys)."""
+    p = _load_pending()
+    p[bet.get("id", "")] = {
+        "bet_id": bet.get("id"), "ticker": bet.get("ticker"), "side": bet.get("side"),
+        "price": price, "count": count, "cost_dollars": cost,
+        "kalshi_price": price, "paper_stake": bet.get("paper_stake"),
+        "game_time": bet.get("game_time"), "client_order_id": client_order_id,
+        "created": _now_iso(), "approved": False,
+    }
+    _save_pending(p)
+
+def _expired(rec: dict) -> bool:
+    from datetime import timedelta
+    try:
+        created = datetime.fromisoformat(rec["created"])
+    except (KeyError, ValueError):
+        return True
+    if datetime.now(timezone.utc) - created > timedelta(minutes=APPROVAL_TTL_MIN):
+        return True
+    gt = rec.get("game_time")   # also expire if the game has already started
+    if gt:
+        try:
+            if datetime.fromisoformat(gt.replace("Z", "+00:00")) <= datetime.now(timezone.utc):
+                return True
+        except (ValueError, AttributeError):
+            pass
+    return False
+
+def list_pending() -> list:
+    return [{"bet_id": k, **v} for k, v in _load_pending().items()]
+
+def approve(bet_id: str) -> bool:
+    p = _load_pending()
+    if bet_id in p:
+        p[bet_id]["approved"] = True
+        _save_pending(p)
+        return True
+    return False
+
+def approve_all() -> int:
+    p = _load_pending(); n = 0
+    for k in p:
+        if not p[k].get("approved"):
+            p[k]["approved"] = True; n += 1
+    _save_pending(p)
+    return n
+
+def reject(bet_id: str) -> bool:
+    p = _load_pending()
+    if bet_id in p:
+        del p[bet_id]
+        _save_pending(p)
+        _log_attempt({"bet_id": bet_id, "outcome": "REJECTED_USER", "detail": "manually rejected"})
+        return True
     return False
 
 
@@ -293,7 +376,27 @@ def place_order_for_bet(bet: dict, bankroll: float, daily_committed: float) -> d
         _log_attempt(rec)
         return rec
 
-    # ── LIVE submit ──────────────────────────────────────────────────────────
+    if APPROVAL_REQUIRED:
+        # Human-in-the-loop: queue the order + alert; place nothing until approved.
+        _queue_pending(bet, count, price, cost, client_order_id)
+        rec = {**base, "outcome": "PENDING_APPROVAL", "client_order_id": client_order_id,
+               "detail": f"awaiting approval: BUY {count} {bet.get('side')} @ {int(price*100)}c (${cost:.2f})"}
+        _log_attempt(rec)
+        _alert("APPROVAL NEEDED",
+               f"`{bet.get('ticker')}` {bet.get('side')} — BUY {count} @ {int(price*100)}c "
+               f"(${cost:.2f})\nApprove within {APPROVAL_TTL_MIN}m: `--approve {bet_id}`  "
+               f"(reject: `--reject {bet_id}`)", ok=None)
+        return rec
+
+    # Fully autonomous — submit immediately.
+    return _submit_and_verify(bet, count, price, cost, base, client_order_id)
+
+
+def _submit_and_verify(bet: dict, count: int, price: float, cost: float,
+                       base: dict, client_order_id: str) -> dict:
+    """Actually place the order and verify its REAL fill (spec #4). Shared by the
+    autonomous path and the approved-order path. NEVER assumes the submit 200
+    means filled — a resting/canceled order fills nothing."""
     body = _build_order_body(bet, count, price, client_order_id)
     try:
         code, resp = kalshi_post("/portfolio/orders", body)
@@ -311,8 +414,6 @@ def place_order_for_bet(bet: dict, bankroll: float, daily_committed: float) -> d
         return rec
 
     order_id = (resp.get("order") or {}).get("order_id") or resp.get("order_id")
-
-    # ── Verify the ACTUAL fill (spec #4) — never assume the 200 filled it ─────
     status, filled = verify_fill(order_id) if order_id else ("unknown", 0)
     filled_cost = round(filled * price, 2)
 
@@ -338,6 +439,53 @@ def place_order_for_bet(bet: dict, bankroll: float, daily_committed: float) -> d
     return rec
 
 
+def process_approved_orders(bankroll: Optional[float] = None) -> list:
+    """Place every APPROVED, unexpired pending order (re-checking risk against a
+    FRESH bankroll + daily total at placement time), expire the stale ones, and
+    leave un-approved ones queued. The runner calls this each sweep alongside
+    execute_flagged_bets. No-op unless live (armed + not dry-run)."""
+    if DRY_RUN or not EXECUTION_ENABLED:
+        return []
+    if bankroll is None:
+        bankroll = fetch_bankroll_dollars()
+    daily = committed_today_dollars()
+    pending = _load_pending()
+    results, remove = [], []
+    for bet_id, rec in list(pending.items()):
+        if _expired(rec):
+            remove.append(bet_id)
+            _log_attempt({**rec, "outcome": "EXPIRED",
+                          "detail": f"not approved within {APPROVAL_TTL_MIN}m / game started"})
+            _alert("EXPIRED (not placed)", f"`{rec.get('ticker')}` {rec.get('side')} — "
+                   f"approval window passed", ok=False)
+            continue
+        if not rec.get("approved"):
+            continue
+        count = int(rec["count"]); price = float(rec["price"]); cost = float(rec["cost_dollars"])
+        # Re-run the risk gate at PLACEMENT time (bankroll/daily may have changed).
+        ok, reason = pre_trade_checks(rec, bankroll, daily, count, cost)
+        if not ok:
+            remove.append(bet_id)
+            r = {**rec, "outcome": "REJECTED_RISK", "detail": f"at placement: {reason}"}
+            _log_attempt(r); results.append(r)
+            _alert("Order REJECTED at placement", f"`{rec.get('ticker')}` — {reason}", ok=False)
+            continue
+        base = {"bet_id": bet_id, "ticker": rec.get("ticker"), "side": rec.get("side"),
+                "price": price, "count": count, "cost_dollars": cost,
+                "pt_day": _pt_today(), "dry_run": False, "bankroll": bankroll}
+        r = _submit_and_verify(rec, count, price, cost, base, rec.get("client_order_id", f"exec-{bet_id}"))
+        results.append(r)
+        remove.append(bet_id)
+        if r.get("outcome") == "FILLED":
+            daily += float(r.get("cost_dollars") or 0.0)
+    if remove:
+        p = _load_pending()
+        for k in remove:
+            p.pop(k, None)
+        _save_pending(p)
+    return results
+
+
 def execute_flagged_bets(bets: list, bankroll: Optional[float] = None) -> list:
     """Entry point: place orders for eligible flagged bets. Filters to real
     (non-shadow), open, not-already-attempted positions. Reads the running daily
@@ -357,6 +505,8 @@ def execute_flagged_bets(bets: list, bankroll: Optional[float] = None) -> list:
             continue                              # silent skip (not a rejection to log)
         if already_attempted(b.get("id", "")):
             continue
+        if is_pending(b.get("id", "")):           # already queued & awaiting approval
+            continue
         rec = place_order_for_bet(b, bankroll, daily)
         results.append(rec)
         if rec.get("outcome") == "FILLED":
@@ -364,16 +514,51 @@ def execute_flagged_bets(bets: list, bankroll: Optional[float] = None) -> list:
     return results
 
 
-if __name__ == "__main__":
-    # Self-check only — prints config, never trades. Real use: import
-    # execute_flagged_bets and feed it the scanner's flagged bets.
+def _print_config():
     print("kalshi_execution config:")
     print(f"  EXECUTION_ENABLED = {EXECUTION_ENABLED}  (kill switch; must be True to trade)")
     print(f"  DRY_RUN           = {DRY_RUN}  (must be False to submit real orders)")
+    print(f"  APPROVAL_REQUIRED = {APPROVAL_REQUIRED}  (True → each order waits for --approve)")
     print(f"  MARKET_ALLOWLIST  = {MARKET_ALLOWLIST}   LIVE_SIZE_FRACTION = {LIVE_SIZE_FRACTION}")
     print(f"  MAX_POSITION_FRAC = {MAX_POSITION_FRAC:.0%}   MAX_DAILY_FRAC = {MAX_DAILY_FRAC:.0%}")
     print(f"  log → {EXECUTION_LOG_FILE}")
     if EXECUTION_ENABLED and not DRY_RUN:
-        print("  ⚠ LIVE MODE ARMED — this will place REAL orders when fed flagged bets.")
+        mode = "APPROVAL-GATED" if APPROVAL_REQUIRED else "FULLY AUTONOMOUS"
+        print(f"  ⚠ LIVE MODE ARMED ({mode}) — real orders when fed flagged bets.")
     else:
         print("  ✓ inert (no real orders will be placed in this configuration).")
+
+
+if __name__ == "__main__":
+    # CLI for the approval workflow. NEVER places an order by itself except
+    # --process (which places APPROVED, unexpired orders — and only when live).
+    import argparse
+    ap = argparse.ArgumentParser(description="Kalshi execution — approval workflow CLI")
+    ap.add_argument("--list-pending", action="store_true", help="show orders awaiting approval")
+    ap.add_argument("--approve", metavar="BET_ID", help="approve one queued order")
+    ap.add_argument("--approve-all", action="store_true", help="approve all queued orders")
+    ap.add_argument("--reject", metavar="BET_ID", help="reject/remove one queued order")
+    ap.add_argument("--process", action="store_true",
+                    help="place APPROVED unexpired orders (live only) + expire stale ones")
+    a = ap.parse_args()
+
+    if a.list_pending:
+        p = list_pending()
+        if not p:
+            print("no pending orders.")
+        for r in p:
+            print(f"  [{'APPROVED' if r.get('approved') else 'pending '}] {r['bet_id']}  "
+                  f"{r.get('side')} x{r.get('count')} @ {int(float(r.get('price',0))*100)}c "
+                  f"(${r.get('cost_dollars')})  created {r.get('created')}")
+    elif a.approve:
+        print("approved." if approve(a.approve) else "not found in queue.")
+    elif a.approve_all:
+        print(f"approved {approve_all()} order(s).")
+    elif a.reject:
+        print("rejected." if reject(a.reject) else "not found in queue.")
+    elif a.process:
+        res = process_approved_orders()
+        print(f"processed {len(res)} order(s): {[r.get('outcome') for r in res]}"
+              if res else "nothing to place (none approved/live, or inert).")
+    else:
+        _print_config()

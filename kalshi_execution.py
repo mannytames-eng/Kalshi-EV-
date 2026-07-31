@@ -37,8 +37,7 @@ from __future__ import annotations
 import json
 import os
 import time
-import uuid
-from datetime import datetime, timezone, date
+from datetime import datetime, timezone
 from typing import Optional, Tuple
 
 import requests
@@ -103,8 +102,8 @@ def kalshi_post(path: str, body: dict, _timeout: int = 15) -> Tuple[int, dict]:
     """Signed POST to the Kalshi trading API. Returns (status_code, json)."""
     r = requests.post(
         KALSHI_BASE + path,
-        headers={**_sign_headers("POST", path), "Content-Type": "application/json",
-                 "KALSHI-ACCESS-KEY": os.environ.get("KALSHI_API_KEY", "")},
+        # _sign_headers already sets KALSHI-ACCESS-KEY/-TIMESTAMP/-SIGNATURE.
+        headers={**_sign_headers("POST", path), "Content-Type": "application/json"},
         data=json.dumps(body),
         timeout=_timeout,
     )
@@ -163,13 +162,19 @@ def _alert(title: str, detail: str, ok) -> None:
 
 # ── Daily exposure tracking (from the execution log — real committed $, PT day) ─
 def _pt_today() -> str:
-    # Pacific calendar day (UTC-7/-8; -7 is fine as a coarse day boundary here).
-    from datetime import timedelta
-    return (datetime.now(timezone.utc) - timedelta(hours=7)).strftime("%Y-%m-%d")
+    """Pacific calendar day, DST-correct. Falls back to a UTC-8 approximation only
+    if the tz database is unavailable."""
+    try:
+        from zoneinfo import ZoneInfo
+        return datetime.now(ZoneInfo("America/Los_Angeles")).strftime("%Y-%m-%d")
+    except Exception:
+        from datetime import timedelta
+        return (datetime.now(timezone.utc) - timedelta(hours=8)).strftime("%Y-%m-%d")
 
 def committed_today_dollars() -> float:
     """Sum of actually-committed order cost for the current PT day, read back
-    from the execution log so it survives restarts and reflects reality."""
+    from the execution log so it survives restarts and reflects reality. Counts
+    both FILLED and PARTIAL fills (both put real money at risk)."""
     today = _pt_today()
     total = 0.0
     try:
@@ -179,7 +184,7 @@ def committed_today_dollars() -> float:
                     rec = json.loads(line)
                 except Exception:
                     continue
-                if rec.get("outcome") == "FILLED" and rec.get("pt_day") == today:
+                if rec.get("outcome") in ("FILLED", "PARTIAL") and rec.get("pt_day") == today:
                     total += float(rec.get("cost_dollars") or 0.0)
     except FileNotFoundError:
         pass
@@ -196,7 +201,10 @@ def already_attempted(bet_id: str) -> bool:
                 except Exception:
                     continue
                 if rec.get("bet_id") == bet_id and rec.get("outcome") in (
-                        "FILLED", "PARTIAL", "SUBMIT_ERROR", "REJECTED_RISK"):
+                        "FILLED", "PARTIAL", "SUBMIT_ERROR", "REJECTED_RISK",
+                        "NO_FILL", "SUBMITTED_UNVERIFIED"):
+                    # NO_FILL / SUBMITTED_UNVERIFIED are terminal: an order was
+                    # already POSTed, so never re-submit (would risk a double).
                     return True
     except FileNotFoundError:
         pass
@@ -285,9 +293,10 @@ def _order_size(bet: dict, price: float) -> Tuple[int, float]:
     """(count, cost_dollars). Live stake = the scanner's Kelly-stamped paper_stake
     (half-Kelly for strikeouts) × LIVE_SIZE_FRACTION. Anchored to the paper bankroll
     the track record was built on — i.e. ≈ the same unit that's been working manually
-    — so go-live REPLICATES the proven sizing rather than auto-scaling up to a larger
-    real balance. The 3%-of-real-balance cap in pre_trade_checks still ceilings it
-    (and correctly shrinks it on a small account). Ramp via LIVE_SIZE_FRACTION."""
+    — so go-live REPLICATES the proven sizing rather than auto-scaling to real balance.
+    NOTE: the %-of-balance cap was removed (2026-07-31) — the stake is placed as-is,
+    guarded only by the absolute per-bet $ ceiling + insufficient-balance check in
+    pre_trade_checks. Ramp via LIVE_SIZE_FRACTION."""
     stake = float(bet.get("paper_stake") or 0.0) * LIVE_SIZE_FRACTION
     if price <= 0:
         return 0, 0.0
@@ -423,7 +432,21 @@ def _submit_and_verify(bet: dict, count: int, price: float, cost: float,
         return rec
 
     order_id = (resp.get("order") or {}).get("order_id") or resp.get("order_id")
-    status, filled = verify_fill(order_id) if order_id else ("unknown", 0)
+
+    # The POST succeeded — an order is now LIVE on Kalshi. If the fill-check itself
+    # errors (network), we must NOT let the exception escape: that would leave the
+    # order placed but unlogged, and the next sweep would re-submit it. Record a
+    # TERMINAL "unverified" outcome + alert so it's never re-tried and you reconcile.
+    try:
+        status, filled = verify_fill(order_id) if order_id else ("unknown", 0)
+    except Exception as exc:
+        rec = {**base, "outcome": "SUBMITTED_UNVERIFIED", "order_id": order_id,
+               "detail": f"order POSTed but fill-check failed: {exc} — RECONCILE on Kalshi"}
+        _log_attempt(rec)
+        _alert("SUBMITTED — FILL UNVERIFIED",
+               f"`{bet.get('ticker')}` {bet.get('side')} — order {order_id} placed but fill "
+               f"unconfirmed ({exc}). Check Kalshi manually.", ok=False)
+        return rec
     filled_cost = round(filled * price, 2)
 
     if filled >= count and count > 0:

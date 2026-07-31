@@ -5824,7 +5824,7 @@ HTML = """<!DOCTYPE html>
 
 
 <div id="history-card" class="card">
-  <div class="card-header" onclick="toggleCard('history-body')">Portfolio ROI — Flat Units <span style="font-size:10px;font-weight:400;color:var(--muted);margin-left:6px;">$1 on every bet · no Kelly sizing</span> <span class="card-toggle" id="history-body-toggle">▾</span></div>
+  <div class="card-header" onclick="toggleCard('history-body')">Portfolio ROI — Kelly P&amp;L <span style="font-size:10px;font-weight:400;color:var(--muted);margin-left:6px;">cumulative $ P&amp;L at Kelly sizing (¼-Kelly · ½ on strikeouts)</span> <span class="card-toggle" id="history-body-toggle">▾</span></div>
   <div id="history-body" class="card-body" style="padding:16px 12px 12px;">
     <div class="chart-empty">Loading units chart…</div>
   </div>
@@ -5992,7 +5992,7 @@ function renderRoiChart(points) {
   const cW = W - PAD.left - PAD.right;
   const cH = H - PAD.top - PAD.bottom;
 
-  const rois   = points.map(p => p.units);   // y-axis now = cumulative flat units
+  const rois   = points.map(p => p.kelly_cum);   // y-axis = cumulative Kelly-sized P&L ($)
   const minR   = Math.min(...rois, 0);
   const maxR   = Math.max(...rois, 0);
   const span   = maxR - minR || 1;
@@ -6009,12 +6009,12 @@ function renderRoiChart(points) {
   const fillId = 'roi-fill';
 
   // polyline points
-  const pts = points.map((p, i) => toX(i).toFixed(1) + ',' + toY(p.units).toFixed(1)).join(' ');
+  const pts = points.map((p, i) => toX(i).toFixed(1) + ',' + toY(p.kelly_cum).toFixed(1)).join(' ');
 
   // closed area polygon (go to baseline then back)
   const baseY = toY(0).toFixed(1);
   const areaPath = 'M ' + toX(0).toFixed(1) + ',' + baseY
-    + ' ' + points.map((p, i) => 'L ' + toX(i).toFixed(1) + ',' + toY(p.units).toFixed(1)).join(' ')
+    + ' ' + points.map((p, i) => 'L ' + toX(i).toFixed(1) + ',' + toY(p.kelly_cum).toFixed(1)).join(' ')
     + ' L ' + toX(points.length - 1).toFixed(1) + ',' + baseY + ' Z';
 
   // Y-axis ticks (5 ticks)
@@ -6051,8 +6051,8 @@ function renderRoiChart(points) {
   ${zeroLine}
   <path d="${areaPath}" fill="url(#${fillId})"/>
   <polyline points="${pts}" fill="none" stroke="${stroke}" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>
-  ${points.map((p, i) => `<circle cx="${toX(i).toFixed(1)}" cy="${toY(p.units).toFixed(1)}" r="3" fill="${stroke}" class="roi-dot" data-idx="${i}" style="cursor:pointer"/>`).join('')}
-  ${yTicks.map(t => `<text x="${PAD.left - 6}" y="${(t.y + 4).toFixed(1)}" text-anchor="end" fill="#8b949e" font-size="10">${(t.v >= 0 ? '+' : '') + t.v.toFixed(1)}u</text>`).join('')}
+  ${points.map((p, i) => `<circle cx="${toX(i).toFixed(1)}" cy="${toY(p.kelly_cum).toFixed(1)}" r="3" fill="${stroke}" class="roi-dot" data-idx="${i}" style="cursor:pointer"/>`).join('')}
+  ${yTicks.map(t => `<text x="${PAD.left - 6}" y="${(t.y + 4).toFixed(1)}" text-anchor="end" fill="#8b949e" font-size="10">${t.v >= 0 ? '+$' : '-$'}${Math.abs(t.v).toFixed(0)}</text>`).join('')}
   ${xLabels.map(l => `<text x="${l.x.toFixed(1)}" y="${H - 6}" text-anchor="middle" fill="#8b949e" font-size="10">${l.label}</text>`).join('')}
 </svg>
 <div id="roi-tooltip" style="display:none;position:absolute;background:#161b22;border:1px solid #30363d;border-radius:6px;padding:8px 10px;font-size:12px;color:#e6edf3;pointer-events:none;z-index:10;white-space:nowrap;"></div>`;
@@ -6068,13 +6068,14 @@ function renderRoiChart(points) {
       const tip = document.getElementById('roi-tooltip');
       let html = '';
       if (!p.result) {
-        html = '<b>Start</b><br>Cumulative: +0.00u &nbsp;|&nbsp; ROI: +0.00%';
+        html = '<b>Start</b><br>Cumulative: +$0.00 &nbsp;|&nbsp; ROI: +0.00%';
       } else {
         const icon = p.result === 'won' ? '✓' : '✗';
-        const us   = p.unit_pnl >= 0 ? '+' : '';
+        const bs   = p.pnl >= 0 ? '+$' : '-$';
+        const cs   = p.kelly_cum >= 0 ? '+$' : '-$';
         html = `<b>${p.matchup || p.title || ''}</b><br>`
-          + `${icon} ${p.result.toUpperCase()}  ${us}${p.unit_pnl.toFixed(2)}u<br>`
-          + `Cumulative: ${p.units >= 0 ? '+' : ''}${p.units.toFixed(2)}u &nbsp;|&nbsp; ROI: ${p.units_roi >= 0 ? '+' : ''}${p.units_roi.toFixed(2)}%`;
+          + `${icon} ${p.result.toUpperCase()}  ${bs}${Math.abs(p.pnl).toFixed(2)} (Kelly)<br>`
+          + `Cumulative: ${cs}${Math.abs(p.kelly_cum).toFixed(2)} &nbsp;|&nbsp; ROI: ${p.roi >= 0 ? '+' : ''}${p.roi.toFixed(2)}%`;
       }
       tip.innerHTML = html;
       const rect = el.getBoundingClientRect();
@@ -7504,7 +7505,7 @@ async function fetchPaper() {
     // compounding-bankroll "ROI" tile (balance-vs-start) was removed 2026-07-14:
     // it compounded on an imaginary bankroll with too many degrees of freedom to
     // mean anything at this sample. Flat Units is the primary metric now, and the
-    // Portfolio ROI chart is units-based.
+    // Portfolio ROI chart plots cumulative Kelly-sized $ P&L (user call 2026-07-31).
     const kellyBankPct   = perf.total_kelly_pct;
     const kellyBankColor = kellyBankPct == null ? 'var(--muted)' : kellyBankPct >= 0 ? 'var(--green)' : 'var(--red)';
     const kellyBankTxt   = kellyBankPct == null ? '—' : `${kellyBankPct >= 0 ? '+' : ''}${kellyBankPct.toFixed(2)}%`;
@@ -7923,6 +7924,7 @@ class Handler(BaseHTTPRequestHandler):
             n_flat    = 0
             points = [{"date": PAPER_START_DATE, "roi": 0.0, "balance": balance,
                        "units": 0.0, "units_roi": 0.0, "unit_pnl": None,
+                       "kelly_cum": 0.0,   # cumulative Kelly-sized P&L in $ (actual realized)
                        "matchup": None, "result": None, "pnl": None}]
             for b in settled:
                 balance = round(balance + b["paper_pnl"], 2)
@@ -7944,6 +7946,7 @@ class Handler(BaseHTTPRequestHandler):
                     "units":     round(units_cum, 3),
                     "units_roi": units_roi,
                     "unit_pnl":  round(unit_pnl, 3),
+                    "kelly_cum": round(balance - PAPER_START_BALANCE, 2),   # cumulative Kelly $ P&L
                     "matchup":   b.get("matchup", ""),
                     "title":     b.get("title", ""),
                     "side":      b.get("side", ""),

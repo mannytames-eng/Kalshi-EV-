@@ -398,7 +398,15 @@ def _sign_headers(method: str, path: str) -> dict:
     ts = str(int(time.time() * 1000))
     path_no_qs = path.split("?")[0]
     msg = (ts + method.upper() + "/trade-api/v2" + path_no_qs).encode()
-    sig = _load_privkey().sign(msg, padding.PKCS1v15(), hashes.SHA256())
+    # Kalshi requires RSA-PSS (MGF1/SHA-256, salt = digest length). PKCS1v15 is
+    # silently accepted on public market-data endpoints but rejected by every
+    # authenticated endpoint (portfolio/orders) with INCORRECT_API_KEY_SIGNATURE.
+    sig = _load_privkey().sign(
+        msg,
+        padding.PSS(mgf=padding.MGF1(hashes.SHA256()),
+                    salt_length=padding.PSS.DIGEST_LENGTH),
+        hashes.SHA256(),
+    )
     return {
         "KALSHI-ACCESS-KEY":       KALSHI_API_KEY,
         "KALSHI-ACCESS-TIMESTAMP": ts,

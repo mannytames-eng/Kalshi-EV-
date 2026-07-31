@@ -376,8 +376,14 @@ _privkey = None
 def _load_privkey():
     global _privkey
     if _privkey is None:
-        b64 = os.environ.get("KALSHI_PRIVKEY_B64")
-        if b64:
+        raw = os.environ.get("KALSHI_PRIVATE_KEY")   # raw PEM pasted into a var
+        b64 = os.environ.get("KALSHI_PRIVKEY_B64")   # base64 of the PEM
+        if raw:
+            # Tolerate a paste whose real newlines got flattened to literal "\n".
+            if "\n" not in raw and "\\n" in raw:
+                raw = raw.replace("\\n", "\n")
+            pem_bytes = raw.encode()
+        elif b64:
             pem_bytes = base64.b64decode(b64)
         else:
             with open(KALSHI_PRIVKEY_PATH, "rb") as f:

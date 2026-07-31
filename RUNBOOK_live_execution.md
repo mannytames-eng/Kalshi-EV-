@@ -17,9 +17,17 @@ once before arming anything.
 | `KALSHI_EXECUTION_DRY_RUN` | `1` (on) | `1` = log the intended order, submit nothing. |
 | `KALSHI_EXECUTION_APPROVAL_REQUIRED` | `1` (on) | `1` = each order waits for your explicit `--approve`. `0` = fully autonomous. |
 
-Hard limits always on: **strikeouts only** (`KXMLBKS`), **half-Kelly** sizing,
-**3%** per-position + **15%** daily caps (vs your **real** balance), fill
-verification, full logging, Discord alert on every fill/failure.
+Hard limits always on: **strikeouts only** (`KXMLBKS`), the scanner's stake
+placed **as-is** (no %-of-funds cap — user call 2026-07-31), an absolute
+per-bet **$ sanity ceiling** (`KALSHI_MAX_POSITION_DOLLARS`, default $50) + an
+optional absolute **daily $ ceiling** (`KALSHI_MAX_DAILY_DOLLARS`, default off) +
+an insufficient-balance guard, fill verification, full logging, Discord alert on
+every fill/failure.
+
+> ⚠ Fixed-dollar sizing on a sub-$1000 account is **not** Kelly-of-your-bankroll
+> — a $12–28 bet is a large fraction of a small balance, so variance and ruin
+> risk are higher than the paper track implies. Consider setting
+> `KALSHI_MAX_DAILY_DOLLARS` to a real number as a circuit breaker.
 
 Nothing trades until: `ENABLED=1` **and** `DRY_RUN=0` **and** a runner calls the
 module **and** valid trading credentials are set.

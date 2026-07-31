@@ -22,7 +22,9 @@ shared infra, not flagging logic.
 
 Fulfils the 6-point spec:
   (1) acts only on bets where shadow is False (real positions);
-  (2) pre-trade checks: 3% per-position cap, 15% daily cap, global kill switch;
+  (2) pre-trade checks: absolute per-bet $ ceiling + optional daily $ ceiling +
+      insufficient-balance guard + global kill switch (%-of-balance caps removed
+      per user 2026-07-31 — bets the scanner's stake as-is, not a % of funds);
   (3) sizes the order from the scanner's Kelly-sized stake (quarter-Kelly base,
       half-Kelly on strikeouts — the scanner's single source of truth);
   (4) verifies the ACTUAL fill after submission (never assumes success);
@@ -62,11 +64,15 @@ DRY_RUN           = _env_bool("KALSHI_EXECUTION_DRY_RUN", True)
 APPROVAL_REQUIRED = _env_bool("KALSHI_EXECUTION_APPROVAL_REQUIRED", True)
 APPROVAL_TTL_MIN  = 20   # a queued order EXPIRES (never fires) if not approved in time
 
-# Hard pre-trade risk limits (independent safety net on TOP of the scanner's
-# Kelly sizing — a circuit breaker, not a resizer; an order that breaches these
-# is REJECTED, not shrunk, because a breach means something upstream is wrong).
-MAX_POSITION_FRAC = 0.03    # ≤3% of bankroll per single position
-MAX_DAILY_FRAC    = 0.15    # ≤15% of bankroll committed across a calendar day (PT)
+# Pre-trade limits. Per user call 2026-07-31 the %-OF-BALANCE caps were removed —
+# the order is placed at the scanner's stake as-is, NOT scaled/capped to account
+# size. What remains are ABSOLUTE-DOLLAR guards (not % of funds): a per-bet sanity
+# ceiling (catches a runaway sizing bug — set well above the scanner's ~$28 max),
+# and an OPTIONAL daily circuit breaker (default 0 = off). Env-overridable.
+# ⚠ Fixed-dollar sizing on a small account is NOT Kelly-of-your-bankroll — it's a
+# larger fraction, with higher variance/ruin risk. The daily cap is your friend.
+MAX_POSITION_DOLLARS = float(os.environ.get("KALSHI_MAX_POSITION_DOLLARS", "50"))  # abs $/bet ceiling; 0 = off
+MAX_DAILY_DOLLARS    = float(os.environ.get("KALSHI_MAX_DAILY_DOLLARS", "0"))      # abs $/day ceiling; 0 = off
 
 # Go-live SCOPE: only these Kalshi series prefixes may execute. Strikeouts-only
 # for the initial live phase — it's the one calibrated/confirmed edge. Any other
@@ -337,14 +343,16 @@ def pre_trade_checks(bet: dict, bankroll: float, daily_committed: float,
         return False, "correlated / capped bet — excluded"
     if count < MIN_CONTRACTS:
         return False, f"size rounds to {count} contracts (<{MIN_CONTRACTS})"
-    if bankroll is None or bankroll <= 0:
-        return False, "bankroll unavailable — refusing to size against unknown balance"
-    if cost > MAX_POSITION_FRAC * bankroll + 1e-9:
-        return False, (f"per-position cap: ${cost:.2f} > "
-                       f"{MAX_POSITION_FRAC:.0%} of ${bankroll:.2f}")
-    if daily_committed + cost > MAX_DAILY_FRAC * bankroll + 1e-9:
-        return False, (f"daily cap: ${daily_committed:.2f}+${cost:.2f} > "
-                       f"{MAX_DAILY_FRAC:.0%} of ${bankroll:.2f}")
+    # Absolute per-bet sanity ceiling (NOT % of funds — the scanner's stake is
+    # placed as-is; this only catches a runaway sizing bug). 0 = disabled.
+    if MAX_POSITION_DOLLARS and cost > MAX_POSITION_DOLLARS + 1e-9:
+        return False, f"per-position sanity ceiling: ${cost:.2f} > ${MAX_POSITION_DOLLARS:.2f}"
+    # Optional absolute daily circuit breaker. 0 = off.
+    if MAX_DAILY_DOLLARS and daily_committed + cost > MAX_DAILY_DOLLARS + 1e-9:
+        return False, f"daily $ ceiling: ${daily_committed:.2f}+${cost:.2f} > ${MAX_DAILY_DOLLARS:.2f}"
+    # Never try to bet money that isn't in the account (when balance is known).
+    if bankroll is not None and bankroll > 0 and cost > bankroll + 1e-9:
+        return False, f"insufficient balance: ${cost:.2f} > ${bankroll:.2f} available"
     return True, "ok"
 
 
@@ -520,7 +528,8 @@ def _print_config():
     print(f"  DRY_RUN           = {DRY_RUN}  (must be False to submit real orders)")
     print(f"  APPROVAL_REQUIRED = {APPROVAL_REQUIRED}  (True → each order waits for --approve)")
     print(f"  MARKET_ALLOWLIST  = {MARKET_ALLOWLIST}   LIVE_SIZE_FRACTION = {LIVE_SIZE_FRACTION}")
-    print(f"  MAX_POSITION_FRAC = {MAX_POSITION_FRAC:.0%}   MAX_DAILY_FRAC = {MAX_DAILY_FRAC:.0%}")
+    print(f"  MAX_POSITION_DOLLARS = ${MAX_POSITION_DOLLARS:.0f}/bet   "
+          f"MAX_DAILY_DOLLARS = {'off' if not MAX_DAILY_DOLLARS else '$'+format(MAX_DAILY_DOLLARS,'.0f')+'/day'}  (no %-of-funds cap)")
     print(f"  log → {EXECUTION_LOG_FILE}")
     if EXECUTION_ENABLED and not DRY_RUN:
         mode = "APPROVAL-GATED" if APPROVAL_REQUIRED else "FULLY AUTONOMOUS"

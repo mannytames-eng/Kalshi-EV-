@@ -1,0 +1,28 @@
+# ── Railway config for the EXECUTION WORKER (run_executor.py) ─────────────────
+# This is a SEPARATE service from the scanner. The scanner uses railway.toml
+# (startCommand = kalshi_ev_ui.py); this file exists ONLY so the worker service
+# runs run_executor.py instead.
+#
+# ⚠ CRITICAL: when you create the worker service in the Railway dashboard, set its
+#   Settings → Config → "Railway config file" to  railway.worker.toml
+#   If you don't, the new service inherits railway.toml and starts a SECOND
+#   scanner (double credit burn), not the executor.
+#
+# Env vars to set on this worker service (see RUNBOOK_live_execution.md §3):
+#   KALSHI_API_KEY, KALSHI_PRIVATE_KEY, DISCORD_WEBHOOK, DATA_DIR=/data,
+#   BETS_URL=https://evscanner-production.up.railway.app/api/today_edges,
+#   KALSHI_EXECUTION_ENABLED=0, KALSHI_EXECUTION_DRY_RUN=1,
+#   KALSHI_EXECUTION_APPROVAL_REQUIRED=1  (start inert; arm per the runbook)
+
+[build]
+builder = "nixpacks"
+
+[deploy]
+startCommand = "python3 run_executor.py"
+restartPolicyType = "always"
+# No healthcheckPath — this is a background worker, not a web service.
+
+# Its OWN volume (separate service = separate disk) so the execution log +
+# approval queue survive restarts.
+[[volumes]]
+mountPath = "/data"

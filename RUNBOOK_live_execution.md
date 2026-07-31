@@ -72,7 +72,10 @@ Locally: `python run_executor.py` (set `BETS_FILE=./ev_bets.json`).
 ### Deploy as a separate Railway worker
 
 1. **New service** in the same Railway project, same GitHub repo (`main`).
-2. **Start command:** `python run_executor.py`
+2. **Point it at the worker config:** Settings → Config → set the Railway config
+   file to **`railway.worker.toml`** (committed). That sets the start command to
+   `python3 run_executor.py` and its own `/data` volume. ⚠ If you skip this, the
+   service inherits `railway.toml` and boots a **second scanner**, not the worker.
 3. **Attach a Volume** to this service and set `DATA_DIR` to its mount path (e.g.
    `/data`). The worker is a *separate* service, so it does **not** share the
    scanner's volume — it needs its own for `execution_log.jsonl` (audit +

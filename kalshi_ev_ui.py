@@ -3196,6 +3196,53 @@ def _get_clv_multipliers() -> dict:
     return multipliers
 
 
+# ── Kelly sizing (module-level single source) ─────────────────────────────────
+# Extracted so BOTH the performance panel (the "sizing-model diagnostic" =
+# total_kelly_pct) and the /api/roi chart compute per-bet Kelly P&L identically —
+# otherwise the chart and the diagnostic silently diverge. _get_performance's
+# nested _kelly_frac/_kelly_pnl now delegate here. clv_mults is passed in (from
+# _get_clv_multipliers()) so this stays pure. Displays each bet at the fraction/
+# cap STAMPED at placement (freeze) — a policy change never re-sizes history.
+def _std_kelly_frac(b: dict, clv_mults: dict) -> float:
+    k = b.get("kalshi_price", 0.5)
+    e = b.get("edge_pct", 0) / 100.0
+    if k <= 0 or k >= 1 or e <= 0:
+        return 0.0
+    full_kelly = e / (1.0 - k)
+    if b.get("time_mult_applied") is not None:
+        time_mult = b["time_mult_applied"]
+    else:
+        _flagged = b.get("flagged_at")
+        _gt      = b.get("game_time")
+        if b["status"] in ("won", "lost") and _flagged and _gt:
+            try:
+                _hrs = (datetime.fromisoformat(_gt.replace("Z", "+00:00")) -
+                        datetime.fromisoformat(_flagged.replace("Z", "+00:00"))).total_seconds() / 3600
+                if _hrs > 24:   time_mult = 0.25
+                elif _hrs > 12: time_mult = 0.75
+                elif _hrs >= 4: time_mult = 1.00
+                else:           time_mult = 0.50
+            except (ValueError, AttributeError):
+                time_mult = _time_kelly_mult(b.get("game_time"))
+        else:
+            time_mult  = _time_kelly_mult(b.get("game_time"))
+    clv_mult = clv_mults.get(_calib_bucket(b), 1.0)
+    if b.get("ticker", "").upper().startswith("KXMLBTB") and b.get("raw_edge_pct", 0) >= TB_HIGH_EDGE_THRESHOLD:
+        return 0.0
+    _fraction = b.get("kelly_fraction_applied", PAPER_KELLY_FRACTION)
+    _cap      = b.get("kelly_cap_applied", PAPER_KELLY_CAP)
+    return min(full_kelly * _fraction * time_mult * clv_mult, _cap)
+
+
+def _std_kelly_pnl(b: dict, clv_mults: dict) -> Optional[float]:
+    """Per-bet P&L as fraction-of-bankroll under CLV-adjusted Kelly sizing."""
+    if b["status"] not in ("won", "lost"):
+        return None
+    f = _std_kelly_frac(b, clv_mults)
+    k = b["kalshi_price"]
+    return f * (1.0 - k) / k if b["status"] == "won" else -f
+
+
 def _get_performance(since: Optional[str] = None) -> dict:
     """Return model-quality performance stats — bet-size agnostic.
 
@@ -3272,56 +3319,13 @@ def _get_performance(since: Optional[str] = None) -> dict:
     # Fetch CLV-based multipliers once for the whole performance pass
     clv_mults = _get_clv_multipliers()
 
+    # Delegate to the module-level single source (see above) so the perf panel
+    # and the /api/roi chart never drift. clv_mults is captured by closure.
     def _kelly_frac(b: dict) -> float:
-        k = b.get("kalshi_price", 0.5)
-        e = b.get("edge_pct", 0) / 100.0
-        if k <= 0 or k >= 1 or e <= 0:
-            return 0.0
-        full_kelly = e / (1.0 - k)
-        # Prefer the multiplier actually applied at placement (stamped on bets
-        # since 2026-06-23). For older bets without the stamp, reconstruct the
-        # historical bracket from flagged_at vs game_time so their displayed
-        # sizing still matches what was actually staked under the old policy.
-        if b.get("time_mult_applied") is not None:
-            time_mult = b["time_mult_applied"]
-        else:
-            _flagged = b.get("flagged_at")
-            _gt      = b.get("game_time")
-            if b["status"] in ("won", "lost") and _flagged and _gt:
-                try:
-                    _hrs = (datetime.fromisoformat(_gt.replace("Z", "+00:00")) -
-                            datetime.fromisoformat(_flagged.replace("Z", "+00:00"))).total_seconds() / 3600
-                    if _hrs > 24:   time_mult = 0.25
-                    elif _hrs > 12: time_mult = 0.75
-                    elif _hrs >= 4: time_mult = 1.00
-                    else:           time_mult = 0.50
-                except (ValueError, AttributeError):
-                    time_mult = _time_kelly_mult(b.get("game_time"))
-            else:
-                time_mult  = _time_kelly_mult(b.get("game_time"))
-        clv_mult   = clv_mults.get(_calib_bucket(b), 1.0)
-        # High raw-edge TB is shadowed under current policy — mirror that here
-        # so this "what would current policy stake" column matches reality.
-        if b.get("ticker", "").upper().startswith("KXMLBTB") and b.get("raw_edge_pct", 0) >= TB_HIGH_EDGE_THRESHOLD:
-            return 0.0
-        # Display each bet at the Kelly policy it was ACTUALLY staked under: use
-        # the fraction/cap stamped at placement; bets predating the stamp were all
-        # quarter-Kelly, so fall back to the base defaults. This is why a policy
-        # change (e.g. MLB totals → full Kelly) does NOT retroactively re-size the
-        # existing history's displayed Kelly P&L — only new bets show the new size.
-        _fraction = b.get("kelly_fraction_applied", PAPER_KELLY_FRACTION)
-        _cap      = b.get("kelly_cap_applied", PAPER_KELLY_CAP)
-        return min(full_kelly * _fraction * time_mult * clv_mult, _cap)
+        return _std_kelly_frac(b, clv_mults)
 
     def _kelly_pnl(b: dict) -> Optional[float]:
-        """P&L as fraction-of-bankroll under CLV-adjusted quarter-Kelly sizing."""
-        if b["status"] not in ("won", "lost"):
-            return None
-        f = _kelly_frac(b)
-        k = b["kalshi_price"]
-        if b["status"] == "won":
-            return f * (1.0 - k) / k   # profit = stake × net_odds
-        return -f                        # loss = −stake (fraction of bankroll)
+        return _std_kelly_pnl(b, clv_mults)
 
     # CLV stats — all market types, settled bets only.
     # clv_bets: population for the "Value vs Pin" source breakdown below —
@@ -5992,7 +5996,7 @@ function renderRoiChart(points) {
   const cW = W - PAD.left - PAD.right;
   const cH = H - PAD.top - PAD.bottom;
 
-  const rois   = points.map(p => p.roi);   // y-axis = Kelly ROI % (cumulative Kelly P&L / start bank)
+  const rois   = points.map(p => p.kelly_roi);   // y-axis = cumulative Kelly ROI % (matches sizing-model diagnostic)
   const minR   = Math.min(...rois, 0);
   const maxR   = Math.max(...rois, 0);
   const span   = maxR - minR || 1;
@@ -6009,12 +6013,12 @@ function renderRoiChart(points) {
   const fillId = 'roi-fill';
 
   // polyline points
-  const pts = points.map((p, i) => toX(i).toFixed(1) + ',' + toY(p.roi).toFixed(1)).join(' ');
+  const pts = points.map((p, i) => toX(i).toFixed(1) + ',' + toY(p.kelly_roi).toFixed(1)).join(' ');
 
   // closed area polygon (go to baseline then back)
   const baseY = toY(0).toFixed(1);
   const areaPath = 'M ' + toX(0).toFixed(1) + ',' + baseY
-    + ' ' + points.map((p, i) => 'L ' + toX(i).toFixed(1) + ',' + toY(p.roi).toFixed(1)).join(' ')
+    + ' ' + points.map((p, i) => 'L ' + toX(i).toFixed(1) + ',' + toY(p.kelly_roi).toFixed(1)).join(' ')
     + ' L ' + toX(points.length - 1).toFixed(1) + ',' + baseY + ' Z';
 
   // Y-axis ticks (5 ticks)
@@ -6051,7 +6055,7 @@ function renderRoiChart(points) {
   ${zeroLine}
   <path d="${areaPath}" fill="url(#${fillId})"/>
   <polyline points="${pts}" fill="none" stroke="${stroke}" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>
-  ${points.map((p, i) => `<circle cx="${toX(i).toFixed(1)}" cy="${toY(p.roi).toFixed(1)}" r="3" fill="${stroke}" class="roi-dot" data-idx="${i}" style="cursor:pointer"/>`).join('')}
+  ${points.map((p, i) => `<circle cx="${toX(i).toFixed(1)}" cy="${toY(p.kelly_roi).toFixed(1)}" r="3" fill="${stroke}" class="roi-dot" data-idx="${i}" style="cursor:pointer"/>`).join('')}
   ${yTicks.map(t => `<text x="${PAD.left - 6}" y="${(t.y + 4).toFixed(1)}" text-anchor="end" fill="#8b949e" font-size="10">${t.v >= 0 ? '+' : ''}${t.v.toFixed(1)}%</text>`).join('')}
   ${xLabels.map(l => `<text x="${l.x.toFixed(1)}" y="${H - 6}" text-anchor="middle" fill="#8b949e" font-size="10">${l.label}</text>`).join('')}
 </svg>
@@ -6071,10 +6075,10 @@ function renderRoiChart(points) {
         html = '<b>Start</b><br>Cumulative Kelly ROI: +0.00%';
       } else {
         const icon = p.result === 'won' ? '✓' : '✗';
-        const bs   = p.pnl >= 0 ? '+$' : '-$';
+        const ks   = p.kelly_pnl_pct >= 0 ? '+' : '';
         html = `<b>${p.matchup || p.title || ''}</b><br>`
-          + `${icon} ${p.result.toUpperCase()}  ${bs}${Math.abs(p.pnl).toFixed(2)} (Kelly)<br>`
-          + `Cumulative Kelly ROI: ${p.roi >= 0 ? '+' : ''}${p.roi.toFixed(2)}%`;
+          + `${icon} ${p.result.toUpperCase()}  ${ks}${p.kelly_pnl_pct.toFixed(3)}% (Kelly)<br>`
+          + `Cumulative Kelly ROI: ${p.kelly_roi >= 0 ? '+' : ''}${p.kelly_roi.toFixed(2)}%`;
       }
       tip.innerHTML = html;
       const rect = el.getBoundingClientRect();
@@ -7918,16 +7922,23 @@ class Handler(BaseHTTPRequestHandler):
                     and b.get("flagged_at", "") >= PAPER_START_DATE
                 ]
             settled.sort(key=lambda b: b.get("resolved_at") or b.get("flagged_at", ""))
+            _clv_mults = _get_clv_multipliers()   # same source as the perf diagnostic
             balance = PAPER_START_BALANCE
             units_cum = 0.0     # cumulative FLAT units ($1 staked on every bet)
             n_flat    = 0
+            kelly_cum_pct = 0.0  # cumulative Kelly ROI % — matches the sizing-model diagnostic (total_kelly_pct)
             points = [{"date": PAPER_START_DATE, "roi": 0.0, "balance": balance,
                        "units": 0.0, "units_roi": 0.0, "unit_pnl": None,
-                       "kelly_cum": 0.0,   # cumulative Kelly-sized P&L in $ (actual realized)
+                       "kelly_cum": 0.0, "kelly_roi": 0.0,
                        "matchup": None, "result": None, "pnl": None}]
             for b in settled:
                 balance = round(balance + b["paper_pnl"], 2)
                 roi = round((balance - PAPER_START_BALANCE) / PAPER_START_BALANCE * 100, 2)
+                # Kelly ROI %: recompute each bet's Kelly P&L at the STAMPED policy
+                # (same _std_kelly_pnl the perf panel uses) and cumulate — so the
+                # chart's final value equals the "sizing-model diagnostic" tile.
+                _kp = _std_kelly_pnl(b, _clv_mults)
+                kelly_cum_pct += (_kp * 100) if _kp is not None else 0.0
                 # Flat-units P&L: $1 on every bet. Win pays profit (1-k)/k at the
                 # entry price k; loss = -1 unit. This is the sizing-model-free
                 # curve. Portfolio ROI is now units-based (2026-07-14) — it no
@@ -7945,7 +7956,9 @@ class Handler(BaseHTTPRequestHandler):
                     "units":     round(units_cum, 3),
                     "units_roi": units_roi,
                     "unit_pnl":  round(unit_pnl, 3),
-                    "kelly_cum": round(balance - PAPER_START_BALANCE, 2),   # cumulative Kelly $ P&L
+                    "kelly_cum": round(balance - PAPER_START_BALANCE, 2),   # cumulative Kelly $ P&L (actual realized)
+                    "kelly_roi": round(kelly_cum_pct, 2),                   # cumulative Kelly ROI % (matches diagnostic)
+                    "kelly_pnl_pct": round((_kp or 0.0) * 100, 3),          # this bet's Kelly P&L, % of bank
                     "matchup":   b.get("matchup", ""),
                     "title":     b.get("title", ""),
                     "side":      b.get("side", ""),

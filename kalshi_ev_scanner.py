@@ -367,6 +367,12 @@ MLB_ABBR: Dict[str, str] = {
     "SEA": "Seattle Mariners",       "STL": "St. Louis Cardinals",
     "TB":  "Tampa Bay Rays",         "TEX": "Texas Rangers",
     "TOR": "Toronto Blue Jays",      "WSH": "Washington Nationals",
+    # Kalshi-ticker aliases — Kalshi abbreviates Arizona as "AZ" (not "ARI") and
+    # the Athletics as "ATH" (not "OAK") in its game/player tickers. Without these,
+    # _parse_mlb_event (all-or-nothing on BOTH teams) returns (None, None) for any
+    # SD@AZ / …ATH… game, which silently disables the game-match collision guard
+    # for exactly those games — the Eduardo-Rodriguez/AZ phantom lived here.
+    "AZ":  "Arizona Diamondbacks",   "ATH": "Oakland Athletics",
 }
 
 
@@ -466,6 +472,13 @@ MAX_PRICE      = 0.88   # mid above 88% → likely in-game
 PROP_MIN_PRICE = 0.08
 PROP_MAX_PRICE = 0.92
 PROP_MAX_EDGE  = 0.15   # props above 15% adj edge are almost certainly a line mismatch — cap separately from game-line MAX_EDGE
+# Strikeouts (KXMLBKS) get a MUCH tighter cap than the generic prop cap. The real,
+# validated strikeout edge is small (calibrated +3.1pp; live edges cluster 2–4%).
+# Anything above ~8% has never been a genuine K edge — it's a name-collision
+# (Eduardo vs Grayson Rodriguez, 2026-08-04) or a stale/pre-lineup Pinnacle line.
+# This is the automation-critical backstop: autonomous execution acts on KXMLBKS
+# only, so a phantom K edge is exactly what must never reach a real order.
+STRIKEOUT_MAX_EDGE = 0.08
 
 
 def kalshi_prices(mkt: dict) -> Optional[Tuple[float, float]]:
@@ -2052,6 +2065,24 @@ def build_city_lookup(abbr_map: Dict[str, str]) -> Dict[str, str]:
     return lu
 
 
+def _game_team_keys(raw_a: Optional[str], raw_b: Optional[str],
+                    lu: Dict[str, str]) -> set:
+    """Canonical, normalized full-team-name key set for a game, from two raw team
+    identifiers that may be Kalshi abbreviations ('SD', 'AZ') OR Odds-API full
+    names ('San Diego Padres'). Both map through the city lookup to the SAME
+    normalized full name, so a Kalshi game's key set and a Pinnacle game's key set
+    are directly comparable. Used to reject cross-game player name-collisions
+    (Eduardo Rodriguez / AZ can't inherit Grayson Rodriguez / BAL's line)."""
+    keys: set = set()
+    for raw in (raw_a, raw_b):
+        if not raw:
+            continue
+        rn = _norm(raw)
+        full = lu.get(rn)
+        keys.add(_norm(full) if full else rn)
+    return keys
+
+
 def _find_game(
     team_a: str,
     team_b: str,
@@ -2956,13 +2987,24 @@ def _norm_player(name: str) -> str:
 
 def _find_player_in_title(title: str, prop_lookup: Dict[str, dict]) -> Optional[dict]:
     title_norm = re.sub(r"[^a-z]", "", title.lower())
+    # 1. Exact: the player's full normalized name is a substring of the title.
+    #    Safe against same-surname confusion — 'eduardorodriguez' matches only
+    #    Eduardo, never Grayson.
     for key, pp in prop_lookup.items():
         if key and key in title_norm:
             return pp
+    # 2. Surname fallback (rescues name-form mismatches like 'J. Rodriguez').
+    #    But if MORE THAN ONE player in the lookup shares the matched surname, the
+    #    surname alone can't tell them apart — guessing here is exactly how the
+    #    wrong pitcher's line gets applied. Refuse rather than misassign; the
+    #    caller's game/team check is the primary guard, this is belt-and-braces.
+    surname_hits = []
     for key, pp in prop_lookup.items():
         last = re.sub(r"[^a-z]", "", pp["player"].split()[-1].lower())
         if len(last) > 3 and last in title_norm:
-            return pp
+            surname_hits.append(pp)
+    if len(surname_hits) == 1:
+        return surname_hits[0]
     return None
 
 
@@ -3137,6 +3179,12 @@ def build_all_player_props(
                 entry["lines"] = line_entries           # all lines (incl. alternates)
                 entry["nb_fit"] = nb_fit                # (mu, r) diagnostic fit, or None
                 entry["commence_time"] = ev.get("commence_time")  # game start — CLV freeze needs it for WNBA/NBA (tickers omit time)
+                # Which game this player's line came from — normalized full team
+                # names, directly comparable to a Kalshi market's game team keys.
+                # scan_player_props rejects the match if the Kalshi market's game
+                # doesn't share a team (cross-game name-collision guard).
+                _gt = {_norm(ev.get("home_team", "")), _norm(ev.get("away_team", ""))}
+                entry["game_teams"] = {t for t in _gt if t}
                 # Doubleheader collision guard: the same player + prop across two
                 # same-day games collides on this name-only key. We can't tell which
                 # game's line pairs with which Kalshi market by name alone, so flag
@@ -3178,6 +3226,7 @@ def scan_player_props(
         prop_markets = PLAYER_PROP_MARKETS
     if parse_event_fn is None:
         parse_event_fn = _parse_mlb_event
+    _city_lu = build_city_lookup(abbr_map)   # abbr/full-name → canonical team, for game-match
 
     print(f"\n{'═'*70}")
     print(f"  {sport_label} Player Props  —  {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
@@ -3211,6 +3260,8 @@ def scan_player_props(
                     pass
 
             ev_ticker = evt.get("event_ticker", "")
+            _kp_away_raw, _kp_home_raw = parse_event_fn(ev_ticker, abbr_map)
+            _kp_game_teams = _game_team_keys(_kp_away_raw, _kp_home_raw, _city_lu)
             game_dt   = _parse_ticker_game_time(ev_ticker)
             if game_dt is None and exp_str:
                 try:
@@ -3253,6 +3304,7 @@ def scan_player_props(
                     "threshold": threshold,
                     "yes_bid":   yes_bid,
                     "yes_ask":   yes_ask,
+                    "game_teams": _kp_game_teams,   # canonical team keys — cross-game collision guard
                 })
 
     if not kalshi_props:
@@ -3314,10 +3366,26 @@ def scan_player_props(
         # commence_time (only the top-level entry from build_all_player_props does).
         _nb_fit = matched.get("nb_fit")
         _commence = matched.get("commence_time")
+        _pl_game_teams = matched.get("game_teams") or set()
         # Doubleheader name collision (see build_all_player_props) — skip rather
         # than risk pricing this Kalshi market off the other game's line.
         if matched.get("_dh_collision"):
             print(f"  ⚠ prop  {matched.get('player','?'):<25} SKIPPED — doubleheader name collision (can't game-match)")
+            continue
+
+        # ── Cross-game name-collision guard (ROOT FIX, 2026-08-04) ───────────
+        # The player matched by name must actually be in THIS Kalshi market's
+        # game. Without this, when the correct player is absent from the Pinnacle
+        # index, the surname fallback silently borrows a same-surnamed pitcher
+        # from a DIFFERENT game (Eduardo Rodriguez/AZ priced off Grayson
+        # Rodriguez/BAL → fake +13.2% edge). If both games' team keys are known
+        # and share no team, reject — the name matched the wrong person.
+        _kp_game_teams = kp.get("game_teams") or set()
+        if _kp_game_teams and _pl_game_teams and not (_kp_game_teams & _pl_game_teams):
+            print(
+                f"  ✗ prop  {matched.get('player','?'):<25} REJECTED — game mismatch "
+                f"(Kalshi {sorted(_kp_game_teams)} vs Pinnacle {sorted(_pl_game_teams)}) — name collision, wrong player"
+            )
             continue
 
         # ── Exact alternate-line match ───────────────────────────────────────
@@ -3469,6 +3537,19 @@ def scan_player_props(
         if best_adj > PROP_MAX_EDGE:   # 15% cap — tighter than game-line MAX_EDGE (20%); very large prop edges are almost always a mismatch
             print(
                 f"  ✗ prop  {matched.get('player','?'):<25} REJECTED — adj edge {best_adj:.1%} > PROP_MAX_EDGE {PROP_MAX_EDGE:.0%}"
+            )
+            continue
+        # Strikeout-specific hard cap (automation backstop). Real KXMLBKS edges are
+        # 2–4%; anything > STRIKEOUT_MAX_EDGE is a collision/stale line, never a
+        # genuine edge. This is the last line of defense before a K edge could
+        # reach an autonomous order — keep it even though the guards above should
+        # already have caught the cause.
+        _is_strikeout = (kp.get("ticker", "").upper().startswith("KXMLBKS")
+                         or prop_type == "pitcher_strikeouts")
+        if _is_strikeout and best_adj > STRIKEOUT_MAX_EDGE:
+            print(
+                f"  ✗ prop  {matched.get('player','?'):<25} REJECTED — strikeout edge {best_adj:.1%} "
+                f"> STRIKEOUT_MAX_EDGE {STRIKEOUT_MAX_EDGE:.0%} (real K edges are 2–4%; large = collision/stale)"
             )
             continue
 

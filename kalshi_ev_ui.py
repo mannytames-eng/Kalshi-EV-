@@ -421,6 +421,22 @@ def _kelly_params(ticker: str):
 # (<7%) is unaffected: its win rate (41.3% vs 44.0% implied) isn't
 # significantly miscalibrated, so it keeps normal quarter-Kelly sizing.
 TB_HIGH_EDGE_THRESHOLD = 7.0     # pp, on raw_edge_pct — matches the original prop edge-floor design
+
+# Pitcher Outs (KXMLBOUTS): precautionary, NOT a calibration finding like TB's —
+# n=11 settled is nowhere near enough for a reliability curve or the general
+# _CALIB_PENALTY_MIN_SAMPLE=20 bucket check to even evaluate this market yet.
+# Added 2026-08-09 after a single bet (Davis Martin, 8.5% raw edge) came in
+# nearly double every other OUTS edge seen so far (cluster sits at 4.0-4.8%;
+# only two bets have ever exceeded that: Alcantara 7.3% won, Davis Martin 8.5%).
+# Outs Recorded is at least as compound as TB (strikeouts + contact outs +
+# double plays) plus a factor TB doesn't have: the manager's bullpen hook can
+# cap a start regardless of performance — a plausible extra source of exactly
+# the "big stated edge, model overconfident" failure mode TB already showed.
+# Same threshold and shadow mechanism as TB_HIGH_EDGE_THRESHOLD (no OUTS-
+# specific data to justify a different number) — revisit once OUTS has a real
+# settled sample; this is pattern-based caution, not a proven finding.
+OUTS_HIGH_EDGE_THRESHOLD = 7.0   # pp, on raw_edge_pct
+
 # TB calibration band (2026-07-14 diagnostic, n=57). TB was the best CLV market
 # yet the worst P&L (20-37). Four diagnostics found the fault is the baseline
 # win-prob ESTIMATE, not edge detection: the reliability curve was ~calibrated
@@ -1126,6 +1142,18 @@ _jlowe_id = "KXMLBTB-26JUL082005LAATEX-LAAJLOWE3-2|YES"
 for _b in _bets:
     if _b.get("id") == _jlowe_id and _b.get("status") == "open" and _b.get("paper_stake", 0) != 15.0:
         _b["paper_stake"] = 15.0
+        _data_fixed = True
+
+# Fix: Davis Martin 16+ Outs (Aug 9), still open at deploy time — shadow it
+# under the new OUTS_HIGH_EDGE_THRESHOLD now that the cap has shipped. This is
+# the exact bet that prompted the fix: 8.5% raw edge, nearly double every other
+# Pitcher Outs bet seen so far (cluster sits at 4.0-4.8%). Was staked $34.72 at
+# the general 3% cap before the guard existed.
+_dmartin_id = "KXMLBOUTS-26AUG091410CLECWS-CWSDMARTIN65-16|YES"
+for _b in _bets:
+    if _b.get("id") == _dmartin_id and _b.get("status") == "open" and not _b.get("shadow"):
+        _b["shadow"]      = True
+        _b["paper_stake"] = 0.0
         _data_fixed = True
 
 # Fix: Retroactively mark all KXMLBHR bets logged before shadow mode was added
@@ -1925,11 +1953,18 @@ def _add_new_bets(edges: list) -> list:
             # also $0-stakes the TB NO-side experiment bets, which is intended — we
             # track the under side risk-free while testing whether it beats price.
             _tb_shadow_all = _tb_ticker
+            # High raw-edge Pitcher Outs (>=7%) — shadowed 2026-08-09, precautionary
+            # (see OUTS_HIGH_EDGE_THRESHOLD comment), not a proven calibration finding
+            # like TB's. Excluded from win rate/CLV/record like any other shadow bet.
+            _outs_high_edge = (
+                e.get("ticker", "").upper().startswith("KXMLBOUTS")
+                and round(e.get("raw_edge", 0) * 100, 1) >= OUTS_HIGH_EDGE_THRESHOLD
+            )
             # WNBA: only EXTRAPOLATED props run hypothetical shadow; exact-match
             # props + game lines fund normally (2026-07-22).
             shadow      = (_is_shadow(e.get("ticker", "")) or e.get("sanity_shadow", False)
                            or _tb_high_edge or _tb_overconfident or _tb_shadow_all
-                           or _wnba_hypo(e))
+                           or _outs_high_edge or _wnba_hypo(e))
             _cal_mult = _stake_mults.get(_calib_bucket(e), 1.0)
             paper_stake = 0.0 if shadow else round(_paper_kelly_stake(
                 e["edge_pct"], e["kalshi"], _game_time_iso, e.get("ticker", ""),
@@ -3229,6 +3264,8 @@ def _std_kelly_frac(b: dict, clv_mults: dict) -> float:
             time_mult  = _time_kelly_mult(b.get("game_time"))
     clv_mult = clv_mults.get(_calib_bucket(b), 1.0)
     if b.get("ticker", "").upper().startswith("KXMLBTB") and b.get("raw_edge_pct", 0) >= TB_HIGH_EDGE_THRESHOLD:
+        return 0.0
+    if b.get("ticker", "").upper().startswith("KXMLBOUTS") and b.get("raw_edge_pct", 0) >= OUTS_HIGH_EDGE_THRESHOLD:
         return 0.0
     _fraction = b.get("kelly_fraction_applied", PAPER_KELLY_FRACTION)
     _cap      = b.get("kelly_cap_applied", PAPER_KELLY_CAP)

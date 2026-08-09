@@ -5891,7 +5891,7 @@ function mlbLogo(ticker) {
   if (!ticker) return '';
   // (?:G\d+)? tolerates doubleheader suffixes (e.g. PITNYYG1) that sit between
   // the team codes and the dash — without it, game-1/2 props render no logo.
-  const m = ticker.match(/^KXMLB(?:KS|TB|HIT|RBI|HR)-\d{2}[A-Z]{3}\d{6}([A-Z]+)(?:G\d+)?-([A-Z]+?)\d/);
+  const m = ticker.match(/^KXMLB(?:KS|TB|HIT|RBI|HR|OUTS)-\d{2}[A-Z]{3}\d{6}([A-Z]+)(?:G\d+)?-([A-Z]+?)\d/);
   if (!m) return '';
   const matchup = m[1], playerSeg = m[2];
   let away, home;

@@ -361,7 +361,7 @@ MLB_ABBR: Dict[str, str] = {
     "LAA": "Los Angeles Angels",     "LAD": "Los Angeles Dodgers",
     "MIA": "Miami Marlins",          "MIL": "Milwaukee Brewers",
     "MIN": "Minnesota Twins",        "NYM": "New York Mets",
-    "NYY": "New York Yankees",       "OAK": "Oakland Athletics",
+    "NYY": "New York Yankees",       "OAK": "Athletics",
     "PHI": "Philadelphia Phillies",  "PIT": "Pittsburgh Pirates",
     "SD":  "San Diego Padres",       "SF":  "San Francisco Giants",
     "SEA": "Seattle Mariners",       "STL": "St. Louis Cardinals",
@@ -372,7 +372,15 @@ MLB_ABBR: Dict[str, str] = {
     # _parse_mlb_event (all-or-nothing on BOTH teams) returns (None, None) for any
     # SD@AZ / …ATH… game, which silently disables the game-match collision guard
     # for exactly those games — the Eduardo-Rodriguez/AZ phantom lived here.
-    "AZ":  "Arizona Diamondbacks",   "ATH": "Oakland Athletics",
+    #
+    # 2026-08-10: "Oakland Athletics" was WRONG post-relocation — the Odds API
+    # returns the bare string "Athletics" (verified live), so every Athletics
+    # game's game_teams key normalized to "oaklandathletics" on the Kalshi side
+    # vs "athletics" on the Pinnacle side. Never intersected -> every Athletics
+    # strikeout prop was silently rejected as a false collision by the guard
+    # this exact key was added for. Fixed both ATH and the original OAK entry
+    # to the real current name.
+    "AZ":  "Arizona Diamondbacks",   "ATH": "Athletics",
 }
 
 

@@ -488,6 +488,27 @@ PROP_MAX_EDGE  = 0.15   # props above 15% adj edge are almost certainly a line m
 # only, so a phantom K edge is exactly what must never reach a real order.
 STRIKEOUT_MAX_EDGE = 0.08
 
+# Pitcher Outs (KXMLBOUTS): scan ONLY whole-inning lines (user call 2026-08-11).
+# Outs run 3-per-inning, so a Kalshi "N+ Outs Recorded" market lands on a real
+# managerial decision point only when N is a multiple of 3:
+#     floor_strike 14.5 -> "15+ outs" -> exactly 5.0 innings (win qualification)
+#     floor_strike 17.5 -> "18+ outs" -> exactly 6.0 innings (quality start)
+# Mid-inning lines (13+, 16+, 17+, 19+ ...) need the starter pulled PART WAY
+# through an inning, which managers rarely choose to do — so those outcomes hinge
+# on a mid-inning blowup/injury the model can't see, rather than on pitcher
+# quality it can. This is the same bullpen-hook structural risk already flagged
+# for this market (see OUTS_HIGH_EDGE_THRESHOLD in kalshi_ev_ui.py), attacked at
+# the market-selection level instead of the sizing level.
+# Live record when this shipped (n=14, small — directional support, not proof):
+# whole-inning 2W-2L / -$0.53   vs   mid-inning 2W-8L / -$38.03.
+# Live ladder check the same day: this keeps 7 of 12 open outs markets, with
+# 17.5 the single most-offered line (6 of 12).
+# Deliberately an explicit pair, not a general `(N+0.5) % 3 == 0` rule — 5 and 6
+# innings are the meaningful thresholds; 4-inning (11.5) and 7+ inning (20.5,
+# 23.5) whole-inning lines are rarer and a different situation. Add them here if
+# that changes.
+OUTS_SCAN_LINES = frozenset({14.5, 17.5})
+
 
 def kalshi_prices(mkt: dict) -> Optional[Tuple[float, float]]:
     """Return (yes_bid, yes_ask) in [0,1], or None if unavailable / out of bounds.
@@ -3302,6 +3323,9 @@ def scan_player_props(
                 except (TypeError, ValueError):
                     threshold = None
                 if threshold is None:
+                    continue
+                # Pitcher Outs: whole-inning lines only (see OUTS_SCAN_LINES).
+                if prop_type == "pitcher_outs" and threshold not in OUTS_SCAN_LINES:
                     continue
                 kalshi_props.append({
                     "series":    series,

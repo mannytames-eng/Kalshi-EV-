@@ -172,46 +172,6 @@ def _odds_refresh_interval() -> int:
         return  2 * 60       # Peak Trading: 2min (was 75s — see docstring)
     return 15 * 60           # Sleep: 15min
 
-def _props_refresh_interval() -> int:
-    """Return seconds between MLB props scans (PDT context-aware schedule).
-
-    Discovery    09:00–13:00 PDT: 10min — pre-game lines forming
-    Peak Trading 13:00–22:00 PDT: 15min — lineups locked, scratches happen here
-    Early Morning 06:00–09:00 PDT: 15min — pitcher scratches + overnight line gaps
-    Sleep         22:00–06:00 PDT:  OFF  — no upcoming games, save credits
-
-    Game-slate short-circuit: mirrors odds logic — props off when slate over,
-    checked across the whole day so a fully dark day (rainout, All-Star break)
-    doesn't keep scanning Early Morning/Discovery for games that don't exist.
-
-    Rationale: props markets (pitcher strikeouts, total bases) are less liquid
-    than totals — Kalshi can lag Pinnacle by 15-30min after a lineup change or
-    pitcher scratch. Faster-than-Discovery cadence catches those windows.
-
-    Peak slowed 8min -> 15min on 2026-07-10 alongside Hits/RBI removal — see
-    _odds_refresh_interval() docstring for the CLV-by-window rationale (Peak
-    props carry the sample's highest true CLV, 1.37pp, but were being scanned
-    at nearly Discovery's cadence for a fraction of the bet yield per hour).
-
-    Props credit budget (2 markets/event [K, TB only — Hits/RBI cut 2026-07-10],
-    2 credits/market, ~13 events/scan -> 52 credits/scan):
-      Early Morning (4/hr  ×  3h × 52):   624/day
-      Discovery     (6/hr  ×  4h × 52): 1,248/day
-      Peak Trading  (4/hr  ×  9h × 52): 1,872/day
-      Sleep:                                0/day
-      Total props: ~3,744/day
-    """
-    h = _pdt_hour()
-    if _all_games_commenced():
-        return 10 ** 9       # Slate over, or no games today at all — props off
-    if 6  <= h <  9:
-        return 15 * 60       # Early Morning: 15min — starter scratches post overnight
-    if 9  <= h < 13:
-        return 10 * 60       # Discovery: 10min
-    if 13 <= h < 22:
-        return 15 * 60       # Peak Trading: 15min (was 8min — see docstring)
-    return 10 ** 9           # Sleep: OFF
-
 # ── WNBA scheduling (added 2026-07-10) ───────────────────────────────────────
 # WNBA runs a single evening window, not MLB's four-window day — the slate is
 # small (6 games on a typical day, verified against live Kalshi/Odds API data)
@@ -3982,8 +3942,8 @@ print(f"  Loaded {len(_alerted_keys)} previously alerted edge key(s) from disk")
 # Fires a Discord alert when the scanner has produced zero edges for an extended
 # period during game hours — indicates a silent data pipeline failure.
 _zero_edge_streak      = 0          # consecutive scans with no qualifying edges
-_last_props_scan: float = 0.0       # epoch seconds of last props scan
-_last_outs_scan: float = 0.0        # epoch seconds of last pitcher_outs (shadow) fetch — throttled
+_last_outs_scan: float = 0.0        # epoch seconds of last pitcher_outs fetch — throttled,
+                                    # own independent gate since strikeouts was retired 2026-08-12
 OUTS_REFRESH_SECONDS   = 20 * 60    # pitcher_outs paid-fetch cadence: 20 min (user call
                                     # 2026-07-29 — compromise between hourly and 15min now that
                                     # outs is FUNDED not shadow). Cost = 1 credit/market ×
@@ -3993,7 +3953,6 @@ OUTS_REFRESH_SECONDS   = 20 * 60    # pitcher_outs paid-fetch cadence: 20 min (u
 _last_prop_snapshot: dict = {}      # persists between prop scan cycles so UI stays populated
 _last_soccer_scan: float = 0.0      # epoch seconds of last soccer sweep (all leagues)
 _last_tennis_scan: float = 0.0      # epoch seconds of last tennis sweep (ATP + WTA)
-# Props refresh interval is now dynamic — see _props_refresh_interval() above.
 _zero_edge_alerted     = False      # suppresses duplicate alerts per drought
 _ZERO_EDGE_ALERT_SCANS = 60         # 60 × 2-min scan = 2 hours of silence
 
@@ -4639,26 +4598,27 @@ def _run_scan():
         nba = []
         nba_stats = {}
 
-        # Player props — MLB only, interval set by _props_refresh_interval() per PDT window
-        global _last_props_scan, _last_outs_scan
+        # Player props — MLB Outs only. Strikeouts retired from the live scan
+        # 2026-08-12: the edge died in the Aug 4-5 Kalshi repricing (Kalshi now
+        # quotes within ~1c of Pinnacle fair) and never came back; scanning it
+        # at K's old 10-15min cadence cost ~950-1,050 credits/day for zero
+        # funded bets. k_edge_snapshot.py keeps a ~15 credits/day tripwire
+        # running (1 credit/game/day) — if that shows the edge is back, restore
+        # this block to fold "pitcher_strikeouts" into the markets string.
+        #
+        # Outs now runs on its own independent throttle (previously piggybacked
+        # on K's props-scan gate, which only existed to serve K's cadence).
+        global _last_outs_scan
         now_ts = time.time()
-        if now_ts - _last_props_scan >= _props_refresh_interval():
-            # pitcher_outs (SHADOW) is THROTTLED independently: it's an extra paid
-            # Odds-API market (+1 credit/event) on a ~20-contract market, so we
-            # only fold it into the markets string on its own hourly cadence
-            # rather than every 10-15min strikeouts scan. Outs lines are stable
-            # (they move on scratches, already caught by the strikeouts cadence).
-            _outs_due = now_ts - _last_outs_scan >= OUTS_REFRESH_SECONDS
-            _prop_markets = "pitcher_strikeouts" + (",pitcher_outs" if _outs_due else "")
+        _outs_due = (now_ts - _last_outs_scan >= OUTS_REFRESH_SECONDS) and not _all_games_commenced()
+        if _outs_due:
             try:
                 mlb_props, _fresh_prop_snap = scan_player_props(
-                    odds_sport="baseball_mlb", abbr_map=MLB_ABBR, prop_markets=_prop_markets)
+                    odds_sport="baseball_mlb", abbr_map=MLB_ABBR, prop_markets="pitcher_outs")
             except Exception as _prop_exc:
                 print(f"  Props scan error: {_prop_exc}")
                 mlb_props, _fresh_prop_snap = [], {}
-            _last_props_scan = now_ts
-            if _outs_due:
-                _last_outs_scan = now_ts
+            _last_outs_scan = now_ts
         else:
             mlb_props, _fresh_prop_snap = [], {}
 

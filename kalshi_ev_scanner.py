@@ -545,7 +545,7 @@ def kalshi_prices(mkt: dict) -> Optional[Tuple[float, float]]:
 
 
 # ── The Odds API — multi-book ─────────────────────────────────────────────────
-def fetch_book_odds(sport: str, include_h2h: bool = False) -> Tuple[List[dict], str]:
+def fetch_book_odds(sport: str, include_h2h: bool = False, include_spreads: bool = True) -> Tuple[List[dict], str]:
     """
     Fetch spreads / totals (+ h2h if requested) from Pinnacle only.
     Only sharp-book data is used for fair-value — DK/FanDuel have 0 weight.
@@ -554,9 +554,21 @@ def fetch_book_odds(sport: str, include_h2h: bool = False) -> Tuple[List[dict], 
     is now opt-in via include_h2h — MLB moneyline (2026-07) needs it for h2h
     consensus; other callers (WNBA, etc.) default False so they don't pick up
     the extra ~1 credit/call.
+
+    include_spreads defaults True for backward compat. MLB passes False as of
+    2026-08-12 (KXMLBSPREAD paused — zero bets ever produced, see _run_scan()
+    comment). Odds API bills 1 credit per market key actually returned
+    (measured live 2026-08-12, not the stale "spreads+totals=1cr" comment this
+    replaced) — each market dropped from the string is a real credit saved.
     """
     sharp_books = ",".join(k for k, w in BOOK_WEIGHTS.items() if w > 0)
-    markets = "h2h,spreads,totals" if include_h2h else "spreads,totals"
+    _parts = []
+    if include_h2h:
+        _parts.append("h2h")
+    if include_spreads:
+        _parts.append("spreads")
+    _parts.append("totals")
+    markets = ",".join(_parts)
     r = requests.get(f"{ODDS_BASE}/sports/{sport}/odds", params={
         "apiKey":     ODDS_API_KEY,
         "bookmakers": sharp_books,
@@ -2315,16 +2327,18 @@ def fetch_odds_index(
     total_range: Tuple[float, float] = (0, 9999),
     spread_limit: float = 99,
     include_h2h: bool = False,
+    include_spreads: bool = True,
 ) -> Tuple[Optional[Dict], str]:
     """
     Fetch book odds and build the consensus game index.
-    Costs exactly 1 Odds API credit per call (+1 more if include_h2h=True).
+    Costs 1 Odds API credit per market key actually returned (totals always
+    included; +1 for spreads if include_spreads, +1 more for h2h if include_h2h).
 
     Intended for the slow 30-min refresh loop so the fast 2-min Kalshi
     scan can reuse the cached result without spending credits.
     """
     try:
-        games, remaining = fetch_book_odds(odds_sport, include_h2h=include_h2h)
+        games, remaining = fetch_book_odds(odds_sport, include_h2h=include_h2h, include_spreads=include_spreads)
         index = build_consensus_game_index(games, total_range, spread_limit)
         n = len(index) // max(1, 2)
         print(f"  Odds index refreshed [{odds_sport}]: {n} matchups  "

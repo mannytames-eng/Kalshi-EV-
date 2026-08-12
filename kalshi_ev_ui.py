@@ -4436,8 +4436,17 @@ def _send_odds_stale_alert(minutes: float) -> None:
 def _run_odds_refresh():
     """
     Fetch fresh Pinnacle odds (MLB — NBA faded, WNBA runs its own loop) and
-    update the cached index. MLB: spreads + totals = 2 credits/call (verified
-    against the live Odds API 2026-07-10 — no alternate lines requested).
+    update the cached index. MLB: totals only = 1 credit/call (measured live
+    2026-08-12; each of h2h/spreads bills as a separate credit on top).
+
+    Spread + moneyline paused 2026-08-12 (user call, "waste of credits"):
+    KXMLBSPREAD had produced ZERO bets ever (verified against the live bet
+    record) despite being funded, not shadow — a fully efficient market that
+    never found an edge. KXMLBGAME (moneyline) was already shadow with only 3
+    bets total, awaiting a CLV track record it was never going to get fast
+    enough to justify the h2h fetch. Together they cost ~2 extra credits/call
+    (~1,000/day, ~30k/month) for nothing. Flip include_h2h/include_spreads
+    back to True below to restore either.
     """
     global _cached_mlb_index, _cached_nba_index, _last_odds_refresh, \
            _last_odds_cache_success, _odds_game_count
@@ -4446,7 +4455,7 @@ def _run_odds_refresh():
     try:
         mlb_idx, _ = fetch_odds_index(
             "baseball_mlb", total_range=(5.0, 14.0), spread_limit=3.0,
-            include_h2h=True,   # moneyline (KXMLBGAME), shadow mode — 2026-07-14
+            include_h2h=False, include_spreads=False,
         )
         if mlb_idx is not None:
             n_games = len(mlb_idx) // max(1, 2)
@@ -4577,16 +4586,19 @@ def _run_scan():
                 _state["scanning"] = False
             return
 
-        # MLB spreads + totals + moneyline (KXMLBGAME, shadow mode — 2026-07-14).
-        # KXMLBML (the old guess) never resolved on Kalshi; KXMLBGAME is the
-        # real per-game moneyline series, confirmed live. Shadowed via
-        # SHADOW_MARKETS until it earns its own CLV track record, same pattern
-        # as WNBA/TB.
+        # MLB Totals only. Spread (KXMLBSPREAD) and moneyline (KXMLBGAME) paused
+        # 2026-08-12 — spread was funded but had produced zero bets ever;
+        # moneyline was shadow with 3 bets total, never near a CLV verdict. The
+        # underlying fetch no longer requests h2h/spreads at all (see
+        # _run_odds_refresh()), so mlb_idx has no data for those series anyway;
+        # spread_series/ml_series dropped here to match rather than run scan
+        # logic against an index that will never have anything for them. Pass
+        # them back in (and flip the fetch flags) to restore either.
         mlb, mlb_stats, mlb_snapshot = scan_sport(
-            label="MLB — Spread, Totals & Moneyline",
-            spread_series="KXMLBSPREAD",
+            label="MLB — Totals",
+            spread_series=None,
             total_series="KXMLBTOTAL",
-            ml_series="KXMLBGAME",
+            ml_series=None,
             odds_sport="baseball_mlb",
             abbr_map=MLB_ABBR,
             spread_std=MLB_SPREAD_STD,

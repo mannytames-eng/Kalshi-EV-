@@ -2982,6 +2982,14 @@ WNBA_PLAYER_PROP_MARKETS = "player_points,player_rebounds,player_assists"
 WNBA_EXTRAP_PROP_TYPES = {"player_points", "player_rebounds", "player_assists"}
 WNBA_EXTRAP_MAX_RUNGS  = 1.5
 WNBA_EXTRAP_CV = {"player_points": 0.45, "player_rebounds": 0.45, "player_assists": 0.55}
+# Disabled 2026-08-12 (user call): extrapolated WNBA props already ran
+# HYPOTHETICAL-only ($0 stake, see _wnba_hypo in kalshi_ev_ui.py) on unvalidated
+# cv priors — this turns the extrapolation path off so only an exact Pinnacle/
+# Kalshi line match produces a WNBA prop edge at all. Note this doesn't save
+# Odds API credits (same fetch either way); it only narrows what a fetched line
+# is allowed to produce. Flip back on to restore the wider-but-hypothetical
+# behavior; any already-open extrapolated bets are unaffected either way.
+WNBA_EXTRAP_ENABLED = False
 
 MLB_PROP_SERIES: Dict[str, str] = {
     "KXMLBKS":   "pitcher_strikeouts",
@@ -3452,7 +3460,8 @@ def scan_player_props(
         # The Poisson fair below is then a genuine extrapolation, not a wrong-line
         # ghost edge. MLB and far/lumpy WNBA lines stay on the strict guard.
         _wnba_extrap = (
-            mkt_type_label == "wnba_prop"
+            WNBA_EXTRAP_ENABLED
+            and mkt_type_label == "wnba_prop"
             and prop_type in WNBA_EXTRAP_PROP_TYPES
             and abs(pin_line - kalshi_thresh) <= WNBA_EXTRAP_MAX_RUNGS
         )

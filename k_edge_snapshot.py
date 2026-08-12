@@ -12,9 +12,16 @@ with every market quoted exactly 1c wide -- i.e. Kalshi is now pricing
 strikeouts essentially at Pinnacle fair.
 
 Crucially the avg raw edge of FOUND bets held at 4.6-4.9pp right through the
-final week rather than compressing toward the 2% floor, so this looks like a
-DISCRETE change (a market maker / sharp-feed integration on Kalshi's side)
-around Aug 4-5, not gradual in-season efficiency decay.
+final week rather than compressing toward the 2% floor, so this is a DISCRETE
+change around Aug 4-5, not gradual in-season efficiency decay.
+
+CORRECTION (2026-08-11): the original read here was "a market maker arrived
+and tightened spreads." Kalshi candlesticks survive settlement, so the
+pre-cliff spread WAS recoverable after all -- pre-game median spread was
+1.00pp in the 2026-07-14..22 baseline and is 1.00pp now. Market structure
+never changed; only the price LEVEL moved onto Pinnacle fair. This is
+REPRICING, not restructuring. Spread is still tracked below as a tripwire in
+case that changes.
 
 This script samples the full live distribution once a day so we can tell
 whether that's permanent or whether the market loosens back up -- the
@@ -35,7 +42,7 @@ import os
 import re
 import sys
 import urllib.request
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import kalshi_ev_scanner as s  # noqa: E402
@@ -49,7 +56,15 @@ def _get(url):
         return json.loads(r.read()), r.headers.get("x-requests-remaining")
 
 
-def snapshot(max_games=12):
+def snapshot(max_games=16):
+    """Sample the live K edge distribution.
+
+    Only PRE-GAME markets count. Once a game starts Pinnacle drops its lines
+    while Kalshi keeps the contract active, so in-progress games contribute
+    Kalshi-only rows and silently shrink and skew the sample -- an afternoon run
+    collapsed to n=2 on 2026-08-12 for exactly this reason. Skipping them keeps
+    the daily numbers comparable regardless of what time the job actually fires.
+    """
     kev, _ = _get(f"{KALSHI_PUBLIC}/events?series_ticker=KXMLBKS&status=open&limit=200")
     oev, rem_before = _get(
         f"https://api.the-odds-api.com/v4/sports/baseball_mlb/events/?apiKey={ODDS_KEY}"
@@ -57,14 +72,26 @@ def snapshot(max_games=12):
     oidx = {(s._norm(e["away_team"]), s._norm(e["home_team"])): e for e in oev}
 
     rows, used, rem = [], 0, rem_before
+    now = datetime.now(timezone.utc)
+    meta = {"events_seen": 0, "skipped_started": 0, "skipped_unparsed": 0,
+            "skipped_no_odds_event": 0, "sampled": 0}
     for ev in kev.get("events", [])[:max_games]:
         et = ev.get("event_ticker", "")
+        meta["events_seen"] += 1
         away, home = s._parse_mlb_event(et, s.MLB_ABBR)
         if not away or not home:
+            meta["skipped_unparsed"] += 1
+            continue
+        # PRE-GAME ONLY -- see snapshot() docstring.
+        gstart = s._parse_ticker_start_time(et)
+        if gstart is not None and gstart <= now:
+            meta["skipped_started"] += 1
             continue
         oe = oidx.get((s._norm(away), s._norm(home)))
         if not oe:
+            meta["skipped_no_odds_event"] += 1
             continue
+        meta["sampled"] += 1
         try:
             md, _ = _get(f"{KALSHI_PUBLIC}/markets?event_ticker={et}&status=open&limit=100")
             d, rem = _get(
@@ -114,7 +141,7 @@ def snapshot(max_games=12):
                     "taker_edge_pp": round((fair - ask) * 100, 2),
                     "maker_edge_pp": round((fair - bid) * 100, 2),
                 })
-    return rows, used, rem
+    return rows, used, rem, meta
 
 
 def summarize(rows):
@@ -142,11 +169,17 @@ def main():
     if "--json-out" in sys.argv:
         out_path = sys.argv[sys.argv.index("--json-out") + 1]
 
-    rows, used, rem = snapshot()
+    rows, used, rem, meta = snapshot()
     summ = summarize(rows)
     stamp = datetime.now(timezone.utc).isoformat()
 
-    print(f"=== K edge snapshot  {stamp}  ({used} games, {rem} credits left) ===")
+    pdt_hour = (datetime.now(timezone.utc) - timedelta(hours=7)).strftime("%H:%M")
+    print(f"=== K edge snapshot  {stamp}  ({pdt_hour} PDT, {used} games, "
+          f"{rem} credits left) ===")
+    print(f"    slate: {meta['events_seen']} events | sampled {meta['sampled']} "
+          f"| skipped: {meta['skipped_started']} already started, "
+          f"{meta['skipped_no_odds_event']} no odds-event, "
+          f"{meta['skipped_unparsed']} unparsed")
     if not rows:
         print("  no matched markets (off-hours, or no Pinnacle coverage yet)")
         return
@@ -160,7 +193,8 @@ def main():
 
     if out_path:
         with open(out_path, "a") as f:
-            f.write(json.dumps({"ts": stamp, "summary": summ, "rows": rows}) + "\n")
+            f.write(json.dumps({"ts": stamp, "pdt": pdt_hour, "meta": meta,
+                                "summary": summ, "rows": rows}) + "\n")
         print(f"\nappended to {out_path}")
 
 

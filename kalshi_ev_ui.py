@@ -1553,6 +1553,29 @@ if _purge_soccer:
           f"(settled={len(_settled_hit)}, real-staked={len(_staked_hit)} — both "
           f"expected 0; all were $0 shadow flagged by the since-fixed in-play path)")
 
+
+# --- Tag pre-whole-inning-filter Pitcher Outs bets (user call, 2026-08-12) ---
+# OUTS_SCAN_LINES restricts new scans to 14.5/17.5 lines only (see
+# kalshi_ev_scanner.py) -- the only lines that land on a real managerial
+# decision point (exactly 5 or 6 innings). Every KXMLBOUTS bet placed before
+# that filter shipped was flagged on whatever line the old unrestricted scan
+# happened to hit (16.5, 18.5, 19.5, ...). Tagging rather than deleting: 14 of
+# these are SETTLED real-money bets and 1 is a settled shadow bet -- freeze-
+# settled-bets holds, stake/status/pnl untouched. 1 is still open. The tag
+# lets dashboards/analysis exclude the old-regime cohort from the whole-
+# inning-only track record without erasing history.
+import re as _re_outs
+for _b in _bets:
+    _outs_tk = _b.get("ticker", "")
+    if not _outs_tk.upper().startswith("KXMLBOUTS"):
+        continue
+    _outs_m = _re_outs.search(r"-(\d+)$", _outs_tk)
+    if not _outs_m:
+        continue
+    if int(_outs_m.group(1)) not in (14, 17) and _b.get("line_regime") != "pre_whole_inning_filter":
+        _b["line_regime"] = "pre_whole_inning_filter"
+        _data_fixed = True
+
 if _data_fixed:
     _save_bets(_bets)
     print("  Applied one-time data corrections (CLV/pin_entry upgrades)")

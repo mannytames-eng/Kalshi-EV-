@@ -1559,20 +1559,28 @@ if _purge_soccer:
 # kalshi_ev_scanner.py) -- the only lines that land on a real managerial
 # decision point (exactly 5 or 6 innings). Every KXMLBOUTS bet placed before
 # that filter shipped was flagged on whatever line the old unrestricted scan
-# happened to hit (16.5, 18.5, 19.5, ...). Tagging rather than deleting: 14 of
-# these are SETTLED real-money bets and 1 is a settled shadow bet -- freeze-
-# settled-bets holds, stake/status/pnl untouched. 1 is still open. The tag
-# lets dashboards/analysis exclude the old-regime cohort from the whole-
-# inning-only track record without erasing history.
-import re as _re_outs
+# happened to hit. Tagging rather than deleting so history isn't erased
+# (freeze-settled-bets); stake/status/pnl untouched either way.
+#
+# BUGFIX 2026-08-16: the first version of this block parsed the ticker's
+# trailing "-N" (e.g. "...-18") and compared N against (14, 17) -- but N is
+# the display "N+" threshold, not the line: "18+ Outs Recorded" is line 17.5,
+# not 18. That off-by-one wrongly tagged 6 real whole-inning (17.5) bets as
+# pre_whole_inning_filter (Cease, Kirby, Lambert, Anola, Skenes, Bashcraft).
+# Fixed to compare the bet's own stored pin_line_at_flag directly -- the same
+# value OUTS_SCAN_LINES gates against at flag time, no ticker parsing needed.
+# Also un-tags anything the buggy version mistagged.
 for _b in _bets:
-    _outs_tk = _b.get("ticker", "")
-    if not _outs_tk.upper().startswith("KXMLBOUTS"):
+    if not _b.get("ticker", "").upper().startswith("KXMLBOUTS"):
         continue
-    _outs_m = _re_outs.search(r"-(\d+)$", _outs_tk)
-    if not _outs_m:
+    _outs_line = _b.get("pin_line_at_flag")
+    if _outs_line is None:
         continue
-    if int(_outs_m.group(1)) not in (14, 17) and _b.get("line_regime") != "pre_whole_inning_filter":
+    _outs_is_wi = _outs_line in (14.5, 17.5)
+    if _outs_is_wi and _b.get("line_regime") == "pre_whole_inning_filter":
+        del _b["line_regime"]
+        _data_fixed = True
+    elif not _outs_is_wi and _b.get("line_regime") != "pre_whole_inning_filter":
         _b["line_regime"] = "pre_whole_inning_filter"
         _data_fixed = True
 

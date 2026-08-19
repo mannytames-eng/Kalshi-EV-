@@ -71,6 +71,7 @@ from kalshi_ev_scanner import (
     _parse_ticker_date,
     LAST_ODDS_USAGE,
 )
+import kalshi_freshness_watcher as _freshness
 
 PORT = int(os.environ.get("PORT", 8000))   # Railway injects PORT; falls back to 8000 locally
 # ── Refresh cadence (credit budget) ──────────────────────────────────────────
@@ -3984,6 +3985,9 @@ OUTS_REFRESH_SECONDS   = 20 * 60    # pitcher_outs paid-fetch cadence: 20 min (u
 _last_prop_snapshot: dict = {}      # persists between prop scan cycles so UI stays populated
 _last_soccer_scan: float = 0.0      # epoch seconds of last soccer sweep (all leagues)
 _last_tennis_scan: float = 0.0      # epoch seconds of last tennis sweep (ATP + WTA)
+_last_freshness_scan: float = 0.0   # epoch seconds of last market-freshness watch run
+FRESHNESS_REFRESH_SECONDS = 24 * 60 * 60   # once/day -- new Kalshi series don't appear that often,
+                                            # and the free discovery half doesn't need to be fast
 _zero_edge_alerted     = False      # suppresses duplicate alerts per drought
 _ZERO_EDGE_ALERT_SCANS = 60         # 60 × 2-min scan = 2 hours of silence
 
@@ -4732,6 +4736,22 @@ def _run_scan():
                 except Exception as _ten_exc:
                     print(f"  {_tcfg['label']} tennis scan error: {_ten_exc}")
             _last_tennis_scan = now_ts
+
+        # Market-freshness watcher — once/day. Free discovery (poll Kalshi's
+        # public /series list, diff against everything seen before) plus a
+        # tightly-bounded paid watch on anything newly-listed that looks like
+        # a game-line market in a sport we already have team-matching infra
+        # for. Never produces edges/bets of its own -- Discord-alerts only,
+        # for a human to act on. See kalshi_freshness_watcher.py.
+        global _last_freshness_scan
+        if now_ts - _last_freshness_scan >= FRESHNESS_REFRESH_SECONDS:
+            try:
+                _fresh_summary = _freshness.discover_and_watch(
+                    os.path.join(DATA_DIR, "freshness_watch.json"), send_discord)
+                print(f"  Freshness watcher: {_fresh_summary}")
+            except Exception as _fresh_exc:
+                print(f"  Freshness watcher error: {_fresh_exc}")
+            _last_freshness_scan = now_ts
 
         all_edges = sorted(mlb + nba + mlb_props + wnba + wnba_props + soccer + tennis, key=lambda x: x["edge"], reverse=True)
 

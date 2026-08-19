@@ -25,8 +25,11 @@ Two phases:
           API's h2h/spreads/totals without having to guess a prop's market
           key, and
        b) its sport prefix is one we already carry a team abbreviation map
-          for (MLB, WNBA today -- see SPORT_ABBR_MAPS below; add an entry
-          there, same shape as MLB_ABBR, to extend coverage).
+          for (MLB, WNBA, NFL, NHL today -- see SPORT_ABBR_MAPS below; add
+          an entry there, same shape as MLB_ABBR, to extend further. NFL/NHL
+          use NFL_SPREAD_STD/NFL_TOTAL_STD/NHL_SPREAD_STD/NHL_TOTAL_STD,
+          which are textbook approximations, not calibrated -- fine for a
+          "does this look interesting" check, not for ever funding a bet).
      Everything else that's newly discovered -- a new prop type, or a sport
      we don't have team-matching infra for -- gets flagged in the same
      Discord alert with no automated check. Deciding the right Odds-API
@@ -65,8 +68,10 @@ MAX_FLAG_ONLY_PER_RUN  = 15   # cap how many no-auto-check flags one alert lists
 # to match Kalshi's team names against Pinnacle's). Add an entry here (build
 # the abbr map the same shape as MLB_ABBR first) to extend coverage.
 SPORT_ABBR_MAPS = {
-    "KXMLB":  ("baseball_mlb",     s.MLB_ABBR,  s.MLB_SPREAD_STD,  s.MLB_TOTAL_STD),
-    "KXWNBA": ("basketball_wnba",  s.WNBA_ABBR, s.WNBA_SPREAD_STD, s.WNBA_TOTAL_STD),
+    "KXMLB":  ("baseball_mlb",         s.MLB_ABBR,  s.MLB_SPREAD_STD,  s.MLB_TOTAL_STD),
+    "KXWNBA": ("basketball_wnba",      s.WNBA_ABBR, s.WNBA_SPREAD_STD, s.WNBA_TOTAL_STD),
+    "KXNFL":  ("americanfootball_nfl", s.NFL_ABBR,  s.NFL_SPREAD_STD,  s.NFL_TOTAL_STD),
+    "KXNHL":  ("icehockey_nhl",        s.NHL_ABBR,  s.NHL_SPREAD_STD,  s.NHL_TOTAL_STD),
 }
 
 # Series we already actively scan (funded, shadow, or paused-but-built) --

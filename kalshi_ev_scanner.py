@@ -138,6 +138,15 @@ MLB_TOTAL_STD  =  4.5   # runs (total)
 # static (see project memory on known gaps).
 WNBA_SPREAD_STD =  8.5   # points
 WNBA_TOTAL_STD  = 10.5   # points
+# NFL/NHL: not empirical, not calibrated against any settled bet -- these two
+# sports aren't in the funded/live scan, only used by the market-freshness
+# watcher's bounded check (kalshi_freshness_watcher.py). Standard textbook
+# approximations (NFL margin/total std, NHL treated as ~Poisson goals).
+# Calibrate for real before ever funding a bet off either.
+NFL_SPREAD_STD = 13.5   # points
+NFL_TOTAL_STD  = 10.0   # points
+NHL_SPREAD_STD =  1.8   # goals
+NHL_TOTAL_STD  =  2.0   # goals
 
 
 # ── Ticker date parser ───────────────────────────────────────────────────────
@@ -381,6 +390,51 @@ MLB_ABBR: Dict[str, str] = {
     # this exact key was added for. Fixed both ATH and the original OAK entry
     # to the real current name.
     "AZ":  "Arizona Diamondbacks",   "ATH": "Athletics",
+}
+
+# Built 2026-08-19 for the market-freshness watcher (not used by any funded
+# scan). Every code verified against real Kalshi tickers, not guessed: NFL
+# from all 46 currently-listed KXNFLGAME events (all 32 teams appear directly,
+# no ambiguity); NHL from 1,538 settled KXNHLGAME events across a full season,
+# cross-referencing each city's ticker-code prefix/suffix across many
+# different opponents to resolve the New York I/R and Los Angeles K
+# disambiguation Kalshi encodes in the title, not the ticker.
+NFL_ABBR: Dict[str, str] = {
+    "ARI": "Arizona Cardinals",      "ATL": "Atlanta Falcons",
+    "BAL": "Baltimore Ravens",       "BUF": "Buffalo Bills",
+    "CAR": "Carolina Panthers",      "CHI": "Chicago Bears",
+    "CIN": "Cincinnati Bengals",     "CLE": "Cleveland Browns",
+    "DAL": "Dallas Cowboys",         "DEN": "Denver Broncos",
+    "DET": "Detroit Lions",          "GB":  "Green Bay Packers",
+    "HOU": "Houston Texans",         "IND": "Indianapolis Colts",
+    "JAC": "Jacksonville Jaguars",   "KC":  "Kansas City Chiefs",
+    "LV":  "Las Vegas Raiders",      "LAC": "Los Angeles Chargers",
+    "LAR": "Los Angeles Rams",       "MIA": "Miami Dolphins",
+    "MIN": "Minnesota Vikings",      "NE":  "New England Patriots",
+    "NO":  "New Orleans Saints",     "NYG": "New York Giants",
+    "NYJ": "New York Jets",          "PHI": "Philadelphia Eagles",
+    "PIT": "Pittsburgh Steelers",    "SF":  "San Francisco 49ers",
+    "SEA": "Seattle Seahawks",       "TB":  "Tampa Bay Buccaneers",
+    "TEN": "Tennessee Titans",       "WAS": "Washington Commanders",
+}
+
+NHL_ABBR: Dict[str, str] = {
+    "ANA": "Anaheim Ducks",          "BOS": "Boston Bruins",
+    "BUF": "Buffalo Sabres",         "CGY": "Calgary Flames",
+    "CAR": "Carolina Hurricanes",    "CHI": "Chicago Blackhawks",
+    "COL": "Colorado Avalanche",     "CBJ": "Columbus Blue Jackets",
+    "DAL": "Dallas Stars",           "DET": "Detroit Red Wings",
+    "EDM": "Edmonton Oilers",        "FLA": "Florida Panthers",
+    "LA":  "Los Angeles Kings",      "MIN": "Minnesota Wild",
+    "MTL": "Montréal Canadiens",     "NSH": "Nashville Predators",
+    "NJ":  "New Jersey Devils",      "NYI": "New York Islanders",
+    "NYR": "New York Rangers",       "OTT": "Ottawa Senators",
+    "PHI": "Philadelphia Flyers",    "PIT": "Pittsburgh Penguins",
+    "SJ":  "San Jose Sharks",        "SEA": "Seattle Kraken",
+    "STL": "St Louis Blues",         "TB":  "Tampa Bay Lightning",
+    "TOR": "Toronto Maple Leafs",    "UTA": "Utah Mammoth",
+    "VAN": "Vancouver Canucks",      "VGK": "Vegas Golden Knights",
+    "WSH": "Washington Capitals",    "WPG": "Winnipeg Jets",
 }
 
 

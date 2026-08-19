@@ -3537,8 +3537,10 @@ def _get_performance(since: Optional[str] = None) -> dict:
         "KXMLBHIT":  "Hits",
         "KXMLBTB":   "Total Bases",
         "KXMLBRBI":  "RBIs",
-        "KXMLBOUTS": "Pitcher Outs",
+        # KXMLBOUTS deliberately absent -- split below into whole-inning vs
+        # other lines rather than one blended "Pitcher Outs" bucket.
     }
+    _OUTS_WHOLE_INNING_LINES = (14.5, 17.5)
 
     def _perf_label(b: dict) -> str:
         ticker = b.get("ticker", "").upper()
@@ -3567,6 +3569,18 @@ def _get_performance(since: Optional[str] = None) -> dict:
                 _mk = "BTTS" if "BTTS" in ticker else ("Total" if "TOTAL" in ticker else "Moneyline")
                 return f"{_lg} {_mk}"
         if mtype == "prop":
+            if ticker.startswith("KXMLBOUTS"):
+                # Split by the line actually bet, not just the series -- see
+                # OUTS_SCAN_LINES (kalshi_ev_scanner.py) and the
+                # pre_whole_inning_filter tagging this mirrors. Whole-inning
+                # (14.5/17.5) landed +32% ROI historically vs -31.8% for
+                # every other line (16.5/18.5/19.5/...) -- blending them into
+                # one "Pitcher Outs" row hides that the two are not the same
+                # bet. Uses pin_line_at_flag directly (not the ticker suffix,
+                # which is off-by-one from the real line -- "18+" is 17.5).
+                return ("Pitcher Outs (Whole-Inning)"
+                        if b.get("pin_line_at_flag") in _OUTS_WHOLE_INNING_LINES
+                        else "Pitcher Outs (Other Lines)")
             for prefix, label in _PROP_SERIES_LABELS.items():
                 if ticker.startswith(prefix):
                     return label
@@ -7245,7 +7259,7 @@ function renderPerformance(d) {
 
   // By-type breakdown table
   const PROP_LABELS = new Set(['Strikeouts (K)', 'Hits', 'Total Bases', 'RBIs', 'MLB Props', 'NBA Props', 'WNBA Props']);
-  const TYPE_ORDER  = ['MLB Total', 'MLB Spread', 'Strikeouts (K)', 'Pitcher Outs', 'Hits', 'Total Bases', 'RBIs', 'MLB Props', 'NBA Props', 'WNBA Total', 'WNBA Spread', 'WNBA Props', 'MLS Moneyline', 'MLS Total', 'MLS BTTS', 'Argentina Moneyline', 'Argentina Total', 'Argentina BTTS', 'Brazil Moneyline', 'Brazil Total', 'Brazil BTTS', 'Liga MX Moneyline', 'Liga MX Total', 'Liga MX BTTS', 'Brazil B Moneyline', 'Brazil B Total', 'Brazil B BTTS', 'Sudamericana Moneyline', 'Sudamericana Total', 'Sudamericana BTTS', 'Chile Moneyline', 'Chile Total', 'Chile BTTS', 'ATP Moneyline', 'WTA Moneyline'];
+  const TYPE_ORDER  = ['MLB Total', 'MLB Spread', 'Strikeouts (K)', 'Pitcher Outs (Whole-Inning)', 'Pitcher Outs (Other Lines)', 'Hits', 'Total Bases', 'RBIs', 'MLB Props', 'NBA Props', 'WNBA Total', 'WNBA Spread', 'WNBA Props', 'MLS Moneyline', 'MLS Total', 'MLS BTTS', 'Argentina Moneyline', 'Argentina Total', 'Argentina BTTS', 'Brazil Moneyline', 'Brazil Total', 'Brazil BTTS', 'Liga MX Moneyline', 'Liga MX Total', 'Liga MX BTTS', 'Brazil B Moneyline', 'Brazil B Total', 'Brazil B BTTS', 'Sudamericana Moneyline', 'Sudamericana Total', 'Sudamericana BTTS', 'Chile Moneyline', 'Chile Total', 'Chile BTTS', 'ATP Moneyline', 'WTA Moneyline'];
   // Markets no longer scanned — settled record frozen & still shown, but tagged
   // so it's clear no new bets are being placed. Total Bases terminated 2026-07-23.
   const TERMINATED_LABELS = new Set(['Total Bases']);

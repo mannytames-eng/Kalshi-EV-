@@ -3976,12 +3976,21 @@ print(f"  Loaded {len(_alerted_keys)} previously alerted edge key(s) from disk")
 _zero_edge_streak      = 0          # consecutive scans with no qualifying edges
 _last_outs_scan: float = 0.0        # epoch seconds of last pitcher_outs fetch — throttled,
                                     # own independent gate since strikeouts was retired 2026-08-12
-OUTS_REFRESH_SECONDS   = 20 * 60    # pitcher_outs paid-fetch cadence: 20 min (user call
-                                    # 2026-07-29 — compromise between hourly and 15min now that
-                                    # outs is FUNDED not shadow). Cost = 1 credit/market ×
-                                    # ~11 games/scan × ~3 scans/hr ≈ ~12-15k cr/mo. 20min still
-                                    # catches most 15-30min Kalshi-vs-Pinnacle lag windows on a
-                                    # thin (~few priceable contracts/slate) market. Raise to trim.
+OUTS_REFRESH_SECONDS   = 8 * 60     # pitcher_outs paid-fetch cadence: 8 min (user call
+                                    # 2026-08-19 — spend freed budget on the market's best-
+                                    # performing live surface, sped up from 20min now that
+                                    # retiring K + pausing Spread/ML freed ~58k cr/mo of
+                                    # headroom under the 100k cap). Cost = 1 credit/market x
+                                    # real pre-game event count (measured 12 on 2026-08-19,
+                                    # not estimated) x ~16h/day active window: 20min was
+                                    # ~17.3k cr/mo, 8min is ~43.2k cr/mo (+25.9k/mo). Total
+                                    # projected pace ~68k/mo, leaving ~32k/mo margin under
+                                    # cap -- deliberately short of the theoretical fastest
+                                    # (5min would be ~69k/mo alone, ~94k/mo total, too little
+                                    # margin against a heavy doubleheader day tripping the
+                                    # credit-exhaustion 401 that disables the whole scanner).
+                                    # Catches lineup/bullpen-news lag faster; lower to speed
+                                    # up further, raise to trim.
 _last_prop_snapshot: dict = {}      # persists between prop scan cycles so UI stays populated
 _last_soccer_scan: float = 0.0      # epoch seconds of last soccer sweep (all leagues)
 _last_tennis_scan: float = 0.0      # epoch seconds of last tennis sweep (ATP + WTA)

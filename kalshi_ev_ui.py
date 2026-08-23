@@ -2159,24 +2159,29 @@ def _lookup_box_stat(bet: dict):
     # ticker prefix so this works for both new and historical bets.
     if not prop_type:
         _prefix_map = {
-            "KXMLBKS":  "pitcher_strikeouts",
-            "KXMLBHIT": "batter_hits",
-            "KXMLBTB":  "batter_total_bases",
-            "KXMLBRBI": "batter_rbis",
-            "KXMLBHR":  "batter_home_runs",
+            "KXMLBKS":   "pitcher_strikeouts",
+            "KXMLBHIT":  "batter_hits",
+            "KXMLBTB":   "batter_total_bases",
+            "KXMLBRBI":  "batter_rbis",
+            "KXMLBHR":   "batter_home_runs",
+            "KXMLBOUTS": "pitcher_outs",
         }
         _tu = ticker.upper()
         prop_type = next((pt for pfx, pt in _prefix_map.items() if _tu.startswith(pfx)), "")
     if not prop_type or not matchup or not ticker:
         return None
 
-    # Stat field mapping per prop type
+    # Stat field mapping per prop type. pitcher_outs has no direct field --
+    # MLB Stats API reports "inningsPitched" as a string like "6.2" where the
+    # decimal is OUTS into the inning (0/1/2), not a true fraction, so it's
+    # derived below rather than read straight off stat_field like the others.
     stat_map = {
-        "pitcher_strikeouts":  ("pitching",  "strikeOuts",  "K"),
-        "batter_total_bases":  ("batting",   "totalBases",  "TB"),
-        "batter_hits":         ("batting",   "hits",        "H"),
-        "batter_home_runs":    ("batting",   "homeRuns",    "HR"),
-        "batter_rbis":         ("batting",   "rbi",         "RBI"),
+        "pitcher_strikeouts":  ("pitching",  "strikeOuts",     "K"),
+        "batter_total_bases":  ("batting",   "totalBases",     "TB"),
+        "batter_hits":         ("batting",   "hits",           "H"),
+        "batter_home_runs":    ("batting",   "homeRuns",       "HR"),
+        "batter_rbis":         ("batting",   "rbi",            "RBI"),
+        "pitcher_outs":        ("pitching",  "inningsPitched", "Outs"),
     }
     if prop_type not in stat_map:
         return None
@@ -2231,7 +2236,19 @@ def _lookup_box_stat(bet: dict):
                     if full_name.split()[-1].lower() != player_last:
                         continue
                     stats = pdata.get("stats", {}).get(stat_group, {})
-                    val = stats.get(stat_field) if isinstance(stats, dict) else None
+                    if not isinstance(stats, dict):
+                        continue
+                    if prop_type == "pitcher_outs":
+                        ip = stats.get(stat_field)   # e.g. "6.2" -> 6 innings + 2 outs
+                        if ip is None:
+                            continue
+                        whole, _dot, frac = str(ip).partition(".")
+                        try:
+                            val = int(whole) * 3 + int(frac or 0)
+                        except ValueError:
+                            continue
+                    else:
+                        val = stats.get(stat_field)
                     if val is not None:
                         return (val, stat_label)
     except Exception:
@@ -2239,8 +2256,37 @@ def _lookup_box_stat(bet: dict):
     return None
 
 
+def _lookup_wnba_total_result(bet: dict) -> Optional[str]:
+    """Final scoreline + combined total for a settled WNBA Totals (KXWNBATOTAL)
+    bet, e.g. 'SEA 82 - 79 DAL  (Total 161)'. None until the game is Final --
+    this is a settled-record display, not a live tracker."""
+    ev = _wnba_event_for_ticker(bet.get("ticker", "").upper())
+    if not ev or ev.get("state") != "post":
+        return None
+    a_s, h_s = ev.get("away_score"), ev.get("home_score")
+    if a_s is None or h_s is None:
+        return None
+    try:
+        total = int(a_s) + int(h_s)
+    except (TypeError, ValueError):
+        return None
+    return f"{ev.get('away','')} {a_s} - {h_s} {ev.get('home','')}  (Total {total})"
+
+
+def _wants_actual_result(b: dict) -> bool:
+    """True for any settled bet type _fetch_actual_stat knows how to resolve:
+    player props (incl. Pitcher Outs, mkt_type='prop') and WNBA Totals games
+    (mkt_type='total', same value MLB Totals uses -- ticker prefix is the only
+    way to scope this to WNBA specifically)."""
+    return (b.get("mkt_type") in ("prop", "wnba_prop", "nba_prop")
+            or b.get("ticker", "").upper().startswith("KXWNBATOTAL"))
+
+
 def _fetch_actual_stat(bet: dict) -> Optional[str]:
-    """Human-readable final result like '7 K' / '2 TB', or None if unavailable."""
+    """Human-readable final result like '7 K' / '2 TB' / '2 Outs' for props, or
+    'SEA 82 - 79 DAL  (Total 161)' for a WNBA Totals game. None if unavailable."""
+    if bet.get("ticker", "").upper().startswith("KXWNBATOTAL"):
+        return _lookup_wnba_total_result(bet)
     r = _lookup_box_stat(bet)
     return f"{r[0]} {r[1]}" if r else None
 
@@ -2331,19 +2377,21 @@ def _wnba_scoreboard(date_iso: str) -> list:
             data = json.loads(r.read())
         events = []
         for ev in data.get("events", []):
-            comp  = (ev.get("competitions") or [{}])[0]
-            teams = {c.get("homeAway"): (c.get("team") or {}).get("abbreviation", "")
-                     for c in comp.get("competitors", [])}
+            comp   = (ev.get("competitions") or [{}])[0]
+            byside = {c.get("homeAway"): c for c in comp.get("competitors", [])}
+            a, h   = byside.get("away", {}), byside.get("home", {})
             st = ev.get("status", {}) or {}
             events.append({
-                "id":     ev.get("id"),
-                "away":   teams.get("away", ""),
-                "home":   teams.get("home", ""),
-                "start":  ev.get("date"),
-                "state":  (st.get("type") or {}).get("state", ""),
-                "period": st.get("period"),
-                "clock":  st.get("displayClock"),
-                "detail": (st.get("type") or {}).get("shortDetail", ""),
+                "id":         ev.get("id"),
+                "away":       (a.get("team") or {}).get("abbreviation", ""),
+                "home":       (h.get("team") or {}).get("abbreviation", ""),
+                "away_score": a.get("score"),
+                "home_score": h.get("score"),
+                "start":      ev.get("date"),
+                "state":      (st.get("type") or {}).get("state", ""),
+                "period":     st.get("period"),
+                "clock":      st.get("displayClock"),
+                "detail":     (st.get("type") or {}).get("shortDetail", ""),
             })
     except Exception:
         return hit[1] if hit else []
@@ -2991,7 +3039,7 @@ def _check_resolutions():
                     b["status"]      = "won" if side_won else "lost"
                     b["resolved_at"] = datetime.now(timezone.utc).isoformat()
                     b["resolved_by"] = "score"
-                    if b.get("mkt_type") in ("prop", "wnba_prop", "nba_prop") and not b.get("actual_result"):
+                    if _wants_actual_result(b) and not b.get("actual_result"):
                         b["actual_result"] = _fetch_actual_stat(b)
                     # Kelly P&L — use paper_stake as the bet size
                     ps = b.get("paper_stake") or 0.0
@@ -3113,7 +3161,7 @@ def _check_resolutions():
                         b["status"]          = "won" if side_won else "lost"
                         b["resolved_at"]     = datetime.now(timezone.utc).isoformat()
                         b["resolved_by"]     = "kalshi"
-                        if b.get("mkt_type") in ("prop", "wnba_prop", "nba_prop") and not b.get("actual_result"):
+                        if _wants_actual_result(b) and not b.get("actual_result"):
                             b["actual_result"] = _fetch_actual_stat(b)
                         if closing_yes is not None:
                             b["closing_yes_pct"] = closing_yes
@@ -8442,12 +8490,12 @@ def _backfill_actual_results():
     with _bets_lock:
         todo = [b for b in _bets
                 if b.get("status") in ("won", "lost")
-                and b.get("mkt_type") in ("prop", "wnba_prop", "nba_prop")
+                and _wants_actual_result(b)
                 and not b.get("actual_result")
                 and not b.get("ticker", "").upper().startswith("KXMLBHR")]
     if not todo:
         return
-    print(f"  [backfill] filling actual_result for {len(todo)} settled prop bets…")
+    print(f"  [backfill] filling actual_result for {len(todo)} settled prop/WNBA-total bets…")
     filled = 0
     for i, b in enumerate(todo):
         try:

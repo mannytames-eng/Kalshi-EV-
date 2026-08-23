@@ -6087,11 +6087,63 @@ function mlsLogo(ticker) {
   return '';
 }
 
+// MLB game-line logo (KXMLBGAME/SPREAD/TOTAL — not player props, which mlbLogo
+// already covers). GAME's suffix is a plain team code ("ATL"); SPREAD's is a
+// team code + margin digits ("DET8", unconfirmed live but matches the
+// KXNFLSPREAD/mlsLogo team+digit convention already used elsewhere in this
+// file); TOTAL has no team suffix at all (just the strike number), so falls
+// back to the away team — same convention mlsLogo() uses for its Totals.
+function mlbGameLogo(ticker) {
+  if (!ticker) return '';
+  const m = ticker.match(/^KXMLB(?:GAME|SPREAD|TOTAL)-\d{2}[A-Z]{3}\d{6}([A-Z]+)-([A-Z0-9]+)/);
+  if (!m) return '';
+  const seg = m[1], suffix = m[2];
+  let away, home;
+  for (const n of [3, 2]) {
+    const a = seg.slice(0, n), h = seg.slice(n);
+    if (_MLB_TEAMS.has(a) && _MLB_TEAMS.has(h)) { away = a; home = h; break; }
+  }
+  if (!away) return '';
+  let team = away;
+  for (const n of [3, 2]) {
+    const cand = suffix.slice(0, n);
+    if (cand === away || cand === home) { team = cand; break; }
+  }
+  const id = _MLB_ID[team];
+  if (!id) return '';
+  return `<img src="https://www.mlbstatic.com/team-logos/${id}.svg" onerror="this.style.display='none'" style="width:18px;height:18px;vertical-align:middle;margin-right:6px;object-fit:contain;">`;
+}
+
+// WNBA game-line logo (KXWNBASPREAD/TOTAL — not player props, which wnbaLogo
+// already covers). Same suffix conventions as mlbGameLogo.
+function wnbaGameLogo(ticker) {
+  if (!ticker) return '';
+  const m = ticker.match(/^KXWNBA(?:SPREAD|TOTAL)-\d{2}[A-Z]{3}\d{2}([A-Z]+)-([A-Z0-9]+)/);
+  if (!m) return '';
+  const seg = m[1], suffix = m[2];
+  let away, home;
+  for (const n of [4, 3, 2]) {
+    const a = seg.slice(0, n), h = seg.slice(n);
+    if (_WNBA_TEAMS_JS.has(a) && _WNBA_TEAMS_JS.has(h)) { away = a; home = h; break; }
+  }
+  if (!away) return '';
+  let team = away;
+  for (const n of [4, 3, 2]) {
+    const cand = suffix.slice(0, n);
+    if (cand === away || cand === home) { team = cand; break; }
+  }
+  const slug = _WNBA_SLUG[team];
+  if (!slug) return '';
+  return `<img src="https://a.espncdn.com/i/teamlogos/wnba/500/${slug}.png" onerror="this.style.display='none'" style="width:18px;height:18px;vertical-align:middle;margin-right:6px;object-fit:contain;">`;
+}
+
 // Sport-agnostic logo dispatch from a TICKER — use this at render sites.
 // NOTE: named sportLogo (not teamLogo) to avoid colliding with the name-based
 // teamLogo(name) used by matchupHtml further below; JS would let the later
 // declaration win and silently break ticker-based logos.
-function sportLogo(ticker) { return mlbLogo(ticker) || wnbaLogo(ticker) || mlsLogo(ticker); }
+function sportLogo(ticker) {
+  return mlbLogo(ticker) || mlbGameLogo(ticker) || wnbaLogo(ticker) || wnbaGameLogo(ticker) || mlsLogo(ticker);
+}
 
 // Edge color by strength: orange (weakest) → yellow → green → bright green (strongest)
 function edgeColor(pct) {

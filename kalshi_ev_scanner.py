@@ -4049,18 +4049,24 @@ SOCCER_MIN_KALSHI_PRICE = 0.30   # soccer-only price floor (vs the 0.15 global).
                           # would also throw away genuine large edges).
 
 
-def fetch_soccer_odds(odds_key: str) -> Tuple[List[dict], str]:
-    """Fetch Pinnacle h2h (3-way) + totals for a soccer league in one call
-    (2 credits). Returns (games, remaining) where each game is:
+def fetch_soccer_odds(odds_key: str, include_corners: bool = False) -> Tuple[List[dict], str]:
+    """Fetch Pinnacle h2h (3-way) + totals (+ corners if requested) for a
+    soccer league in one call (2 credits, +1 more if include_corners).
+    Returns (games, remaining) where each game is:
         {"home", "away", "commence_time",
          "ml": {team_name: shin_fair_prob},   # home & away (draw is separate)
          "draw": shin_fair_prob,
-         "total": {"line": L, "over_prob": p} or None}
-    ml/draw are the 3-way Shin de-vigged probabilities (sum to 1)."""
+         "total": {"line": L, "over_prob": p} or None,
+         "corners": {line: {"over_prob": p, "under_prob": p}, ...} or {}}
+    ml/draw are the 3-way Shin de-vigged probabilities (sum to 1). corners
+    comes from Pinnacle's alternate_totals_corners market -- a real per-line
+    quote (like alternate_spreads elsewhere in this file), not a fitted
+    distribution, so it's priced by direct match, not Poisson."""
+    markets = "h2h,totals,alternate_totals_corners" if include_corners else "h2h,totals"
     r = requests.get(f"{ODDS_BASE}/sports/{odds_key}/odds", params={
         "apiKey":     ODDS_API_KEY,
         "bookmakers": "pinnacle",
-        "markets":    "h2h,totals",
+        "markets":    markets,
         "oddsFormat": "american",
     }, timeout=15)
     r.raise_for_status()
@@ -4072,7 +4078,7 @@ def fetch_soccer_odds(odds_key: str) -> Tuple[List[dict], str]:
             continue
         entry: dict = {"home": home, "away": away,
                        "commence_time": g.get("commence_time"),
-                       "ml": {}, "draw": None, "total": None}
+                       "ml": {}, "draw": None, "total": None, "corners": {}}
         for bm in g.get("bookmakers", []):
             if bm.get("key") != "pinnacle":
                 continue
@@ -4091,6 +4097,19 @@ def fetch_soccer_odds(odds_key: str) -> Tuple[List[dict], str]:
                         io = american_to_implied(over["price"]); iu = american_to_implied(under["price"])
                         if io + iu > 0:
                             entry["total"] = {"line": float(over["point"]), "over_prob": io / (io + iu)}
+                elif mk.get("key") == "alternate_totals_corners":
+                    by_line: Dict[float, Dict[str, float]] = {}
+                    for o in mk.get("outcomes", []):
+                        pt = o.get("point")
+                        if pt is None or o.get("name") not in ("Over", "Under"):
+                            continue
+                        by_line.setdefault(float(pt), {})[o["name"].lower()] = o["price"]
+                    for line, sides in by_line.items():
+                        if "over" not in sides or "under" not in sides:
+                            continue
+                        io = american_to_implied(sides["over"]); iu = american_to_implied(sides["under"])
+                        if io + iu > 0:
+                            entry["corners"][line] = {"over_prob": io / (io + iu), "under_prob": iu / (io + iu)}
         if entry["ml"] and entry["draw"] is not None:
             games.append(entry)
     return games, remaining
@@ -4272,28 +4291,39 @@ def _soccer_event_live_or_expired(evt: dict, now_utc: datetime) -> bool:
 # "Los Angeles G" that name-matching can't resolve). 'name' = the safe runtime
 # name-matcher (works wherever Kalshi uses full club names — Argentina, Brazil).
 # All launch SHADOW-first (KX* prefixes in SHADOW_MARKETS on the UI side).
+# `enabled`: per-league scan gate (defaults True if absent) — lets one league
+# stay paused while another runs under the same SOCCER_SCANNING_ENABLED master
+# switch. MLS through Chile Primera paused 2026-07-27 (efficient market, no
+# proven static edge); La Liga/EPL added 2026-08-19 with a genuinely new market
+# (corners) neither had been checked on before.
 SOCCER_LEAGUES: List[dict] = [
-    {"label": "MLS", "prefix": "mls", "match": "map", "team_map": MLS_TEAMS,
+    {"label": "MLS", "prefix": "mls", "match": "map", "team_map": MLS_TEAMS, "enabled": False,
      "game_series": "KXMLSGAME", "total_series": "KXMLSTOTAL", "btts_series": "KXMLSBTTS",
      "odds_key": "soccer_usa_mls", "espn": "usa.1"},
-    {"label": "Argentina Primera", "prefix": "arg", "match": "name",
+    {"label": "Argentina Primera", "prefix": "arg", "match": "name", "enabled": False,
      "game_series": "KXARGPREMDIVGAME", "total_series": "KXARGPREMDIVTOTAL", "btts_series": "KXARGPREMDIVBTTS",
      "odds_key": "soccer_argentina_primera_division", "espn": "arg.1"},
-    {"label": "Brazil Serie A", "prefix": "bra", "match": "name",
+    {"label": "Brazil Serie A", "prefix": "bra", "match": "name", "enabled": False,
      "game_series": "KXBRASILEIROGAME", "total_series": "KXBRASILEIROTOTAL", "btts_series": "KXBRASILEIROBTTS",
      "odds_key": "soccer_brazil_campeonato", "espn": "bra.1"},
-    {"label": "Liga MX", "prefix": "lmx", "match": "name",
+    {"label": "Liga MX", "prefix": "lmx", "match": "name", "enabled": False,
      "game_series": "KXLIGAMXGAME", "total_series": "KXLIGAMXTOTAL", "btts_series": "KXLIGAMXBTTS",
      "odds_key": "soccer_mexico_ligamx", "espn": "mex.1"},
-    {"label": "Brazil Serie B", "prefix": "brb", "match": "name",
+    {"label": "Brazil Serie B", "prefix": "brb", "match": "name", "enabled": False,
      "game_series": "KXBRASILEIROBGAME", "total_series": "KXBRASILEIROBTOTAL", "btts_series": "KXBRASILEIROBBTTS",
      "odds_key": "soccer_brazil_serie_b", "espn": "bra.2"},
-    {"label": "Copa Sudamericana", "prefix": "sud", "match": "name",
+    {"label": "Copa Sudamericana", "prefix": "sud", "match": "name", "enabled": False,
      "game_series": "KXCONMEBOLSUDGAME", "total_series": "KXCONMEBOLSUDTOTAL", "btts_series": "KXCONMEBOLSUDBTTS",
      "odds_key": "soccer_conmebol_copa_sudamericana", "espn": "conmebol.sudamericana"},
-    {"label": "Chile Primera", "prefix": "chl", "match": "name",
+    {"label": "Chile Primera", "prefix": "chl", "match": "name", "enabled": False,
      "game_series": "KXCHLLDPGAME", "total_series": "KXCHLLDPTOTAL", "btts_series": "KXCHLLDPBTTS",
      "odds_key": "soccer_chile_campeonato", "espn": "chi.1"},
+    {"label": "La Liga", "prefix": "lal", "match": "name", "enabled": True,
+     "game_series": "KXLALIGAGAME", "total_series": "KXLALIGATOTAL", "btts_series": "KXLALIGABTTS",
+     "corners_series": "KXLALIGACORNERS", "odds_key": "soccer_spain_la_liga", "espn": "esp.1"},
+    {"label": "EPL", "prefix": "epl", "match": "name", "enabled": True,
+     "game_series": "KXEPLGAME", "total_series": "KXEPLTOTAL", "btts_series": "KXEPLBTTS",
+     "corners_series": "KXEPLCORNERS", "odds_key": "soccer_epl", "espn": "eng.1"},
 ]
 
 
@@ -4316,7 +4346,7 @@ def scan_soccer(cfg: dict, games: Optional[List[dict]] = None) -> Tuple[List[dic
             print(f"  {label}: no checkpoint due — skip (0 credits)")
             return [], remaining
         try:
-            games, remaining = fetch_soccer_odds(cfg["odds_key"])
+            games, remaining = fetch_soccer_odds(cfg["odds_key"], include_corners=bool(cfg.get("corners_series")))
         except Exception as exc:
             print(f"  ERROR — {label} book odds: {exc}")
             return [], remaining
@@ -4486,14 +4516,57 @@ def scan_soccer(cfg: dict, games: Optional[List[dict]] = None) -> Tuple[List[dic
                     e["lambda_home"], e["lambda_away"] = round(fit[0], 4), round(fit[1], 4)
                     edges.append(e)
 
+    # ── Corners (direct match — Pinnacle's alternate_totals_corners posts a
+    # real quote at each line, so this is priced like TB/Outs' exact-line
+    # match, not fitted to a distribution). Only run for leagues with a
+    # corners_series configured (only credits fetched if this cost includes
+    # the extra Pinnacle market — see include_corners above).
+    #
+    # Kalshi's corners floor_strike is "at least N" (verified against the live
+    # market's own rules_primary text: floor_strike=9 resolves YES on "9+"
+    # corners, i.e. corners >= 9) -- that's Pinnacle's Over (N-0.5) line, NOT
+    # Over N or Over (N+0.5). This is the OPPOSITE offset from MLB player props
+    # (floor_strike=k there means strictly-greater, k+0.5) -- different Kalshi
+    # product line, different convention, don't assume they match. Reading
+    # floor_strike directly (not regexing "N+ corners" out of the title, which
+    # has no ".5" in it at all -- that was the first version's bug).
+    corners_type = f"{prefix}_corners"
+    if cfg.get("corners_series"):
+        try:
+            corners_events = fetch_kalshi_events(cfg["corners_series"])
+        except Exception as e:
+            print(f"  ERROR — Kalshi {cfg['corners_series']}: {e}")
+            corners_events = []
+        for evt in corners_events:
+            if _soccer_event_live_or_expired(evt, now_utc):
+                continue
+            game = find_game(evt)
+            if not game or not game.get("corners"):
+                continue
+            matchup = f"{game['away']} @ {game['home']}"
+            for mkt in (evt.get("markets") or []):
+                floor_n = mkt.get("floor_strike")
+                if floor_n is None:
+                    continue
+                line = float(floor_n) - 0.5   # Kalshi "N+" -> Pinnacle "Over N-0.5"
+                cl = game["corners"].get(line)
+                if not cl:
+                    continue   # Pinnacle didn't post this exact line — no fair value to use
+                e = _soccer_price_market(mkt, cl["over_prob"], corners_type,
+                                         f"{int(floor_n)}+ corners", matchup,
+                                         game.get("commence_time"), line, line, now_utc)
+                if e:
+                    edges.append(e)
+
     # Correlation control — one best edge per (game, market group). The 3 ML
     # outcomes are mutually exclusive and adjacent rungs correlate, so each group
-    # (moneyline / total / btts) keeps only its single best edge per game.
+    # (moneyline / total / btts / corners) keeps only its single best edge per game.
     edges.sort(key=lambda x: x["edge"], reverse=True)
     best: Dict[Tuple[str, str], dict] = {}
     for e in edges:
         grp = "total" if e["mkt_type"].endswith("_total") else (
-              "btts" if e["mkt_type"].endswith("_btts") else "moneyline")
+              "btts" if e["mkt_type"].endswith("_btts") else (
+              "corners" if e["mkt_type"].endswith("_corners") else "moneyline"))
         best.setdefault((e["matchup"], grp), e)
     edges = sorted(best.values(), key=lambda x: x["edge"], reverse=True)
     if _soccer_fired != _fired_before:

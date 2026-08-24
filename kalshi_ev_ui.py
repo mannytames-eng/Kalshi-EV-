@@ -276,13 +276,13 @@ def _wnba_props_refresh_interval() -> int:
 # broad 08:00–23:00 PDT window covers them; the short-circuit does the precise
 # per-league gating. Each active league costs ONE 2-credit Pinnacle call per
 # 6-min tick only on days it actually plays.
-SOCCER_SCANNING_ENABLED = False   # PAUSED 2026-07-27 — efficient market (Kalshi within
-                                  # ~0.94c of Pinnacle), shadow-only, no proven static edge.
-                                  # Was ~15-22k credits/mo (2cr × active league × 6-min tick)
-                                  # — the biggest discretionary drain against the 100k cap for
-                                  # ~zero edge. Settled shadow records stay frozen; open bets
-                                  # still settle. Re-enable only for a purpose-built latency
-                                  # (Path B) experiment, not the static-edge scan. See tennis flag.
+SOCCER_SCANNING_ENABLED = True    # RE-ENABLED 2026-08-19 (user call) for La Liga/EPL, which
+                                  # carry their own per-league "enabled" flag in
+                                  # SOCCER_LEAGUES (kalshi_ev_scanner.py) -- MLS through Chile
+                                  # Primera stay individually disabled (paused 2026-07-27,
+                                  # efficient market, no proven static edge; unchanged). This
+                                  # master switch only gates the scan cadence timer; the
+                                  # per-league flag decides who actually spends credits.
 SOCCER_WINDOW_START_H   = 8    # 8am PDT (early SA / Liga MX afternoons)
 SOCCER_WINDOW_END_H     = 23   # 11pm PDT (late MLS west-coast)
 
@@ -446,6 +446,11 @@ SHADOW_MARKETS: list[str] = [
                       # Shadow-first until it has a clean settled sample (walkover/
                       # retirement void handling verified) and CLV/win-rate read.
     "KXWTAMATCH",     # WTA match-winner (moneyline) — added 2026-07-27. Same.
+    "KXLALIGA",       # La Liga (KXLALIGAGAME/TOTAL/BTTS/CORNERS) — added 2026-08-19.
+                      # Corners is a genuinely new market type (never priced before on
+                      # any league here), moneyline/total/BTTS are the same math the
+                      # paused leagues used. Shadow-first until it earns its own record.
+    "KXEPL",          # EPL (KXEPLGAME/TOTAL/BTTS/CORNERS) — added 2026-08-19. Same.
     # KXMLBOUTS (pitcher outs) is NOT shadowed — user never wanted it shadow-first
     # (my call when I added it; reversed 2026-07-29). It funds like any other MLB
     # prop (2% floor, ¼-Kelly, 3% cap). The one already-settled shadow bet
@@ -1492,7 +1497,7 @@ def _soccer_game_key(ticker: str) -> Optional[str]:
 #       (best edge survives). Across market types and across scan cycles.
 # OPEN soccer only: every soccer bet is shadow ($0), so nothing here touches
 # real P&L, and SETTLED bets are never modified (freeze-settled-bets).
-_SOCCER_PREFIXES_CLEAN = ("mls", "arg", "bra", "lmx", "brb", "sud", "chl")
+_SOCCER_PREFIXES_CLEAN = ("mls", "arg", "bra", "lmx", "brb", "sud", "chl", "lal", "epl")
 _open_soccer_clean = [
     _b for _b in _bets
     if _b.get("status") == "open"
@@ -2586,14 +2591,15 @@ _SOCCER_ESPN_LEAGUE = {
     "KXMLS": "usa.1", "KXARGPREMDIV": "arg.1",
     "KXBRASILEIROB": "bra.2", "KXBRASILEIRO": "bra.1",   # longest-first (see below)
     "KXLIGAMX": "mex.1", "KXCONMEBOLSUD": "conmebol.sudamericana",
-    "KXCHLLDP": "chi.1",
+    "KXCHLLDP": "chi.1", "KXLALIGA": "esp.1", "KXEPL": "eng.1",
 }
 # Match longest prefix first so KXBRASILEIROB* (Serie B) resolves to bra.2 before
 # the shorter KXBRASILEIRO (Serie A → bra.1) prefix can shadow it.
 _SOCCER_ESPN_PREFIXES = sorted(_SOCCER_ESPN_LEAGUE, key=len, reverse=True)
 # mkt_type prefix → display league name (mkt_type is "<prefix>_moneyline/_total").
 _SOCCER_LEAGUE_NAMES = {"mls": "MLS", "arg": "Argentina", "bra": "Brazil",
-                        "lmx": "Liga MX", "brb": "Brazil B", "sud": "Sudamericana", "chl": "Chile"}
+                        "lmx": "Liga MX", "brb": "Brazil B", "sud": "Sudamericana", "chl": "Chile",
+                        "lal": "La Liga", "epl": "EPL"}
 _soccer_sb_cache: dict = {}   # (espn_league, "YYYYMMDD") → (ts, events) 60s TTL
 
 
@@ -3609,12 +3615,17 @@ def _get_performance(since: Optional[str] = None) -> dict:
             if mtype.endswith("_moneyline"): return f"{_lg} Moneyline"
             if mtype.endswith("_total"):     return f"{_lg} Total"
             if mtype.endswith("_btts"):      return f"{_lg} BTTS"
+            if mtype.endswith("_corners"):   return f"{_lg} Corners"
         for _tk_pfx in _SOCCER_ESPN_PREFIXES:
             if ticker.startswith(_tk_pfx):
                 _lg = {"usa.1": "MLS", "arg.1": "Argentina", "bra.1": "Brazil",
                        "bra.2": "Brazil B", "mex.1": "Liga MX",
-                       "conmebol.sudamericana": "Sudamericana", "chi.1": "Chile"}[_SOCCER_ESPN_LEAGUE[_tk_pfx]]
-                _mk = "BTTS" if "BTTS" in ticker else ("Total" if "TOTAL" in ticker else "Moneyline")
+                       "conmebol.sudamericana": "Sudamericana", "chi.1": "Chile",
+                       "esp.1": "La Liga", "eng.1": "EPL"}[_SOCCER_ESPN_LEAGUE[_tk_pfx]]
+                if "BTTS" in ticker:      _mk = "BTTS"
+                elif "CORNERS" in ticker: _mk = "Corners"
+                elif "TOTAL" in ticker:   _mk = "Total"
+                else:                     _mk = "Moneyline"
                 return f"{_lg} {_mk}"
         if mtype == "prop":
             if ticker.startswith("KXMLBOUTS"):
@@ -4038,21 +4049,12 @@ print(f"  Loaded {len(_alerted_keys)} previously alerted edge key(s) from disk")
 _zero_edge_streak      = 0          # consecutive scans with no qualifying edges
 _last_outs_scan: float = 0.0        # epoch seconds of last pitcher_outs fetch — throttled,
                                     # own independent gate since strikeouts was retired 2026-08-12
-OUTS_REFRESH_SECONDS   = 8 * 60     # pitcher_outs paid-fetch cadence: 8 min (user call
-                                    # 2026-08-19 — spend freed budget on the market's best-
-                                    # performing live surface, sped up from 20min now that
-                                    # retiring K + pausing Spread/ML freed ~58k cr/mo of
-                                    # headroom under the 100k cap). Cost = 1 credit/market x
-                                    # real pre-game event count (measured 12 on 2026-08-19,
-                                    # not estimated) x ~16h/day active window: 20min was
-                                    # ~17.3k cr/mo, 8min is ~43.2k cr/mo (+25.9k/mo). Total
-                                    # projected pace ~68k/mo, leaving ~32k/mo margin under
-                                    # cap -- deliberately short of the theoretical fastest
-                                    # (5min would be ~69k/mo alone, ~94k/mo total, too little
-                                    # margin against a heavy doubleheader day tripping the
-                                    # credit-exhaustion 401 that disables the whole scanner).
-                                    # Catches lineup/bullpen-news lag faster; lower to speed
-                                    # up further, raise to trim.
+OUTS_REFRESH_SECONDS   = 20 * 60    # pitcher_outs paid-fetch cadence: 20 min (reverted
+                                    # 2026-08-19 — user call, back to the pre-8min value.
+                                    # The 8min speedup (~43.2k cr/mo) is being reallocated
+                                    # to new La Liga/EPL soccer coverage instead. Raise to
+                                    # trim credits further, lower to catch lineup/bullpen
+                                    # news lag faster if the budget allows it again.
 _last_prop_snapshot: dict = {}      # persists between prop scan cycles so UI stays populated
 _last_soccer_scan: float = 0.0      # epoch seconds of last soccer sweep (all leagues)
 _last_tennis_scan: float = 0.0      # epoch seconds of last tennis sweep (ATP + WTA)
@@ -4777,14 +4779,18 @@ def _run_scan():
         else:
             wnba_props, _fresh_wnba_prop_snap = [], {}
 
-        # Soccer — MLS + Argentina + Brazil, one sweep on a shared cadence.
-        # Each league self-gates via the FREE /events short-circuit inside
-        # scan_soccer (0 credits on off-days); only active leagues spend the
-        # 2-credit Pinnacle call. All shadow-first via SHADOW_MARKETS.
+        # Soccer — one sweep on a shared cadence across every configured league,
+        # but only leagues with enabled=True in SOCCER_LEAGUES actually scan
+        # (MLS through Chile Primera stay individually paused; La Liga/EPL run).
+        # Each active league self-gates via the FREE /events short-circuit
+        # inside scan_soccer (0 credits on off-days); only active leagues spend
+        # the paid Pinnacle call. All shadow-first via SHADOW_MARKETS.
         global _last_soccer_scan
         soccer: list = []
         if now_ts - _last_soccer_scan >= _soccer_refresh_interval():
             for _cfg in SOCCER_LEAGUES:
+                if not _cfg.get("enabled", True):
+                    continue
                 try:
                     _league_edges, _ = scan_soccer(_cfg)
                     soccer.extend(_league_edges)
@@ -7359,7 +7365,7 @@ function renderPerformance(d) {
 
   // By-type breakdown table
   const PROP_LABELS = new Set(['Strikeouts (K)', 'Hits', 'Total Bases', 'RBIs', 'MLB Props', 'NBA Props', 'WNBA Props']);
-  const TYPE_ORDER  = ['MLB Total', 'MLB Spread', 'Strikeouts (K)', 'Pitcher Outs (Whole-Inning)', 'Pitcher Outs (Other Lines)', 'Hits', 'Total Bases', 'RBIs', 'MLB Props', 'NBA Props', 'WNBA Total', 'WNBA Spread', 'WNBA Props', 'MLS Moneyline', 'MLS Total', 'MLS BTTS', 'Argentina Moneyline', 'Argentina Total', 'Argentina BTTS', 'Brazil Moneyline', 'Brazil Total', 'Brazil BTTS', 'Liga MX Moneyline', 'Liga MX Total', 'Liga MX BTTS', 'Brazil B Moneyline', 'Brazil B Total', 'Brazil B BTTS', 'Sudamericana Moneyline', 'Sudamericana Total', 'Sudamericana BTTS', 'Chile Moneyline', 'Chile Total', 'Chile BTTS', 'ATP Moneyline', 'WTA Moneyline'];
+  const TYPE_ORDER  = ['MLB Total', 'MLB Spread', 'Strikeouts (K)', 'Pitcher Outs (Whole-Inning)', 'Pitcher Outs (Other Lines)', 'Hits', 'Total Bases', 'RBIs', 'MLB Props', 'NBA Props', 'WNBA Total', 'WNBA Spread', 'WNBA Props', 'La Liga Moneyline', 'La Liga Total', 'La Liga BTTS', 'La Liga Corners', 'EPL Moneyline', 'EPL Total', 'EPL BTTS', 'EPL Corners', 'MLS Moneyline', 'MLS Total', 'MLS BTTS', 'Argentina Moneyline', 'Argentina Total', 'Argentina BTTS', 'Brazil Moneyline', 'Brazil Total', 'Brazil BTTS', 'Liga MX Moneyline', 'Liga MX Total', 'Liga MX BTTS', 'Brazil B Moneyline', 'Brazil B Total', 'Brazil B BTTS', 'Sudamericana Moneyline', 'Sudamericana Total', 'Sudamericana BTTS', 'Chile Moneyline', 'Chile Total', 'Chile BTTS', 'ATP Moneyline', 'WTA Moneyline'];
   // Markets no longer scanned — settled record frozen & still shown, but tagged
   // so it's clear no new bets are being placed. Total Bases terminated 2026-07-23.
   const TERMINATED_LABELS = new Set(['Total Bases']);

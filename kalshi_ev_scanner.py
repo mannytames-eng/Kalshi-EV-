@@ -4286,6 +4286,15 @@ def _soccer_event_live_or_expired(evt: dict, now_utc: datetime) -> bool:
     return game_dt is not None and now_utc >= game_dt
 
 
+# Soccer moneyline edges retired 2026-08-19 (user call) — every league checked
+# so far (MLS, Argentina, Brazil A/B, Liga MX, Sudamericana, Chile, and a live
+# EPL sample) came back efficient on moneyline specifically, and La Liga/EPL
+# carry MORE market-making attention than the smaller leagues already ruled
+# out, not less. h2h is still fetched (fetch_soccer_odds) because BTTS's
+# bivariate-Poisson fit needs it as an input — this only stops moneyline from
+# producing its own edges, not from being fetched.
+SOCCER_SCAN_MONEYLINE = False
+
 # Config-driven soccer leagues. `match`: 'map' = hardcoded code→Pinnacle-name
 # map (MLS only — its Kalshi display names are odd abbreviations like
 # "Los Angeles G" that name-matching can't resolve). 'name' = the safe runtime
@@ -4428,27 +4437,28 @@ def scan_soccer(cfg: dict, games: Optional[List[dict]] = None) -> Tuple[List[dic
                 return (game["ml"][name], f"{name} to win")
         return None
 
-    # ── Moneyline ────────────────────────────────────────────────────────────
-    try:
-        ml_events = fetch_kalshi_events(cfg["game_series"])
-    except Exception as e:
-        print(f"  ERROR — Kalshi {cfg['game_series']}: {e}")
-        ml_events = []
-    for evt in ml_events:
-        if _soccer_event_live_or_expired(evt, now_utc):
-            continue
-        game = find_game(evt)
-        if not game:
-            continue
-        matchup = f"{game['away']} @ {game['home']}"
-        for mkt in (evt.get("markets") or []):
-            of = outcome_fair(mkt, game)
-            if not of or of[0] is None:
+    # ── Moneyline (retired — see SOCCER_SCAN_MONEYLINE) ──────────────────────
+    if SOCCER_SCAN_MONEYLINE:
+        try:
+            ml_events = fetch_kalshi_events(cfg["game_series"])
+        except Exception as e:
+            print(f"  ERROR — Kalshi {cfg['game_series']}: {e}")
+            ml_events = []
+        for evt in ml_events:
+            if _soccer_event_live_or_expired(evt, now_utc):
                 continue
-            e = _soccer_price_market(mkt, of[0], ml_type, of[1], matchup,
-                                     game.get("commence_time"), None, None, now_utc)
-            if e:
-                edges.append(e)
+            game = find_game(evt)
+            if not game:
+                continue
+            matchup = f"{game['away']} @ {game['home']}"
+            for mkt in (evt.get("markets") or []):
+                of = outcome_fair(mkt, game)
+                if not of or of[0] is None:
+                    continue
+                e = _soccer_price_market(mkt, of[0], ml_type, of[1], matchup,
+                                         game.get("commence_time"), None, None, now_utc)
+                if e:
+                    edges.append(e)
 
     # ── Total goals (Poisson off Pinnacle's line) ────────────────────────────
     try:

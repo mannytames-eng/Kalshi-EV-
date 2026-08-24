@@ -269,13 +269,11 @@ def _wnba_props_refresh_interval() -> int:
     return 10 ** 9
 
 # ── Soccer scheduling (MLS + Argentina + Brazil, added 2026-07-23) ───────────
-# The real cost gate is now the FREE /events zero-game short-circuit inside
-# scan_soccer (0 credits when a league has no game within 12h). The clock window
-# below is just a coarse "don't even bother checking overnight" bound. Americas
-# leagues (MLS, Argentina, Brazil) all kick off US morning→late-night, so a
-# broad 08:00–23:00 PDT window covers them; the short-circuit does the precise
-# per-league gating. Each active league costs ONE 2-credit Pinnacle call per
-# 6-min tick only on days it actually plays.
+# The real cost gate is the FREE /events zero-game short-circuit inside
+# scan_soccer (0 credits when a league has no game within 12h) -- that's what
+# actually conserves credits on days with no match, regardless of the clock
+# window below, which is just a coarse "don't even bother checking overnight"
+# bound sized to whoever is actually enabled.
 SOCCER_SCANNING_ENABLED = True    # RE-ENABLED 2026-08-19 (user call) for La Liga/EPL, which
                                   # carry their own per-league "enabled" flag in
                                   # SOCCER_LEAGUES (kalshi_ev_scanner.py) -- MLS through Chile
@@ -283,8 +281,20 @@ SOCCER_SCANNING_ENABLED = True    # RE-ENABLED 2026-08-19 (user call) for La Lig
                                   # efficient market, no proven static edge; unchanged). This
                                   # master switch only gates the scan cadence timer; the
                                   # per-league flag decides who actually spends credits.
-SOCCER_WINDOW_START_H   = 8    # 8am PDT (early SA / Liga MX afternoons)
-SOCCER_WINDOW_END_H     = 23   # 11pm PDT (late MLS west-coast)
+# Window re-tuned 2026-08-19 for La Liga/EPL specifically -- the only leagues
+# actually enabled right now. Real kickoff times pulled live from the Odds API
+# (21 EPL + 15 La Liga upcoming fixtures, Aug 24 - Sep 6) run 4:30am-12:30pm
+# PDT, not the old 8am-11pm Americas-tuned window. That old window actively
+# MISSED the closest, most valuable checkpoint (1h before kickoff) for every
+# early Saturday match, since 1h before a 4:30am kickoff is 3:30am -- before
+# the window opened. 3am-6pm covers every observed kickoff's 1h/6h/12h
+# checkpoints with real margin, and drops ~5 hours/day of pointless free
+# short-circuit polling after the last possible European checkpoint. If
+# Americas leagues (MLS/Argentina/Brazil) are ever re-enabled alongside these,
+# this window needs widening back out or splitting per-league -- it no longer
+# covers US evening kickoffs.
+SOCCER_WINDOW_START_H   = 3    # 3am PDT (covers the 1h-before check for a 4:30am kickoff)
+SOCCER_WINDOW_END_H     = 18   # 6pm PDT (covers the 12h-before check for next day's earliest game)
 
 def _soccer_refresh_interval() -> int:
     """Seconds between soccer scan sweeps (all leagues). Broad daytime→night

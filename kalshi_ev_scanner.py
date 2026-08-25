@@ -4135,7 +4135,12 @@ def fetch_soccer_corners(odds_key: str, event_id: str) -> Dict[float, Dict[str, 
     is called lazily, once per game actually at a checkpoint in scan_soccer(),
     not for a league's whole slate. Returns {} on any failure (no corners
     edges that cycle; never raises, mirroring fetch_soccer_odds' callers'
-    fail-open expectations elsewhere in scan_soccer)."""
+    fail-open expectations elsewhere in scan_soccer).
+    NOTE: total goals does NOT need an equivalent alternate_totals fetch --
+    fit_poisson_lambda already handles Pinnacle's quarter-goal lines correctly
+    (see _asian_over_components), so the existing Poisson fit off the bulk-
+    fetched single line is both cheaper and has broader rung coverage than an
+    exact-match alternative would. Don't re-add one without new evidence."""
     try:
         r = requests.get(f"{ODDS_BASE}/sports/{odds_key}/events/{event_id}/odds", params={
             "apiKey":     ODDS_API_KEY,
@@ -4501,6 +4506,17 @@ def scan_soccer(cfg: dict, games: Optional[List[dict]] = None) -> Tuple[List[dic
                     edges.append(e)
 
     # ── Total goals (Poisson off Pinnacle's line) ────────────────────────────
+    # fit_poisson_lambda already handles Pinnacle's quarter-goal lines
+    # correctly (see _asian_over_components: a stake-weighted decomposition
+    # into the two adjacent clean legs, e.g. 2.25 = ½·over2.0 + ½·over2.5) --
+    # a spurious +5pp "edge" on 2026-08-25 turned out to be a bug in a
+    # one-off verification script that skipped that decomposition, not in
+    # this fit. Briefly replaced this block with an alternate_totals exact-
+    # match (mirroring corners) on that false premise; reverted since the
+    # original was already correct and cheaper (0 extra credits vs +1/game/
+    # checkpoint for a per-event alternate_totals fetch) with broader rung
+    # coverage (extrapolates within MLS_MAX_TOTAL_RUNGS vs only Pinnacle's
+    # exact posted alternate lines).
     try:
         tot_events = fetch_kalshi_events(cfg["total_series"])
     except Exception as e:

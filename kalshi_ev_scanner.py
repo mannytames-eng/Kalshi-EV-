@@ -4050,23 +4050,30 @@ SOCCER_MIN_KALSHI_PRICE = 0.30   # soccer-only price floor (vs the 0.15 global).
 
 
 def fetch_soccer_odds(odds_key: str, include_corners: bool = False) -> Tuple[List[dict], str]:
-    """Fetch Pinnacle h2h (3-way) + totals (+ corners if requested) for a
-    soccer league in one call (2 credits, +1 more if include_corners).
-    Returns (games, remaining) where each game is:
-        {"home", "away", "commence_time",
+    """Fetch Pinnacle h2h (3-way) + totals for a soccer league in one call
+    (2 credits). Returns (games, remaining) where each game is:
+        {"id", "home", "away", "commence_time",
          "ml": {team_name: shin_fair_prob},   # home & away (draw is separate)
          "draw": shin_fair_prob,
          "total": {"line": L, "over_prob": p} or None,
          "corners": {line: {"over_prob": p, "under_prob": p}, ...} or {}}
-    ml/draw are the 3-way Shin de-vigged probabilities (sum to 1). corners
-    comes from Pinnacle's alternate_totals_corners market -- a real per-line
-    quote (like alternate_spreads elsewhere in this file), not a fitted
-    distribution, so it's priced by direct match, not Poisson."""
-    markets = "h2h,totals,alternate_totals_corners" if include_corners else "h2h,totals"
+    ml/draw are the 3-way Shin de-vigged probabilities (sum to 1). corners is
+    left empty here -- see fetch_soccer_corners() below. The Odds API's bulk
+    list endpoint used here rejects alternate_totals_corners outright ("Markets
+    not supported by this endpoint") even though the same market works fine
+    on the per-event endpoint -- alternate-line markets are event-only. Every
+    La Liga/EPL scan 500'd on this until fixed 2026-08-25 (caught live, ~30min
+    before a real kickoff): the whole function threw and returned nothing, so
+    moneyline/total/BTTS were ALSO silently broken, not just corners.
+    include_corners is now unused here (kept so callers don't need updating)
+    -- corners is fetched lazily per-game in scan_soccer() instead, only for
+    whichever game is actually at a checkpoint, which is both correct against
+    the endpoint restriction and cheaper (1 credit for the one game being
+    priced, not the whole league's slate)."""
     r = requests.get(f"{ODDS_BASE}/sports/{odds_key}/odds", params={
         "apiKey":     ODDS_API_KEY,
         "bookmakers": "pinnacle",
-        "markets":    markets,
+        "markets":    "h2h,totals",
         "oddsFormat": "american",
     }, timeout=15)
     r.raise_for_status()
@@ -4076,7 +4083,7 @@ def fetch_soccer_odds(odds_key: str, include_corners: bool = False) -> Tuple[Lis
         home, away = g.get("home_team", ""), g.get("away_team", "")
         if not home or not away:
             continue
-        entry: dict = {"home": home, "away": away,
+        entry: dict = {"id": g.get("id"), "home": home, "away": away,
                        "commence_time": g.get("commence_time"),
                        "ml": {}, "draw": None, "total": None, "corners": {}}
         for bm in g.get("bookmakers", []):
@@ -4097,22 +4104,55 @@ def fetch_soccer_odds(odds_key: str, include_corners: bool = False) -> Tuple[Lis
                         io = american_to_implied(over["price"]); iu = american_to_implied(under["price"])
                         if io + iu > 0:
                             entry["total"] = {"line": float(over["point"]), "over_prob": io / (io + iu)}
-                elif mk.get("key") == "alternate_totals_corners":
-                    by_line: Dict[float, Dict[str, float]] = {}
-                    for o in mk.get("outcomes", []):
-                        pt = o.get("point")
-                        if pt is None or o.get("name") not in ("Over", "Under"):
-                            continue
-                        by_line.setdefault(float(pt), {})[o["name"].lower()] = o["price"]
-                    for line, sides in by_line.items():
-                        if "over" not in sides or "under" not in sides:
-                            continue
-                        io = american_to_implied(sides["over"]); iu = american_to_implied(sides["under"])
-                        if io + iu > 0:
-                            entry["corners"][line] = {"over_prob": io / (io + iu), "under_prob": iu / (io + iu)}
         if entry["ml"] and entry["draw"] is not None:
             games.append(entry)
     return games, remaining
+
+
+def _parse_corners_outcomes(outcomes: List[dict]) -> Dict[float, Dict[str, float]]:
+    """Shared by fetch_soccer_corners() below: alternate_totals_corners
+    outcomes -> {line: {"over_prob": p, "under_prob": p}}."""
+    by_line: Dict[float, Dict[str, float]] = {}
+    for o in outcomes:
+        pt = o.get("point")
+        if pt is None or o.get("name") not in ("Over", "Under"):
+            continue
+        by_line.setdefault(float(pt), {})[o["name"].lower()] = o["price"]
+    corners: Dict[float, Dict[str, float]] = {}
+    for line, sides in by_line.items():
+        if "over" not in sides or "under" not in sides:
+            continue
+        io = american_to_implied(sides["over"]); iu = american_to_implied(sides["under"])
+        if io + iu > 0:
+            corners[line] = {"over_prob": io / (io + iu), "under_prob": iu / (io + iu)}
+    return corners
+
+
+def fetch_soccer_corners(odds_key: str, event_id: str) -> Dict[float, Dict[str, float]]:
+    """Fetch Pinnacle's alternate_totals_corners for ONE event (1 credit).
+    alternate-line markets are only available on the per-event odds endpoint,
+    not the bulk list fetch_soccer_odds() uses (see its docstring) -- so this
+    is called lazily, once per game actually at a checkpoint in scan_soccer(),
+    not for a league's whole slate. Returns {} on any failure (no corners
+    edges that cycle; never raises, mirroring fetch_soccer_odds' callers'
+    fail-open expectations elsewhere in scan_soccer)."""
+    try:
+        r = requests.get(f"{ODDS_BASE}/sports/{odds_key}/events/{event_id}/odds", params={
+            "apiKey":     ODDS_API_KEY,
+            "bookmakers": "pinnacle",
+            "markets":    "alternate_totals_corners",
+            "oddsFormat": "american",
+        }, timeout=15)
+        r.raise_for_status()
+        for bm in r.json().get("bookmakers", []):
+            if bm.get("key") != "pinnacle":
+                continue
+            for mk in bm.get("markets", []):
+                if mk.get("key") == "alternate_totals_corners":
+                    return _parse_corners_outcomes(mk.get("outcomes", []))
+    except Exception as exc:
+        print(f"  ERROR — corners fetch [{odds_key}/{event_id}]: {exc}")
+    return {}
 
 
 def minutes_to_kickoff(commence_time, now: Optional[datetime] = None) -> Optional[float]:
@@ -4529,8 +4569,10 @@ def scan_soccer(cfg: dict, games: Optional[List[dict]] = None) -> Tuple[List[dic
     # ── Corners (direct match — Pinnacle's alternate_totals_corners posts a
     # real quote at each line, so this is priced like TB/Outs' exact-line
     # match, not fitted to a distribution). Only run for leagues with a
-    # corners_series configured (only credits fetched if this cost includes
-    # the extra Pinnacle market — see include_corners above).
+    # corners_series configured. Fetched lazily per-game below via
+    # fetch_soccer_corners() — 1 credit only for whichever game is actually
+    # at a checkpoint this cycle, not the whole league's slate (the bulk
+    # endpoint doesn't support this market at all — see fetch_soccer_odds()).
     #
     # Kalshi's corners floor_strike is "at least N" (verified against the live
     # market's own rules_primary text: floor_strike=9 resolves YES on "9+"
@@ -4551,7 +4593,12 @@ def scan_soccer(cfg: dict, games: Optional[List[dict]] = None) -> Tuple[List[dic
             if _soccer_event_live_or_expired(evt, now_utc):
                 continue
             game = find_game(evt)
-            if not game or not game.get("corners"):
+            if not game or not game.get("id"):
+                continue
+            # Fetched lazily here, once per game actually at a checkpoint (not
+            # for the whole league's slate) -- see fetch_soccer_corners().
+            corners = fetch_soccer_corners(cfg["odds_key"], game["id"])
+            if not corners:
                 continue
             matchup = f"{game['away']} @ {game['home']}"
             for mkt in (evt.get("markets") or []):
@@ -4559,7 +4606,7 @@ def scan_soccer(cfg: dict, games: Optional[List[dict]] = None) -> Tuple[List[dic
                 if floor_n is None:
                     continue
                 line = float(floor_n) - 0.5   # Kalshi "N+" -> Pinnacle "Over N-0.5"
-                cl = game["corners"].get(line)
+                cl = corners.get(line)
                 if not cl:
                     continue   # Pinnacle didn't post this exact line — no fair value to use
                 e = _soccer_price_market(mkt, cl["over_prob"], corners_type,

@@ -72,6 +72,7 @@ from kalshi_ev_scanner import (
     LAST_ODDS_USAGE,
 )
 import kalshi_freshness_watcher as _freshness
+import kalshi_mma_watcher as _mma
 
 PORT = int(os.environ.get("PORT", 8000))   # Railway injects PORT; falls back to 8000 locally
 # ── Refresh cadence (credit budget) ──────────────────────────────────────────
@@ -4071,6 +4072,10 @@ _last_tennis_scan: float = 0.0      # epoch seconds of last tennis sweep (ATP + 
 _last_freshness_scan: float = 0.0   # epoch seconds of last market-freshness watch run
 FRESHNESS_REFRESH_SECONDS = 24 * 60 * 60   # once/day -- new Kalshi series don't appear that often,
                                             # and the free discovery half doesn't need to be fast
+_last_mma_scan: float = 0.0         # epoch seconds of last UFC/MMA fight-card watch run
+MMA_REFRESH_SECONDS = 24 * 60 * 60         # once/day -- each fight only needs checking once
+                                            # (state persists which have already alerted), and
+                                            # cards turn over roughly weekly. See kalshi_mma_watcher.py.
 _zero_edge_alerted     = False      # suppresses duplicate alerts per drought
 _ZERO_EDGE_ALERT_SCANS = 60         # 60 × 2-min scan = 2 hours of silence
 
@@ -4839,6 +4844,21 @@ def _run_scan():
             except Exception as _fresh_exc:
                 print(f"  Freshness watcher error: {_fresh_exc}")
             _last_freshness_scan = now_ts
+
+        # UFC/MMA fight-card watcher — once/day. Checks open Kalshi fight
+        # markets against Pinnacle moneyline; the closest signal found in a
+        # full cross-sport sweep (2026-08-25) but not yet over the funding
+        # bar. Discord-alerts only, same as the freshness watcher -- never
+        # produces edges/bets of its own. See kalshi_mma_watcher.py.
+        global _last_mma_scan
+        if now_ts - _last_mma_scan >= MMA_REFRESH_SECONDS:
+            try:
+                _mma_summary = _mma.run(
+                    os.path.join(DATA_DIR, "mma_watch.json"), send_discord)
+                print(f"  MMA watcher: {_mma_summary}")
+            except Exception as _mma_exc:
+                print(f"  MMA watcher error: {_mma_exc}")
+            _last_mma_scan = now_ts
 
         all_edges = sorted(mlb + nba + mlb_props + wnba + wnba_props + soccer + tennis, key=lambda x: x["edge"], reverse=True)
 

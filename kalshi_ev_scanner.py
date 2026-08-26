@@ -26,6 +26,7 @@ import math
 import os
 import re
 import time
+import unicodedata
 from datetime import datetime, timezone, timedelta
 from typing import Dict, List, Optional, Tuple
 
@@ -2136,8 +2137,23 @@ def _parse_ticker_game_time(ticker: str) -> Optional[datetime]:
     return _parse_ticker_start_time(ticker)
 
 
+def _ascii_fold(s: str) -> str:
+    """Decompose accented characters to their base letter (Ureña -> Urena,
+    Núñez -> Nunez) before the caller strips non-ASCII-letter characters.
+    Without this, re.sub(r"[^a-z]", ...) just DELETES an accented character
+    instead of folding it, so "Ureña" strips to "urea" (missing the n) while
+    Pinnacle's usually-unaccented "Urena" strips to "urena" -- the substring
+    match silently fails even though it's the same player. Found live
+    2026-08-26 checking Walbert Ureña: every name-normalizer in this file
+    (_norm, _norm_player, the title_norm in _find_player_in_title, the
+    surname fallback, and soccer's _soccer_norm) had this gap. MLB alone has
+    plenty of accented surnames (Nunez, Suarez, Rodriguez, Martinez, Munoz,
+    Pena, Gomez, Vazquez...), so this wasn't a one-off."""
+    return unicodedata.normalize("NFKD", s or "").encode("ascii", "ignore").decode()
+
+
 def _norm(s: str) -> str:
-    return re.sub(r"[^a-z0-9]", "", s.lower())
+    return re.sub(r"[^a-z0-9]", "", _ascii_fold(s).lower())
 
 
 def _abbr_to_name(abbr: str, abbr_map: Dict[str, str]) -> Optional[str]:
@@ -3087,11 +3103,11 @@ WNBA_PROP_SERIES: Dict[str, str] = {
 
 
 def _norm_player(name: str) -> str:
-    return re.sub(r"[^a-z]", "", name.lower())
+    return re.sub(r"[^a-z]", "", _ascii_fold(name).lower())
 
 
 def _find_player_in_title(title: str, prop_lookup: Dict[str, dict]) -> Optional[dict]:
-    title_norm = re.sub(r"[^a-z]", "", title.lower())
+    title_norm = re.sub(r"[^a-z]", "", _ascii_fold(title).lower())
     # 1. Exact: the player's full normalized name is a substring of the title.
     #    Safe against same-surname confusion — 'eduardorodriguez' matches only
     #    Eduardo, never Grayson.
@@ -3105,7 +3121,7 @@ def _find_player_in_title(title: str, prop_lookup: Dict[str, dict]) -> Optional[
     #    caller's game/team check is the primary guard, this is belt-and-braces.
     surname_hits = []
     for key, pp in prop_lookup.items():
-        last = re.sub(r"[^a-z]", "", pp["player"].split()[-1].lower())
+        last = re.sub(r"[^a-z]", "", _ascii_fold(pp["player"].split()[-1]).lower())
         if len(last) > 3 and last in title_norm:
             surname_hits.append(pp)
     if len(surname_hits) == 1:
@@ -4194,7 +4210,7 @@ _MONTH3 = {"JAN":1,"FEB":2,"MAR":3,"APR":4,"MAY":5,"JUN":6,
            "JUL":7,"AUG":8,"SEP":9,"OCT":10,"NOV":11,"DEC":12}
 
 def _soccer_norm(s: str) -> str:
-    return re.sub(r"[^a-z0-9]", "", (s or "").lower())
+    return re.sub(r"[^a-z0-9]", "", _ascii_fold(s or "").lower())
 
 def _soccer_ticker_date(ticker: str):
     """date object from the KX…-26JUL25… token, or None."""

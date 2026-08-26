@@ -162,6 +162,22 @@ def run(state_file: str, send_discord: Callable[[dict, str], bool]) -> dict:
         oe = _match_pinnacle_fight(sub_a, sub_b, odds_events)
         if not oe:
             continue
+        # Skip fights that have already started/concluded. Kalshi's market
+        # stays "open" for days after a fight actually happens (same issue
+        # found in the MLB sweep earlier this session) -- a decided fight
+        # prices at ~99/100 vs ~0/1, which reads as a huge "edge" against a
+        # stale/irrelevant Pinnacle pregame line. Caught live 2026-08-26:
+        # Piazzon vs Uriel fired a false +37.5pp alert this way on the
+        # watcher's very first run. Pinnacle's per-fight commence_time is the
+        # real signal here (Kalshi's own close_time reflects the card window,
+        # not the individual bout).
+        ct = oe.get("commence_time")
+        if ct:
+            try:
+                if datetime.fromisoformat(ct.replace("Z", "+00:00")) <= now:
+                    continue
+            except (ValueError, AttributeError):
+                pass
         outs = {}
         for bm in oe.get("bookmakers", []):
             if bm.get("key") != "pinnacle":

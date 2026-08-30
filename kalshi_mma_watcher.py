@@ -193,7 +193,7 @@ def run(state_file: str, send_discord: Callable[[dict, str], bool]) -> dict:
         p0, p1 = s.no_vig_prob(outs[names[0]], outs[names[1]])
         fair = {names[0]: p0, names[1]: p1}
 
-        best_this_fight = 0.0
+        best_this_fight, best_desc = 0.0, ""
         for m in markets:
             sub = m.get("yes_sub_title", "")
             bid = float(m.get("yes_bid_dollars") or 0) * 100
@@ -204,14 +204,28 @@ def run(state_file: str, send_discord: Callable[[dict, str], bool]) -> dict:
             if f is None:
                 continue
             f100 = f * 100
-            best_this_fight = max(best_this_fight, f100 - ask, bid - f100)
+            yes_edge, no_edge = f100 - ask, bid - f100
+            if yes_edge > best_this_fight:
+                best_this_fight, best_desc = yes_edge, f"{sub} YES @ {ask/100:.2f} (fair {f100:.1f}%)"
+            if no_edge > best_this_fight:
+                best_this_fight, best_desc = no_edge, f"{sub} NO @ {bid/100:.2f} (fair {f100:.1f}%)"
 
         rec = fights.setdefault(et, {"title": ev.get("title", ""), "best_edge": None, "alerted": False})
         rec["best_edge"] = best_this_fight if rec["best_edge"] is None else max(rec["best_edge"], best_this_fight)
         rec["last_checked"] = now.isoformat()
+        # Printed unconditionally (not just on alert) so a run's stdout always
+        # shows what the best candidate was, without needing to guess whether
+        # a Discord alert actually reached the user -- log retention is too
+        # short to check that after the fact (found 2026-08-30: verified a
+        # real +2.54pp edge by hand that the watcher may or may not have
+        # alerted on before the fight happened, with no way to confirm from
+        # logs after the window rolled off).
+        if best_this_fight > 0:
+            print(f"  MMA watcher: {ev.get('title','?')} best={best_this_fight:.2f}pp -- {best_desc}")
         if best_this_fight >= ALERT_RAW_EDGE_PP and not rec["alerted"]:
             rec["alerted"] = True
             alerts_fired.append((et, rec, best_this_fight))
+            print(f"  MMA watcher: ALERT FIRED — {et} {best_desc} edge={best_this_fight:.2f}pp")
 
     # drop fights whose card has already started/passed -- nothing left to check
     for et in list(fights.keys()):

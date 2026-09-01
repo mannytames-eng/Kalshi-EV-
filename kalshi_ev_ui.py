@@ -1199,6 +1199,44 @@ for _b in _bets:
             print(f"  FREEZE EXCEPTION (user-directed): funded Alcantara pitcher-outs "
                   f"— stake ${_stake:.2f}, pnl ${_pnl:+.2f} (was $0 shadow)")
 
+# EXPLICIT FREEZE EXCEPTION #2 (2026-08-31, user-directed). Ethan Pecko's
+# pitcher-outs bet (7.5% raw edge) auto-shadowed on OUTS_HIGH_EDGE_THRESHOLD
+# (>=7.0pp raw) -- the same guard built after Davis Martin's 8.5% outlier.
+# Investigated before knowing the outcome (game was live, Pecko at 12/15 outs,
+# genuinely undecided) rather than after: correct threshold match (floor_strike
+# 14.5 == pin_line_at_flag), THREE independent books agreeing (books_used:
+# fanduel+draftkings+pinnacle, not a lone Pinnacle anomaly), and a completely
+# normal start (4 clean innings, no early exit) -- none of the red flags Davis
+# Martin had. The user directed funding it as a case-by-case override of the
+# high-edge gate, not a change to the gate itself (OUTS_HIGH_EDGE_THRESHOLD
+# stays 7.0 -- this doesn't touch it). Same DELIBERATE, one-off
+# freeze-settled-bets override as the Alcantara exception above, on the same
+# standard flat-$1000/quarter-Kelly/3%-cap basis (matches its stamped
+# kelly_fraction_applied 0.25): edge 5.2% @ 0.48 -> stake $25.00; won -> pnl
+# +$27.08. Idempotent (guarded on shadow still True).
+_pecko_outs_id = "KXMLBOUTS-26AUG301510HOUNYM-HOUEPECKO70-15|YES"
+for _b in _bets:
+    if _b.get("id") == _pecko_outs_id and _b.get("shadow"):
+        _e = (_b.get("edge_pct") or 0) / 100.0
+        _k = _b.get("kalshi_price") or 0
+        if 0 < _k < 1 and _e > 0:
+            _stake = round(min(_e / (1 - _k) * PAPER_KELLY_FRACTION,
+                               PAPER_KELLY_CAP) * PAPER_START_BALANCE, 2)
+            if _b.get("status") == "won":
+                _pnl = round(_stake * (1 - _k) / _k, 2)
+            elif _b.get("status") == "lost":
+                _pnl = round(-_stake, 2)
+            else:
+                _pnl = _b.get("pnl")
+            _b["paper_stake"]      = _stake
+            _b["shadow"]           = False
+            _b["pnl"]              = _pnl
+            _b["paper_pnl"]        = _pnl
+            _b["freeze_exception"] = "unshadow_20260831_user_directed"
+            _data_fixed = True
+            print(f"  FREEZE EXCEPTION (user-directed): funded Pecko pitcher-outs "
+                  f"— stake ${_stake:.2f}, pnl ${_pnl:+.2f} (was $0 shadow)")
+
 # Fix: bets silently halved by the retroactive-resize migration (now removed
 # above). That migration was a one-time historical correction for the June
 # 2026 time-Kelly-multiplier flip (_time_kelly_mult() -> flat 1.0x), but kept

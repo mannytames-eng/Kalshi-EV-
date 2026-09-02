@@ -1209,18 +1209,22 @@ for _b in _bets:
 # normal start (4 clean innings, no early exit) -- none of the red flags Davis
 # Martin had. The user directed funding it as a case-by-case override of the
 # high-edge gate, not a change to the gate itself (OUTS_HIGH_EDGE_THRESHOLD
-# stays 7.0 -- this doesn't touch it). Same DELIBERATE, one-off
-# freeze-settled-bets override as the Alcantara exception above, on the same
-# standard flat-$1000/quarter-Kelly/3%-cap basis (matches its stamped
-# kelly_fraction_applied 0.25): edge 5.2% @ 0.48 -> stake $25.00; won -> pnl
-# +$27.08. Idempotent (guarded on shadow still True).
+# stays 7.0 -- this doesn't touch it), AND directed half-Kelly (0.5) rather
+# than the standard quarter-Kelly this bet originally stamped (0.25) -- edge
+# 5.2% @ 0.48 hits the 3% cap at half-Kelly: stake $30.00; won -> pnl +$32.50.
+# freeze_exception is also read by _std_kelly_frac() as a bypass for the
+# TB/Outs high-edge zero-out, so the Kelly-P&L readouts count this bet instead
+# of silently re-deriving 0% from the raw edge alone -- setting shadow=False
+# here isn't enough on its own, that function doesn't look at shadow at all.
+# Idempotent (guarded on kelly_fraction_applied != 0.5, not on shadow --
+# shadow is already False after the first pass of this exception).
 _pecko_outs_id = "KXMLBOUTS-26AUG301510HOUNYM-HOUEPECKO70-15|YES"
 for _b in _bets:
-    if _b.get("id") == _pecko_outs_id and _b.get("shadow"):
+    if _b.get("id") == _pecko_outs_id and _b.get("kelly_fraction_applied") != 0.5:
         _e = (_b.get("edge_pct") or 0) / 100.0
         _k = _b.get("kalshi_price") or 0
         if 0 < _k < 1 and _e > 0:
-            _stake = round(min(_e / (1 - _k) * PAPER_KELLY_FRACTION,
+            _stake = round(min(_e / (1 - _k) * 0.5,
                                PAPER_KELLY_CAP) * PAPER_START_BALANCE, 2)
             if _b.get("status") == "won":
                 _pnl = round(_stake * (1 - _k) / _k, 2)
@@ -1228,13 +1232,15 @@ for _b in _bets:
                 _pnl = round(-_stake, 2)
             else:
                 _pnl = _b.get("pnl")
-            _b["paper_stake"]      = _stake
-            _b["shadow"]           = False
-            _b["pnl"]              = _pnl
-            _b["paper_pnl"]        = _pnl
-            _b["freeze_exception"] = "unshadow_20260831_user_directed"
+            _b["paper_stake"]         = _stake
+            _b["shadow"]              = False
+            _b["pnl"]                 = _pnl
+            _b["paper_pnl"]           = _pnl
+            _b["kelly_fraction_applied"] = 0.5
+            _b["kelly_cap_applied"]      = PAPER_KELLY_CAP
+            _b["freeze_exception"]    = "unshadow_halfkelly_20260831_user_directed"
             _data_fixed = True
-            print(f"  FREEZE EXCEPTION (user-directed): funded Pecko pitcher-outs "
+            print(f"  FREEZE EXCEPTION (user-directed): funded Pecko pitcher-outs at half-Kelly "
                   f"— stake ${_stake:.2f}, pnl ${_pnl:+.2f} (was $0 shadow)")
 
 # Fix: bets silently halved by the retroactive-resize migration (now removed
@@ -3358,10 +3364,18 @@ def _std_kelly_frac(b: dict, clv_mults: dict) -> float:
         else:
             time_mult  = _time_kelly_mult(b.get("game_time"))
     clv_mult = clv_mults.get(_calib_bucket(b), 1.0)
-    if b.get("ticker", "").upper().startswith("KXMLBTB") and b.get("raw_edge_pct", 0) >= TB_HIGH_EDGE_THRESHOLD:
-        return 0.0
-    if b.get("ticker", "").upper().startswith("KXMLBOUTS") and b.get("raw_edge_pct", 0) >= OUTS_HIGH_EDGE_THRESHOLD:
-        return 0.0
+    # freeze_exception bypasses the high-edge zero-out below: a bet the user
+    # has explicitly case-by-case overruled (e.g. Pecko, 2026-08-31 -- vetted
+    # before the outcome was known, not an automatic pass for every high-edge
+    # bet) should count in the Kelly-P&L readouts using its own stamped
+    # fraction/cap, not silently re-derive 0% from the raw edge alone. shadow
+    # alone doesn't gate this function at all, so unshadowing a bet elsewhere
+    # isn't sufficient on its own -- this check has to live here too.
+    if not b.get("freeze_exception"):
+        if b.get("ticker", "").upper().startswith("KXMLBTB") and b.get("raw_edge_pct", 0) >= TB_HIGH_EDGE_THRESHOLD:
+            return 0.0
+        if b.get("ticker", "").upper().startswith("KXMLBOUTS") and b.get("raw_edge_pct", 0) >= OUTS_HIGH_EDGE_THRESHOLD:
+            return 0.0
     _fraction = b.get("kelly_fraction_applied", PAPER_KELLY_FRACTION)
     _cap      = b.get("kelly_cap_applied", PAPER_KELLY_CAP)
     return min(full_kelly * _fraction * time_mult * clv_mult, _cap)

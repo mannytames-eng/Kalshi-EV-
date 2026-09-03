@@ -216,8 +216,10 @@ WNBA_WINDOW_END_H   = 22   # 10pm PDT
 # scanning adds ~3-4k credits/month — watch the 100k Odds API cap (running near
 # it). Funds live (not shadow, user call); the calibration penalty auto-halves it
 # if it runs overconfident.
-WNBA_SCANNING_ENABLED = True
-WNBA_PROPS_ENABLED    = True
+WNBA_SCANNING_ENABLED = False   # PAUSED 2026-09-01 (user call) -- scrapped to reallocate
+                                 # credits to NFL. No open WNBA positions at pause time
+                                 # (checked live); settled record stays as-is.
+WNBA_PROPS_ENABLED    = False
 
 def _all_wnba_games_commenced() -> bool:
     """Return True when a confirmed fetch shows zero WNBA games today — either
@@ -275,13 +277,12 @@ def _wnba_props_refresh_interval() -> int:
 # actually conserves credits on days with no match, regardless of the clock
 # window below, which is just a coarse "don't even bother checking overnight"
 # bound sized to whoever is actually enabled.
-SOCCER_SCANNING_ENABLED = True    # RE-ENABLED 2026-08-19 (user call) for La Liga/EPL, which
-                                  # carry their own per-league "enabled" flag in
-                                  # SOCCER_LEAGUES (kalshi_ev_scanner.py) -- MLS through Chile
-                                  # Primera stay individually disabled (paused 2026-07-27,
-                                  # efficient market, no proven static edge; unchanged). This
-                                  # master switch only gates the scan cadence timer; the
-                                  # per-league flag decides who actually spends credits.
+SOCCER_SCANNING_ENABLED = False   # PAUSED 2026-09-01 (user call) -- scrapped entirely
+                                  # (La Liga/EPL included) to reallocate credits to NFL.
+                                  # No open La Liga/EPL positions at pause time (checked
+                                  # live). Per-league "enabled" flags in SOCCER_LEAGUES
+                                  # (kalshi_ev_scanner.py) are now moot underneath this
+                                  # master switch, left as-is rather than touched too.
 # Window re-tuned 2026-08-19 for La Liga/EPL specifically -- the only leagues
 # actually enabled right now. Real kickoff times pulled live from the Odds API
 # (21 EPL + 15 La Liga upcoming fixtures, Aug 24 - Sep 6) run 4:30am-12:30pm

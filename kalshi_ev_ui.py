@@ -4171,14 +4171,14 @@ MMA_REFRESH_SECONDS = 24 * 60 * 60         # once/day -- each fight only needs c
 NFL_SCANNING_ENABLED = True   # shadow-first via SHADOW_MARKETS regardless of this flag
 NFL_WINDOW_START_H   = 6    # 6am PDT
 NFL_WINDOW_END_H     = 22   # 10pm PDT -- covers MNF kickoff (5:15pm PT) through the game
-NFL_GAME_REFRESH_SECONDS  = 45 * 60   # spread/total/ml: cheap (3 credits/call incl. h2h),
-                                       # fine at this cadence even across the full window
-NFL_PROPS_REFRESH_SECONDS = 45 * 60   # props: real per-event cost once Pinnacle populates
-                                       # alternates -- start conservative, tune against the
-                                       # live credit readout once a full Sunday slate is open
-                                       # (same iterate-from-live-data pattern as WNBA/soccer).
+NFL_GAME_REFRESH_SECONDS  = 45 * 60   # spread/total/ml: cheap (3 credits/call incl. h2h) --
+                                       # ~1,900 credits/month flat, a rounding error next to
+                                       # props, so no day/hour gating needed here. Kept simple
+                                       # deliberately: user confirmed 2026-09-03 the thesis is
+                                       # game lines won't yield edges (near-misses only, -3.0%
+                                       # to +0.1pp on the first live scan) -- this is a cheap
+                                       # insurance check, not where NFL's build effort goes.
 _last_nfl_scan: float = 0.0         # epoch seconds of last NFL game-line sweep
-_last_nfl_props_scan: float = 0.0   # epoch seconds of last NFL props sweep
 
 def _nfl_window_open() -> bool:
     if not NFL_SCANNING_ENABLED:
@@ -4189,8 +4189,56 @@ def _nfl_window_open() -> bool:
 def _nfl_refresh_interval() -> int:
     return NFL_GAME_REFRESH_SECONDS if _nfl_window_open() else 10 ** 9
 
+# ── NFL props scheduling -- day/hour-gated two-tier (added 2026-09-04) ───────
+# Real measured cost (live 2026-09-03): 10 credits/event (5 base + 5 alternate
+# market keys -- verified live that DraftKings/FanDuel now post real alternate
+# data even though Pinnacle hasn't yet, so trimming the alternates to save
+# credits would cost real matching power, not just credits -- not worth it).
+# scan_player_props caps at MAX_PROP_EVENTS=15, so once Kalshi lists the full
+# ~16-game week (observed to happen most of the week, not just Sunday) one
+# props call costs up to 15*10 + 3 (game index) = 153 credits.
+#
+# A flat 45min/16h-window cadence (the original build) projected to roughly
+# 64-80k credits/month for props ALONE once the full slate is loaded most
+# days -- most of the 100k/month cap, on a schedule that scans exactly as
+# often at 3am Tuesday as during Sunday's window. That's backwards: real
+# closing-line movement (the thing every proven edge this session actually
+# traced back to -- Outs, Pecko, the MLB Peak-Trading CLV data) concentrates
+# in the hours around actual kickoffs, not idle weekday mornings. So cadence
+# is redirected there instead of spread flat across the whole day/week:
+#   TIGHT   (real kickoff windows -- Thu evening, all Sunday, Mon evening):
+#     30min cadence -- catches closing-line movement near real kickoffs.
+#   COARSE  (everything else in the 6am-10pm PDT daily window):
+#     2h cadence -- still catches a freshly-listed line settling in in a
+#     dead midweek morning, at a fraction of the cost.
+# Projects to roughly ~53k credits/month for props (~55k incl. game lines) --
+# well inside the 100k cap alongside MLB's ~17-27k/month baseline, with real
+# margin left over (vs. the freed ~18-26k/month from pausing WNBA+soccer).
+# Retune against the live credit readout (/api/scan -> odds_credits) once a
+# full real week has run, same iterate-from-live-data pattern as WNBA/soccer.
+NFL_PROPS_TIGHT_REFRESH_SECONDS  = 30 * 60
+NFL_PROPS_COARSE_REFRESH_SECONDS = 2 * 60 * 60
+_last_nfl_props_scan: float = 0.0   # epoch seconds of last NFL props sweep
+
+def _nfl_props_tight_window() -> bool:
+    """True during real NFL kickoff windows (PDT): Thu 3-9pm (TNF ~5:15pm),
+    all Sunday 7am-9pm (early/late/SNF slate), Mon 3-9pm (MNF ~5:15pm).
+    Python weekday(): Mon=0 .. Sun=6."""
+    from datetime import timedelta as _td
+    now = datetime.now(timezone.utc) - _td(hours=7)
+    wd, h = now.weekday(), now.hour
+    if wd == 3:                      # Thursday
+        return 15 <= h < 21
+    if wd == 6:                      # Sunday
+        return 7 <= h < 21
+    if wd == 0:                      # Monday
+        return 15 <= h < 21
+    return False
+
 def _nfl_props_refresh_interval() -> int:
-    return NFL_PROPS_REFRESH_SECONDS if _nfl_window_open() else 10 ** 9
+    if not _nfl_window_open():
+        return 10 ** 9
+    return NFL_PROPS_TIGHT_REFRESH_SECONDS if _nfl_props_tight_window() else NFL_PROPS_COARSE_REFRESH_SECONDS
 _zero_edge_alerted     = False      # suppresses duplicate alerts per drought
 _ZERO_EDGE_ALERT_SCANS = 60         # 60 × 2-min scan = 2 hours of silence
 

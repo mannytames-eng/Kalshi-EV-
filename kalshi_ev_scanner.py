@@ -3179,10 +3179,19 @@ def build_all_player_props(
     odds_events: List[dict],
     needed_teams: Optional[set] = None,
     markets: str = None,
+    lookahead_hours: float = 48.0,
 ) -> Dict[str, Dict[str, dict]]:
     """
     Fetch player-prop odds for all books and build a weighted-consensus
     no-vig over probability per (player, prop_type).
+
+    lookahead_hours bounds how far out a game can be and still get scanned —
+    48h fits MLB/WNBA (games are same-day/next-day). NFL needs it widened:
+    Pinnacle prices and Kalshi lists a whole week's slate up to ~10 days out,
+    and that early, thin-line window is exactly what this scanner exists to
+    catch (found live 2026-09-03 -- the default 48h silently zeroed every NFL
+    game, since the nearest one was 6+ days away, even though real Pinnacle
+    odds already existed for it).
 
     Returns: { player_norm: { prop_type: {player, line, over_prob, lambda} } }
     """
@@ -3194,7 +3203,7 @@ def build_all_player_props(
         ct_str = ev.get("commence_time", "")
         try:
             ct = datetime.fromisoformat(ct_str.replace("Z", "+00:00"))
-            if ct <= now or (ct - now).total_seconds() > 172800:
+            if ct <= now or (ct - now).total_seconds() > lookahead_hours * 3600:
                 continue
         except ValueError:
             continue
@@ -3378,11 +3387,14 @@ def scan_player_props(
     sport_label: str = "MLB",
     mkt_type_label: str = "prop",
     parse_event_fn=None,
+    lookahead_hours: float = 48.0,
 ) -> List[dict]:
     """
     Scan Kalshi player-prop markets vs consensus no-vig props.
     Sport-agnostic — pass prop_series, prop_markets, and sport_label for each sport.
-    Defaults to MLB configuration.
+    Defaults to MLB configuration. lookahead_hours passes through to
+    build_all_player_props (see its docstring — widen for sports whose books
+    post a whole week's props at once, like NFL).
     """
     if abbr_map is None:
         abbr_map = MLB_ABBR
@@ -3506,10 +3518,11 @@ def scan_player_props(
         return [], {}
 
     # 4. Build player prop consensus index
-    player_lookup = build_all_player_props(odds_sport, odds_events, needed_teams or None, markets=prop_markets)
+    player_lookup = build_all_player_props(odds_sport, odds_events, needed_teams or None, markets=prop_markets,
+                                            lookahead_hours=lookahead_hours)
     if not player_lookup:
         print("  No player prop data available — skipping.")
-        return []
+        return [], {}
 
     # 5. Match Kalshi markets → consensus fair value
     edges:      List[dict] = []

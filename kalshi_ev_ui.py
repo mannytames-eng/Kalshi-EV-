@@ -4951,6 +4951,9 @@ def _run_scan():
                     prop_markets=NFL_PLAYER_PROP_MARKETS,
                     sport_label="NFL", mkt_type_label="prop",
                     parse_event_fn=_parse_nfl_event,
+                    lookahead_hours=240,   # ~10 days -- default 48h zeroed every NFL game
+                                           # live 2026-09-03 (nearest kickoff was 6+ days out
+                                           # even though real Pinnacle odds already existed)
                 )
             except Exception as _nfl_prop_exc:
                 print(f"  NFL props scan error: {_nfl_prop_exc}")

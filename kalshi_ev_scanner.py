@@ -2266,6 +2266,24 @@ def _parse_nba_event(ticker: str, abbr_map: Dict[str, str]) -> Tuple[Optional[st
     return None, None
 
 
+def _parse_nfl_event(ticker: str, abbr_map: Dict[str, str]) -> Tuple[Optional[str], Optional[str]]:
+    """NFL tickers carry no time component (KXNFLGAME-26SEP09NESEA -- just
+    yy+3-letter-month+dd), unlike MLB's date+time (KXMLBKS-26AUG301510...).
+    _parse_mlb_event's regex requires a trailing 4-digit time and silently
+    fails to strip the prefix here (re.sub returns the ticker unchanged when
+    it doesn't match, which isn't empty, so its own empty-suffix fallback
+    never fires either) -- same team-splitting logic otherwise, just the
+    right prefix pattern for this ticker shape."""
+    suffix = re.sub(r"^KX\w+?-\d{2}[A-Z]{3}\d{2}", "", ticker).lstrip("-")
+    for i in range(2, len(suffix) - 1):
+        a, b = suffix[:i], suffix[i:]
+        na = _abbr_to_name(a, abbr_map)
+        nb = _abbr_to_name(b, abbr_map)
+        if na and nb:
+            return na, nb
+    return None, None
+
+
 def _parse_mlb_event(ticker: str, abbr_map: Dict[str, str]) -> Tuple[Optional[str], Optional[str]]:
     suffix = re.sub(r"^KX\w+?-\d+[A-Z]+\d+\d{4}", "", ticker)
     if not suffix:
@@ -3100,6 +3118,33 @@ WNBA_PROP_SERIES: Dict[str, str] = {
     "KXWNBAREB": "player_rebounds",
     "KXWNBAAST": "player_assists",
 }
+
+# NFL props (added 2026-09-03, SHADOW). Pinnacle only posts ONE line per
+# player-market a week out (verified live: player_pass_yds returned a single
+# 227.5/228.5 line, no alternates yet) -- the "_alternate" markets are valid,
+# documented keys (confirmed: a direct call returns 200 with an empty
+# bookmakers list, not an error) that Pinnacle fills in as game day nears, not
+# something to build custom extrapolation for like WNBA needed. Requesting
+# both here means scan_player_props's existing alt-merge logic (already used
+# by MLB/WNBA -- "Standard and *_alternate markets are merged under the same
+# prop_type") picks up real per-line quotes the moment they're posted, with
+# zero new code. Until then, only the single main-line rung gets a genuine
+# exact-line match; every other Kalshi rung is correctly rejected as a line
+# mismatch, same guard MLB uses -- no silent extrapolation.
+NFL_PROP_SERIES: Dict[str, str] = {
+    "KXNFLPASSYDS": "player_pass_yds",
+    "KXNFLRSHYDS":  "player_rush_yds",
+    "KXNFLRECYDS":  "player_reception_yds",
+    "KXNFLREC":     "player_receptions",
+    "KXNFLPASSTDS": "player_pass_tds",
+}
+NFL_PLAYER_PROP_MARKETS = (
+    "player_pass_yds,player_pass_yds_alternate,"
+    "player_rush_yds,player_rush_yds_alternate,"
+    "player_reception_yds,player_reception_yds_alternate,"
+    "player_receptions,player_receptions_alternate,"
+    "player_pass_tds,player_pass_tds_alternate"
+)
 
 
 def _norm_player(name: str) -> str:

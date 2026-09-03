@@ -65,7 +65,10 @@ from kalshi_ev_scanner import (
     MLB_SPREAD_STD, MLB_TOTAL_STD,
     NBA_SPREAD_STD, NBA_TOTAL_STD,
     WNBA_SPREAD_STD, WNBA_TOTAL_STD,
-    MLB_ABBR, NBA_ABBR, WNBA_ABBR,
+    NFL_SPREAD_STD, NFL_TOTAL_STD,
+    MLB_ABBR, NBA_ABBR, WNBA_ABBR, NFL_ABBR,
+    NFL_PROP_SERIES, NFL_PLAYER_PROP_MARKETS,
+    _parse_nfl_event,
     EDGE_THRESHOLD,
     _parse_ticker_start_time,
     _parse_ticker_date,
@@ -463,6 +466,12 @@ SHADOW_MARKETS: list[str] = [
                       # any league here), moneyline/total/BTTS are the same math the
                       # paused leagues used. Shadow-first until it earns its own record.
     "KXEPL",          # EPL (KXEPLGAME/TOTAL/BTTS/CORNERS) — added 2026-08-19. Same.
+    "KXNFL",          # NFL (KXNFLGAME/SPREAD/TOTAL + PASSYDS/RSHYDS/RECYDS/REC/
+                      # PASSTDS props) — added 2026-09-03, the week Pinnacle
+                      # started pricing the season opener. Brand new to this
+                      # scanner on both sides (game lines AND props); shadow-
+                      # first until it earns its own record, same as everything
+                      # else here.
     # KXMLBOUTS (pitcher outs) is NOT shadowed — user never wanted it shadow-first
     # (my call when I added it; reversed 2026-07-29). It funds like any other MLB
     # prop (2% floor, ¼-Kelly, 3% cap). The one already-settled shadow bet
@@ -4146,6 +4155,42 @@ _last_mma_scan: float = 0.0         # epoch seconds of last UFC/MMA fight-card w
 MMA_REFRESH_SECONDS = 24 * 60 * 60         # once/day -- each fight only needs checking once
                                             # (state persists which have already alerted), and
                                             # cards turn over roughly weekly. See kalshi_mma_watcher.py.
+
+# ── NFL scheduling (added 2026-09-03) ─────────────────────────────────────────
+# Built the week Pinnacle started pricing the season opener (Sept 10) -- real
+# player-prop odds for game 1 are live a week out, and Kalshi already has
+# matching KXNFLPASSYDS/KXNFLRSHYDS/KXNFLRECYDS/KXNFLREC/KXNFLPASSTDS +
+# KXNFLGAME/SPREAD/TOTAL events open for it. Unlike MLB/WNBA there's no
+# free/events short-circuit here yet and no dedicated background odds-cache
+# loop -- both scan_sport (game lines) and scan_player_props (props) just
+# self-fetch inline, gated by this one window/interval, same lightweight
+# shape as the soccer/tennis inline calls. NFL games only run Thu/Sun/Mon in
+# the regular season, but the PROP LINES themselves are live and moving all
+# week before kickoff -- exactly the "freshly listed, not yet arbed" window
+# this build exists to catch -- so the window is NOT restricted to game days.
+NFL_SCANNING_ENABLED = True   # shadow-first via SHADOW_MARKETS regardless of this flag
+NFL_WINDOW_START_H   = 6    # 6am PDT
+NFL_WINDOW_END_H     = 22   # 10pm PDT -- covers MNF kickoff (5:15pm PT) through the game
+NFL_GAME_REFRESH_SECONDS  = 45 * 60   # spread/total/ml: cheap (3 credits/call incl. h2h),
+                                       # fine at this cadence even across the full window
+NFL_PROPS_REFRESH_SECONDS = 45 * 60   # props: real per-event cost once Pinnacle populates
+                                       # alternates -- start conservative, tune against the
+                                       # live credit readout once a full Sunday slate is open
+                                       # (same iterate-from-live-data pattern as WNBA/soccer).
+_last_nfl_scan: float = 0.0         # epoch seconds of last NFL game-line sweep
+_last_nfl_props_scan: float = 0.0   # epoch seconds of last NFL props sweep
+
+def _nfl_window_open() -> bool:
+    if not NFL_SCANNING_ENABLED:
+        return False
+    h = _pdt_hour()
+    return NFL_WINDOW_START_H <= h < NFL_WINDOW_END_H
+
+def _nfl_refresh_interval() -> int:
+    return NFL_GAME_REFRESH_SECONDS if _nfl_window_open() else 10 ** 9
+
+def _nfl_props_refresh_interval() -> int:
+    return NFL_PROPS_REFRESH_SECONDS if _nfl_window_open() else 10 ** 9
 _zero_edge_alerted     = False      # suppresses duplicate alerts per drought
 _ZERO_EDGE_ALERT_SCANS = 60         # 60 × 2-min scan = 2 hours of silence
 
@@ -4864,6 +4909,54 @@ def _run_scan():
         else:
             wnba_props, _fresh_wnba_prop_snap = [], {}
 
+        # NFL — game lines (spread/total/ml) + player props, added 2026-09-03.
+        # No cached background index like MLB/WNBA — self-fetches inline on its
+        # own gate (see _nfl_refresh_interval() for why). Total/spread ranges
+        # sized for real NFL magnitudes (totals ~30-55, spreads ~1-20), unlike
+        # scan_sport's built-in self-fetch fallback which is NBA/WNBA-shaped
+        # (170-280 total range) -- so the index is always fetched here rather
+        # than left to that fallback. Shadow-first via SHADOW_MARKETS.
+        global _last_nfl_scan
+        nfl: list = []
+        if now_ts - _last_nfl_scan >= _nfl_refresh_interval():
+            try:
+                nfl_idx, _ = fetch_odds_index(
+                    "americanfootball_nfl",
+                    total_range=(25.0, 65.0), spread_limit=25.0,
+                    include_h2h=True, include_spreads=True,
+                )
+                nfl, _nfl_stats, _nfl_snapshot = scan_sport(
+                    label="NFL — Spread, Total & Moneyline",
+                    spread_series="KXNFLSPREAD",
+                    total_series="KXNFLTOTAL",
+                    ml_series="KXNFLGAME",
+                    odds_sport="americanfootball_nfl",
+                    abbr_map=NFL_ABBR,
+                    spread_std=NFL_SPREAD_STD,
+                    total_std=NFL_TOTAL_STD,
+                    game_index=nfl_idx,
+                )
+            except Exception as _nfl_exc:
+                print(f"  NFL scan error: {_nfl_exc}")
+                nfl = []
+            _last_nfl_scan = now_ts
+
+        global _last_nfl_props_scan
+        nfl_props: list = []
+        if now_ts - _last_nfl_props_scan >= _nfl_props_refresh_interval():
+            try:
+                nfl_props, _fresh_nfl_prop_snap = scan_player_props(
+                    odds_sport="americanfootball_nfl", abbr_map=NFL_ABBR,
+                    max_games=20, prop_series=NFL_PROP_SERIES,
+                    prop_markets=NFL_PLAYER_PROP_MARKETS,
+                    sport_label="NFL", mkt_type_label="prop",
+                    parse_event_fn=_parse_nfl_event,
+                )
+            except Exception as _nfl_prop_exc:
+                print(f"  NFL props scan error: {_nfl_prop_exc}")
+                nfl_props = []
+            _last_nfl_props_scan = now_ts
+
         # Soccer — one sweep on a shared cadence across every configured league,
         # but only leagues with enabled=True in SOCCER_LEAGUES actually scan
         # (MLS through Chile Primera stay individually paused; La Liga/EPL run).
@@ -4930,7 +5023,7 @@ def _run_scan():
                 print(f"  MMA watcher error: {_mma_exc}")
             _last_mma_scan = now_ts
 
-        all_edges = sorted(mlb + nba + mlb_props + wnba + wnba_props + soccer + tennis, key=lambda x: x["edge"], reverse=True)
+        all_edges = sorted(mlb + nba + mlb_props + wnba + wnba_props + nfl + nfl_props + soccer + tennis, key=lambda x: x["edge"], reverse=True)
 
         # Deduplicate: keep only best edge per (matchup, mkt_type, side)
         edges = _best_edge_per_game(all_edges)

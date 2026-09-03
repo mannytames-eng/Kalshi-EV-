@@ -1210,21 +1210,38 @@ for _b in _bets:
 # Martin had. The user directed funding it as a case-by-case override of the
 # high-edge gate, not a change to the gate itself (OUTS_HIGH_EDGE_THRESHOLD
 # stays 7.0 -- this doesn't touch it), AND directed half-Kelly (0.5) rather
-# than the standard quarter-Kelly this bet originally stamped (0.25) -- edge
-# 5.2% @ 0.48 hits the 3% cap at half-Kelly: stake $30.00; won -> pnl +$32.50.
+# than the quarter-Kelly this bet originally stamped (0.25).
+#
+# CORRECTED 2026-09-01 (user call: "apply the same logic as anyone else"):
+# the first pass of this exception computed stake as fraction-and-cap only
+# (edge/(1-k) * 0.5, capped at 3%) and got $30.00/+$32.50 -- but every other
+# bet's sizing also multiplies in time_mult_applied and clv_mult_applied, and
+# this bet's own stamped clv_mult_applied is 0.5 (the current Pitcher Outs
+# calibration bucket's CLV-confidence discount -- a market-wide adjustment
+# from the bucket's own recent record, not anything specific to Pecko).
+# Skipping that factor was the inconsistency, not the 2.5%/$25 kelly_bet_pct
+# reading it was flagged against -- that number was already right. With
+# time_mult_applied (1.0) and clv_mult_applied (0.5) included: edge 5.2% @
+# 0.48 * half-Kelly * 1.0 * 0.5 = 2.5% (well under the 3% cap, not hitting
+# it) -> stake $25.00; won -> pnl +$27.08. Matches kelly_bet_dollars/
+# kelly_pnl_dollars exactly, which is the actual bar for "same logic as
+# anyone else" -- those were never wrong, only paper_stake/pnl were.
+#
 # freeze_exception is also read by _std_kelly_frac() as a bypass for the
 # TB/Outs high-edge zero-out, so the Kelly-P&L readouts count this bet instead
 # of silently re-deriving 0% from the raw edge alone -- setting shadow=False
 # here isn't enough on its own, that function doesn't look at shadow at all.
-# Idempotent (guarded on kelly_fraction_applied != 0.5, not on shadow --
-# shadow is already False after the first pass of this exception).
+# Idempotent (guarded on paper_stake != the corrected $25.00, not on shadow or
+# kelly_fraction_applied -- both are already set from the first pass).
 _pecko_outs_id = "KXMLBOUTS-26AUG301510HOUNYM-HOUEPECKO70-15|YES"
 for _b in _bets:
-    if _b.get("id") == _pecko_outs_id and _b.get("kelly_fraction_applied") != 0.5:
+    if _b.get("id") == _pecko_outs_id and _b.get("paper_stake") != 25.0:
         _e = (_b.get("edge_pct") or 0) / 100.0
         _k = _b.get("kalshi_price") or 0
         if 0 < _k < 1 and _e > 0:
-            _stake = round(min(_e / (1 - _k) * 0.5,
+            _tmult = _b.get("time_mult_applied", 1.0) or 1.0
+            _cmult = _b.get("clv_mult_applied", 1.0) or 1.0
+            _stake = round(min(_e / (1 - _k) * 0.5 * _tmult * _cmult,
                                PAPER_KELLY_CAP) * PAPER_START_BALANCE, 2)
             if _b.get("status") == "won":
                 _pnl = round(_stake * (1 - _k) / _k, 2)
@@ -1238,7 +1255,7 @@ for _b in _bets:
             _b["paper_pnl"]           = _pnl
             _b["kelly_fraction_applied"] = 0.5
             _b["kelly_cap_applied"]      = PAPER_KELLY_CAP
-            _b["freeze_exception"]    = "unshadow_halfkelly_20260831_user_directed"
+            _b["freeze_exception"]    = "unshadow_halfkelly_20260901_user_directed"
             _data_fixed = True
             print(f"  FREEZE EXCEPTION (user-directed): funded Pecko pitcher-outs at half-Kelly "
                   f"— stake ${_stake:.2f}, pnl ${_pnl:+.2f} (was $0 shadow)")

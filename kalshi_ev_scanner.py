@@ -3119,18 +3119,21 @@ WNBA_PROP_SERIES: Dict[str, str] = {
     "KXWNBAAST": "player_assists",
 }
 
-# NFL props (added 2026-09-03, SHADOW). Pinnacle only posts ONE line per
-# player-market a week out (verified live: player_pass_yds returned a single
-# 227.5/228.5 line, no alternates yet) -- the "_alternate" markets are valid,
-# documented keys (confirmed: a direct call returns 200 with an empty
-# bookmakers list, not an error) that Pinnacle fills in as game day nears, not
-# something to build custom extrapolation for like WNBA needed. Requesting
-# both here means scan_player_props's existing alt-merge logic (already used
-# by MLB/WNBA -- "Standard and *_alternate markets are merged under the same
-# prop_type") picks up real per-line quotes the moment they're posted, with
-# zero new code. Until then, only the single main-line rung gets a genuine
-# exact-line match; every other Kalshi rung is correctly rejected as a line
-# mismatch, same guard MLB uses -- no silent extrapolation.
+# NFL props (added 2026-09-03, SHADOW). Pinnacle posts ONE line per
+# player-market, period -- verified live TWICE now (initial build, then again
+# 2026-09-03 closer to kickoff): DraftKings/FanDuel populate the "_alternate"
+# keys with real per-line ladders, Pinnacle never does. Since BOOK_WEIGHTS
+# gives Pinnacle 100% and DK/FanDuel 0%, those alternate-only lines get
+# computed and then correctly discarded downstream (_weighted_consensus
+# returns 0.0 on an all-zero-weight book set, poisson_lambda_from_line's
+# 0.05<p<0.95 sanity guard rejects it -- verified no phantom edge risk) --
+# they were pure wasted spend. Confirmed live: requesting the alternates
+# doubled the real per-event cost (10 credits vs 5, via the Odds API's own
+# x-requests-last header) for zero usable data. Dropped here; only the
+# single main-line rung gets a genuine exact-line match against Kalshi, same
+# as MLB. Revisit only if Pinnacle is ever observed posting real NFL prop
+# alternates (unconfirmed as of this writing -- may just not offer them for
+# this sport, same as WNBA never offering them for basketball props).
 NFL_PROP_SERIES: Dict[str, str] = {
     "KXNFLPASSYDS": "player_pass_yds",
     "KXNFLRSHYDS":  "player_rush_yds",
@@ -3139,11 +3142,11 @@ NFL_PROP_SERIES: Dict[str, str] = {
     "KXNFLPASSTDS": "player_pass_tds",
 }
 NFL_PLAYER_PROP_MARKETS = (
-    "player_pass_yds,player_pass_yds_alternate,"
-    "player_rush_yds,player_rush_yds_alternate,"
-    "player_reception_yds,player_reception_yds_alternate,"
-    "player_receptions,player_receptions_alternate,"
-    "player_pass_tds,player_pass_tds_alternate"
+    "player_pass_yds,"
+    "player_rush_yds,"
+    "player_reception_yds,"
+    "player_receptions,"
+    "player_pass_tds"
 )
 
 
@@ -3180,6 +3183,7 @@ def build_all_player_props(
     needed_teams: Optional[set] = None,
     markets: str = None,
     lookahead_hours: float = 48.0,
+    max_events: int = None,
 ) -> Dict[str, Dict[str, dict]]:
     """
     Fetch player-prop odds for all books and build a weighted-consensus
@@ -3215,7 +3219,7 @@ def build_all_player_props(
         target_events.append(ev)
 
     target_events.sort(key=lambda e: e.get("commence_time", ""))
-    target_events = target_events[:MAX_PROP_EVENTS]
+    target_events = target_events[:(max_events if max_events is not None else MAX_PROP_EVENTS)]
 
     player_lookup: Dict[str, Dict[str, dict]] = {}
     fetched = 0
@@ -3381,20 +3385,21 @@ def build_all_player_props(
 def scan_player_props(
     odds_sport: str = "baseball_mlb",
     abbr_map: Optional[Dict[str, str]] = None,
-    max_games: int = 15,
     prop_series: Optional[Dict[str, str]] = None,
     prop_markets: Optional[str] = None,
     sport_label: str = "MLB",
     mkt_type_label: str = "prop",
     parse_event_fn=None,
     lookahead_hours: float = 48.0,
+    max_events: int = None,
 ) -> List[dict]:
     """
     Scan Kalshi player-prop markets vs consensus no-vig props.
     Sport-agnostic — pass prop_series, prop_markets, and sport_label for each sport.
-    Defaults to MLB configuration. lookahead_hours passes through to
-    build_all_player_props (see its docstring — widen for sports whose books
-    post a whole week's props at once, like NFL).
+    Defaults to MLB configuration. lookahead_hours and max_events pass through to
+    build_all_player_props (see its docstring — widen lookahead for sports whose
+    books post a whole week's props at once, like NFL; raise max_events past the
+    MAX_PROP_EVENTS default for a sport whose slate can exceed it).
     """
     if abbr_map is None:
         abbr_map = MLB_ABBR
@@ -3519,7 +3524,7 @@ def scan_player_props(
 
     # 4. Build player prop consensus index
     player_lookup = build_all_player_props(odds_sport, odds_events, needed_teams or None, markets=prop_markets,
-                                            lookahead_hours=lookahead_hours)
+                                            lookahead_hours=lookahead_hours, max_events=max_events)
     if not player_lookup:
         print("  No player prop data available — skipping.")
         return [], {}

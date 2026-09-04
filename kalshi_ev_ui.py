@@ -4995,7 +4995,10 @@ def _run_scan():
             try:
                 nfl_props, _fresh_nfl_prop_snap = scan_player_props(
                     odds_sport="americanfootball_nfl", abbr_map=NFL_ABBR,
-                    max_games=20, prop_series=NFL_PROP_SERIES,
+                    max_events=16,   # full Sunday slate can hit 16 games; the shared
+                                     # MAX_PROP_EVENTS default (15, sized for MLB) would
+                                     # silently drop one game on a full week
+                    prop_series=NFL_PROP_SERIES,
                     prop_markets=NFL_PLAYER_PROP_MARKETS,
                     sport_label="NFL", mkt_type_label="prop",
                     parse_event_fn=_parse_nfl_event,

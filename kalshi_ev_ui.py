@@ -2657,9 +2657,19 @@ def _lookup_mlb_score(bet: dict):
     return (score or "—", status or "", ev.get("home_logo", ""), ev.get("away_logo", ""))
 
 
-def _is_mlb_moneyline_bet(b: dict) -> bool:
-    return (b.get("mkt_type") == "moneyline"
-            and b.get("ticker", "").upper().startswith("KXMLBGAME"))
+def _is_mlb_game_line_bet(b: dict) -> bool:
+    """True for MLB moneyline, total, or spread bets -- anything _lookup_mlb_score
+    can resolve (it matches by matchup name + ticker date, not market type).
+
+    Renamed from _is_mlb_moneyline_bet and broadened 2026-09-05: KXMLBGAME
+    (moneyline) is paused and KXMLBTOTAL is the one actually live, but Totals
+    bets were falling through to the generic per-player prop branch in
+    _live_stats_loop instead -- which has nothing to look up for a market with
+    no single player -- so Totals never got a live score, a final result, or
+    real ESPN team logos. This was the live portfolio tracker gap the user
+    flagged as "not set up yet."""
+    return (b.get("mkt_type") in ("moneyline", "total", "spread")
+            and b.get("ticker", "").upper().startswith(("KXMLBGAME", "KXMLBTOTAL", "KXMLBSPREAD")))
 
 
 # ── Soccer (ESPN) — live score, match clock, logos for ALL leagues ───────────
@@ -2907,7 +2917,7 @@ def _live_stats_loop():
                 for b in _bets:
                     if b.get("status") != "open" or not (
                             b.get("mkt_type") in ("prop", "wnba_prop", "nba_prop")
-                            or _is_soccer_bet(b) or _is_mlb_moneyline_bet(b)):
+                            or _is_soccer_bet(b) or _is_mlb_game_line_bet(b)):
                         continue
                     gt = b.get("game_time")
                     started = False
@@ -2945,8 +2955,10 @@ def _live_stats_loop():
                         entry["game_final"] = True
                     if entry:
                         fresh[b["id"]] = entry
-                elif _is_mlb_moneyline_bet(b):
-                    # MLB moneyline: live scoreline + inning + logos from ESPN.
+                elif _is_mlb_game_line_bet(b):
+                    # MLB moneyline/total/spread: live scoreline + inning + logos
+                    # from ESPN. _lookup_mlb_score reports "Final" once the game
+                    # ends, so this also covers the final-result display.
                     st = _lookup_mlb_score(b)
                     if st:
                         fresh[b["id"]] = {"stat": st[0], "inning": st[1],
@@ -6676,13 +6688,26 @@ function matchupHtml(matchup) {
 }
 
 // Matchup cell that prefers backend-threaded ESPN logos (soccer: MLS/Argentina/
-// Brazil, matched by name so no per-league id maps). Falls back to the
-// ticker/name logo dispatch for everything else.
+// Brazil; MLB moneyline/total/spread, matched by name so no per-league id
+// maps). Falls back to the ticker/name logo dispatch for everything else.
+//
+// The two fallback pieces (sportLogo, a ticker-based dispatch that resolves
+// ONE team, and matchupHtml, a name-based lookup that independently resolves
+// BOTH teams via LOGOS) are alternatives, not additions -- concatenating them
+// double-renders whichever team sportLogo happens to pick. Found live
+// 2026-09-05 on MLB Totals: KXMLBTOTAL has no team suffix, so its ticker-based
+// logo falls back to the away team (see mlbGameLogo's comment) -- which
+// matchupHtml then ALSO draws by name, since MLB teams are in LOGOS. Net
+// result: away team's logo twice, home team's once. Prefer matchupHtml alone
+// whenever it can resolve at least one of the two names.
 function matchupWithLogos(b) {
   const parts = (b.matchup || '').split(' @ ');
   if ((b.home_logo || b.away_logo) && parts.length === 2) {
     const img = u => u ? `<img src="${u}" onerror="this.style.display='none'" style="width:18px;height:18px;vertical-align:middle;margin-right:5px;object-fit:contain;">` : '';
     return `${img(b.away_logo)}<span>${parts[0]}</span> <span style="color:var(--muted);font-weight:400;">@</span> ${img(b.home_logo)}<span>${parts[1]}</span>`;
+  }
+  if (parts.length === 2 && (LOGOS[parts[0]] || LOGOS[parts[1]])) {
+    return matchupHtml(b.matchup);
   }
   return `${sportLogo(b.ticker)}${matchupHtml(b.matchup)}`;
 }
@@ -6725,7 +6750,7 @@ function renderTable(edges) {
       ? `<span class="badge-drift">(${e.drift_pct > 0 ? '+' : ''}${e.drift_pct}%)</span>` : '';
     rows += `
     <tr>
-      <td class="matchup-inline">${sportLogo(e.ticker)}${matchupHtml(e.matchup)}</td>
+      <td class="matchup-inline">${matchupWithLogos(e)}</td>
       <td class="prop-col">${e.title}${kalshiLineBadge(e)}${newBadge}${staleBadge}${driftTxt}</td>
       <td class="num pin-line">${pinLineLabel(e)}</td>
       <td class="side-${e.side.toLowerCase()}">${e.side}</td>
@@ -8056,7 +8081,7 @@ async function fetchPaper() {
 
         return `<tr style="${b.clv_source === 'corrupted_utc' ? 'opacity:0.55;' : ''}">
           <td style="color:var(--muted);font-size:11px;">${flagDate}</td>
-          <td class="matchup-inline">${sportLogo(b.ticker)}${matchupHtml(b.matchup)}</td>
+          <td class="matchup-inline">${matchupWithLogos(b)}</td>
           <td style="font-size:12px;max-width:200px;">${b.title}${capBadge}</td>
           <td class="side-${(b.side||'').toLowerCase()}">${sideLabel(b)}</td>
           <td class="num">${edgeTag}</td>

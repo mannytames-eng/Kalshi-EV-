@@ -4157,7 +4157,15 @@ OUTS_REFRESH_SECONDS   = 20 * 60    # pitcher_outs paid-fetch cadence: 20 min (r
                                     # to new La Liga/EPL soccer coverage instead. Raise to
                                     # trim credits further, lower to catch lineup/bullpen
                                     # news lag faster if the budget allows it again.
-_last_prop_snapshot: dict = {}      # persists between prop scan cycles so UI stays populated
+_last_market_snapshot: dict = {}    # persists per-ticker|side across ALL sports/scan cycles so
+                                     # the UI's "Last Scan" column never blanks a market just
+                                     # because one specific cycle didn't produce a comparison for
+                                     # it (Odds API data can be intermittently absent for a single
+                                     # player/market on a single fetch -- found live 2026-09-07,
+                                     # Colby Parkinson's receptions line vanished from one NFL
+                                     # props cycle then reappeared the next). Merged with .update()
+                                     # (not replaced) so one sport's/cycle's miss never erases
+                                     # another entry's last-known-good comparison.
 _last_soccer_scan: float = 0.0      # epoch seconds of last soccer sweep (all leagues)
 _last_tennis_scan: float = 0.0      # epoch seconds of last tennis sweep (ATP + WTA)
 _last_freshness_scan: float = 0.0   # epoch seconds of last market-freshness watch run
@@ -4978,6 +4986,7 @@ def _run_scan():
         # than left to that fallback. Shadow-first via SHADOW_MARKETS.
         global _last_nfl_scan
         nfl: list = []
+        _nfl_snapshot: dict = {}
         if now_ts - _last_nfl_scan >= _nfl_refresh_interval():
             try:
                 nfl_idx, _ = fetch_odds_index(
@@ -4998,11 +5007,12 @@ def _run_scan():
                 )
             except Exception as _nfl_exc:
                 print(f"  NFL scan error: {_nfl_exc}")
-                nfl = []
+                nfl, _nfl_snapshot = [], {}
             _last_nfl_scan = now_ts
 
         global _last_nfl_props_scan
         nfl_props: list = []
+        _fresh_nfl_prop_snap: dict = {}
         if now_ts - _last_nfl_props_scan >= _nfl_props_refresh_interval():
             try:
                 nfl_props, _fresh_nfl_prop_snap = scan_player_props(
@@ -5020,7 +5030,7 @@ def _run_scan():
                 )
             except Exception as _nfl_prop_exc:
                 print(f"  NFL props scan error: {_nfl_prop_exc}")
-                nfl_props = []
+                nfl_props, _fresh_nfl_prop_snap = [], {}
             _last_nfl_props_scan = now_ts
 
         # Soccer — one sweep on a shared cadence across every configured league,
@@ -5233,24 +5243,23 @@ def _run_scan():
             except Exception as _cred_exc:
                 print(f"  credit tracker error: {_cred_exc}")
 
-            # ── Build full market snapshot: game lines + props ────────────────
-            # scan_sport() already populates mlb_snapshot for game lines.
-            # Props come from scan_player_props() which runs on its own slower
-            # interval — mlb_props is [] on non-prop cycles.  We persist the
-            # last prop snapshot in _last_prop_snapshot so the UI stays populated
-            # between prop scan cycles (every 8–10 min) rather than blanking out
-            # every 30 s when mlb_props is empty.
-            #
-            # Source: all_edges (the merged, deduped list) rather than mlb_props
-            # directly, so any future edge source added to all_edges is
-            # automatically included here with no extra changes needed.
-            global _last_prop_snapshot
-            if _fresh_prop_snap:   # fresh prop scan this cycle — use full snapshot (all markets, not just above-threshold)
-                _last_prop_snapshot = _fresh_prop_snap
+            # ── Build full market snapshot: game lines + props, all sports ─────
+            # MLB Totals scans every 30s, so mlb_snapshot is always fresh — merged
+            # straight in. Everything else (MLB props, NFL game lines, NFL props)
+            # runs on its own slower cadence and is []/{} most cycles, so each
+            # fresh result is MERGED (not replacing the whole dict) into
+            # _last_market_snapshot — a single miss on one ticker doesn't erase
+            # every other market's last-known-good comparison (see its
+            # declaration for the Colby Parkinson case that prompted this).
+            global _last_market_snapshot
+            if _fresh_prop_snap:
+                _last_market_snapshot.update(_fresh_prop_snap)
+            if _nfl_snapshot:
+                _last_market_snapshot.update(_nfl_snapshot)
+            if _fresh_nfl_prop_snap:
+                _last_market_snapshot.update(_fresh_nfl_prop_snap)
 
-            # Merge: game-line snapshot + last known prop snapshot.
-            # Game lines take precedence on key collision (shouldn't happen).
-            _state["market_snapshot"] = {**_last_prop_snapshot, **mlb_snapshot}
+            _state["market_snapshot"] = {**_last_market_snapshot, **mlb_snapshot}
 
         # Log new bets and capture what was just added for the alert
         newly_logged = _add_new_bets(edges)

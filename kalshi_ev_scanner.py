@@ -3277,6 +3277,7 @@ def build_all_player_props(
                 line_entries: Dict[float, dict] = {}
 
                 for line_val, book_entries in lines_dict.items():
+                    _disp_name = next((be.get("player") for be in book_entries.values() if be.get("player")), player_key)
                     book_probs: Dict[str, float] = {}
                     for bkey, be in book_entries.items():
                         op = be.get("over_price")
@@ -3287,14 +3288,17 @@ def build_all_player_props(
                         book_probs[bkey] = po
 
                     if not book_probs:
+                        print(f"    [drop] {_disp_name} {mtype} line={line_val}: no book had both over+under prices")
                         continue
                     # Safety: require Pinnacle or 2+ books per line
                     if "pinnacle" not in book_probs and len(book_probs) < 2:
+                        print(f"    [drop] {_disp_name} {mtype} line={line_val}: no Pinnacle price, only {list(book_probs.keys())} (need Pinnacle or 2+ books)")
                         continue
 
                     consensus_po, _ = _weighted_consensus(book_probs)
                     lam = poisson_lambda_from_line(line_val, consensus_po)
                     if lam is None:
+                        print(f"    [drop] {_disp_name} {mtype} line={line_val}: consensus prob {consensus_po:.3f} failed sanity bounds (books={list(book_probs.keys())})")
                         continue
 
                     # Per-book lambdas — each book fitted to THIS line.

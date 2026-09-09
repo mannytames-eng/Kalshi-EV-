@@ -6411,12 +6411,67 @@ function wnbaGameLogo(ticker) {
   return `<img src="https://a.espncdn.com/i/teamlogos/wnba/500/${slug}.png" onerror="this.style.display='none'" style="width:18px;height:18px;vertical-align:middle;margin-right:6px;object-fit:contain;">`;
 }
 
+// NFL team code -> ESPN CDN slug. ESPN's own abbreviations differ from
+// Kalshi's/NFL_ABBR's on two teams: Jacksonville (JAC here, but ESPN's slug
+// is "jax") and Washington (WAS here, ESPN's slug is "wsh") — same kind of
+// Kalshi-vs-ESPN mismatch already handled for WNBA (PDX->por, CONN->con) and
+// MLB (OAK/ATH->133). Codes are all 2 or 3 letters, same shape as MLB's.
+const _NFL_TEAMS = new Set(['ARI','ATL','BAL','BUF','CAR','CHI','CIN','CLE','DAL','DEN','DET','GB','HOU','IND','JAC','KC','LV','LAC','LAR','MIA','MIN','NE','NO','NYG','NYJ','PHI','PIT','SF','SEA','TB','TEN','WAS']);
+const _NFL_SLUG = {ARI:'ari',ATL:'atl',BAL:'bal',BUF:'buf',CAR:'car',CHI:'chi',CIN:'cin',CLE:'cle',DAL:'dal',DEN:'den',DET:'det',GB:'gb',HOU:'hou',IND:'ind',JAC:'jax',KC:'kc',LV:'lv',LAC:'lac',LAR:'lar',MIA:'mia',MIN:'min',NE:'ne',NO:'no',NYG:'nyg',NYJ:'nyj',PHI:'phi',PIT:'pit',SF:'sf',SEA:'sea',TB:'tb',TEN:'ten',WAS:'wsh'};
+
+// NFL player-prop logo (KXNFLPASSYDS/RSHYDS/RECYDS/REC/PASSTDS). Ticker has
+// no time component (KXNFLREC-26SEP10SFLAR-LARCPARKINSON84-3) — same shape
+// as WNBA's prop tickers, unlike MLB's date+time.
+function nflLogo(ticker) {
+  if (!ticker) return '';
+  const m = ticker.match(/^KXNFL(?:PASSYDS|RSHYDS|RECYDS|REC|PASSTDS)-\d{2}[A-Z]{3}\d{2}([A-Z]+)-([A-Z]+?)\d/);
+  if (!m) return '';
+  const matchup = m[1], playerSeg = m[2];
+  let away, home;
+  for (const n of [3, 2]) {
+    const a = matchup.slice(0, n), h = matchup.slice(n);
+    if (_NFL_TEAMS.has(a) && _NFL_TEAMS.has(h)) { away = a; home = h; break; }
+  }
+  if (!away) return '';
+  const team = playerSeg.startsWith(away) ? away : (playerSeg.startsWith(home) ? home : null);
+  const slug = team && _NFL_SLUG[team];
+  if (!slug) return '';
+  return `<img src="https://a.espncdn.com/i/teamlogos/nfl/500/${slug}.png" onerror="this.style.display='none'" style="width:18px;height:18px;vertical-align:middle;margin-right:6px;object-fit:contain;">`;
+}
+
+// NFL game-line logo (KXNFLGAME/SPREAD/TOTAL — not player props, which
+// nflLogo already covers). GAME's suffix is a plain team code ("SEA",
+// confirmed live); SPREAD's is team+margin ("DET8", same convention as
+// MLB/MLS); TOTAL has no team suffix at all (just the strike number, e.g.
+// KXNFLTOTAL-26SEP09NESEA-45), so falls back to the away team — same
+// convention mlbGameLogo/mlsLogo use for their Totals.
+function nflGameLogo(ticker) {
+  if (!ticker) return '';
+  const m = ticker.match(/^KXNFL(?:GAME|SPREAD|TOTAL)-\d{2}[A-Z]{3}\d{2}([A-Z]+)-([A-Z0-9]+)/);
+  if (!m) return '';
+  const seg = m[1], suffix = m[2];
+  let away, home;
+  for (const n of [3, 2]) {
+    const a = seg.slice(0, n), h = seg.slice(n);
+    if (_NFL_TEAMS.has(a) && _NFL_TEAMS.has(h)) { away = a; home = h; break; }
+  }
+  if (!away) return '';
+  let team = away;
+  for (const n of [3, 2]) {
+    const cand = suffix.slice(0, n);
+    if (cand === away || cand === home) { team = cand; break; }
+  }
+  const slug = _NFL_SLUG[team];
+  if (!slug) return '';
+  return `<img src="https://a.espncdn.com/i/teamlogos/nfl/500/${slug}.png" onerror="this.style.display='none'" style="width:18px;height:18px;vertical-align:middle;margin-right:6px;object-fit:contain;">`;
+}
+
 // Sport-agnostic logo dispatch from a TICKER — use this at render sites.
 // NOTE: named sportLogo (not teamLogo) to avoid colliding with the name-based
 // teamLogo(name) used by matchupHtml further below; JS would let the later
 // declaration win and silently break ticker-based logos.
 function sportLogo(ticker) {
-  return mlbLogo(ticker) || mlbGameLogo(ticker) || wnbaLogo(ticker) || wnbaGameLogo(ticker) || mlsLogo(ticker);
+  return mlbLogo(ticker) || mlbGameLogo(ticker) || wnbaLogo(ticker) || wnbaGameLogo(ticker) || nflLogo(ticker) || nflGameLogo(ticker) || mlsLogo(ticker);
 }
 
 // Edge color by strength: orange (weakest) → yellow → green → bright green (strongest)
@@ -6682,6 +6737,39 @@ const LOGOS = {
   'Toronto Raptors':         'https://a.espncdn.com/i/teamlogos/nba/500/tor.png',
   'Utah Jazz':               'https://a.espncdn.com/i/teamlogos/nba/500/utah.png',
   'Washington Wizards':      'https://a.espncdn.com/i/teamlogos/nba/500/wsh.png',
+  // NFL
+  'Arizona Cardinals':       'https://a.espncdn.com/i/teamlogos/nfl/500/ari.png',
+  'Atlanta Falcons':         'https://a.espncdn.com/i/teamlogos/nfl/500/atl.png',
+  'Baltimore Ravens':        'https://a.espncdn.com/i/teamlogos/nfl/500/bal.png',
+  'Buffalo Bills':           'https://a.espncdn.com/i/teamlogos/nfl/500/buf.png',
+  'Carolina Panthers':       'https://a.espncdn.com/i/teamlogos/nfl/500/car.png',
+  'Chicago Bears':           'https://a.espncdn.com/i/teamlogos/nfl/500/chi.png',
+  'Cincinnati Bengals':      'https://a.espncdn.com/i/teamlogos/nfl/500/cin.png',
+  'Cleveland Browns':        'https://a.espncdn.com/i/teamlogos/nfl/500/cle.png',
+  'Dallas Cowboys':          'https://a.espncdn.com/i/teamlogos/nfl/500/dal.png',
+  'Denver Broncos':          'https://a.espncdn.com/i/teamlogos/nfl/500/den.png',
+  'Detroit Lions':           'https://a.espncdn.com/i/teamlogos/nfl/500/det.png',
+  'Green Bay Packers':       'https://a.espncdn.com/i/teamlogos/nfl/500/gb.png',
+  'Houston Texans':          'https://a.espncdn.com/i/teamlogos/nfl/500/hou.png',
+  'Indianapolis Colts':      'https://a.espncdn.com/i/teamlogos/nfl/500/ind.png',
+  'Jacksonville Jaguars':    'https://a.espncdn.com/i/teamlogos/nfl/500/jax.png',
+  'Kansas City Chiefs':      'https://a.espncdn.com/i/teamlogos/nfl/500/kc.png',
+  'Las Vegas Raiders':       'https://a.espncdn.com/i/teamlogos/nfl/500/lv.png',
+  'Los Angeles Chargers':    'https://a.espncdn.com/i/teamlogos/nfl/500/lac.png',
+  'Los Angeles Rams':        'https://a.espncdn.com/i/teamlogos/nfl/500/lar.png',
+  'Miami Dolphins':          'https://a.espncdn.com/i/teamlogos/nfl/500/mia.png',
+  'Minnesota Vikings':       'https://a.espncdn.com/i/teamlogos/nfl/500/min.png',
+  'New England Patriots':    'https://a.espncdn.com/i/teamlogos/nfl/500/ne.png',
+  'New Orleans Saints':      'https://a.espncdn.com/i/teamlogos/nfl/500/no.png',
+  'New York Giants':         'https://a.espncdn.com/i/teamlogos/nfl/500/nyg.png',
+  'New York Jets':           'https://a.espncdn.com/i/teamlogos/nfl/500/nyj.png',
+  'Philadelphia Eagles':     'https://a.espncdn.com/i/teamlogos/nfl/500/phi.png',
+  'Pittsburgh Steelers':     'https://a.espncdn.com/i/teamlogos/nfl/500/pit.png',
+  'San Francisco 49ers':     'https://a.espncdn.com/i/teamlogos/nfl/500/sf.png',
+  'Seattle Seahawks':        'https://a.espncdn.com/i/teamlogos/nfl/500/sea.png',
+  'Tampa Bay Buccaneers':    'https://a.espncdn.com/i/teamlogos/nfl/500/tb.png',
+  'Tennessee Titans':        'https://a.espncdn.com/i/teamlogos/nfl/500/ten.png',
+  'Washington Commanders':   'https://a.espncdn.com/i/teamlogos/nfl/500/wsh.png',
 };
 
 function teamLogo(name) {

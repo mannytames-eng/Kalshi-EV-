@@ -66,6 +66,7 @@ from kalshi_ev_scanner import (
     NBA_SPREAD_STD, NBA_TOTAL_STD,
     WNBA_SPREAD_STD, WNBA_TOTAL_STD,
     NFL_SPREAD_STD, NFL_TOTAL_STD,
+    NCAAF_SPREAD_STD, NCAAF_TOTAL_STD, NCAAF_ABBR,
     MLB_ABBR, NBA_ABBR, WNBA_ABBR, NFL_ABBR,
     NFL_PROP_SERIES, NFL_PLAYER_PROP_MARKETS,
     _parse_nfl_event,
@@ -472,6 +473,14 @@ SHADOW_MARKETS: list[str] = [
                       # scanner on both sides (game lines AND props); shadow-
                       # first until it earns its own record, same as everything
                       # else here.
+    "KXNCAAF",        # College football (KXNCAAFGAME/SPREAD/TOTAL) — added
+                      # 2026-09-09. Game lines only, no player props exist on
+                      # Kalshi for CFB. A live spot check found Kalshi's CFB
+                      # moneylines meaningfully less efficiently priced than
+                      # NFL's (4/62 side-comparisons cleared 2%+ raw edge vs
+                      # zero ever on NFL game lines) -- genuinely promising,
+                      # but one week of evidence on a much higher-variance
+                      # sport. Shadow-first until it earns its own record.
     # KXMLBOUTS (pitcher outs) is NOT shadowed — user never wanted it shadow-first
     # (my call when I added it; reversed 2026-07-29). It funds like any other MLB
     # prop (2% floor, ¼-Kelly, 3% cap). The one already-settled shadow bet
@@ -4259,6 +4268,35 @@ def _nfl_props_refresh_interval() -> int:
     if not _nfl_window_open():
         return 10 ** 9
     return NFL_PROPS_TIGHT_REFRESH_SECONDS if _nfl_props_tight_window() else NFL_PROPS_COARSE_REFRESH_SECONDS
+
+# ── NCAAF scheduling (added 2026-09-09, game lines only) ─────────────────────
+# No player props exist on Kalshi for college football -- confirmed by
+# scoping the full CFB series list: only season-long stat-leader/award
+# futures (e.g. "who leads the SEC in passing yards"), not per-game threshold
+# props like NFL's KXNFLREC-style markets. scan_player_props doesn't apply
+# here at all -- this is spread/total/moneyline only.
+#
+# Game-line cost is trivial regardless of the much larger slate (100+ games/
+# week vs NFL's 16): fetch_odds_index bills per UNIQUE MARKET KEY returned in
+# the bulk call (h2h+spread+total = 3 credits), not per game, so one CFB
+# index refresh costs exactly what NFL's does. Flat cadence, same as NFL's
+# game lines and for the same reason: a live spot check (2026-09-09, 31 real
+# games, moneyline only) found Kalshi's CFB pricing meaningfully less
+# efficient than NFL's -- 4 of 62 side-comparisons cleared 2%+ raw edge vs
+# zero ever on NFL's game lines -- worth the same attention all week, not
+# just Saturday (lines move and get posted throughout the week regardless).
+NCAAF_SCANNING_ENABLED    = True   # shadow-first via SHADOW_MARKETS regardless of this flag
+NCAAF_WINDOW_START_H      = 6    # 6am PDT
+NCAAF_WINDOW_END_H        = 22   # 10pm PDT
+NCAAF_GAME_REFRESH_SECONDS = 45 * 60
+_last_ncaaf_scan: float = 0.0   # epoch seconds of last NCAAF game-line sweep
+
+def _ncaaf_refresh_interval() -> int:
+    if not NCAAF_SCANNING_ENABLED:
+        return 10 ** 9
+    h = _pdt_hour()
+    return NCAAF_GAME_REFRESH_SECONDS if (NCAAF_WINDOW_START_H <= h < NCAAF_WINDOW_END_H) else 10 ** 9
+
 _zero_edge_alerted     = False      # suppresses duplicate alerts per drought
 _ZERO_EDGE_ALERT_SCANS = 60         # 60 × 2-min scan = 2 hours of silence
 
@@ -5033,6 +5071,38 @@ def _run_scan():
                 nfl_props, _fresh_nfl_prop_snap = [], {}
             _last_nfl_props_scan = now_ts
 
+        # NCAAF — game lines only, added 2026-09-09 (see NCAAF_SCANNING_ENABLED
+        # comment for why: no player props exist on Kalshi for CFB). Same
+        # inline-self-fetch shape as NFL's game-line block -- total_range/
+        # spread_limit sized wider than NFL's (CFB blowouts routinely run
+        # 40-50+ point spreads and 80+ point totals, unlike NFL's tighter
+        # range). Shadow-first via SHADOW_MARKETS.
+        global _last_ncaaf_scan
+        ncaaf: list = []
+        _ncaaf_snapshot: dict = {}
+        if now_ts - _last_ncaaf_scan >= _ncaaf_refresh_interval():
+            try:
+                ncaaf_idx, _ = fetch_odds_index(
+                    "americanfootball_ncaaf",
+                    total_range=(20.0, 100.0), spread_limit=60.0,
+                    include_h2h=True, include_spreads=True,
+                )
+                ncaaf, _ncaaf_stats, _ncaaf_snapshot = scan_sport(
+                    label="NCAAF — Spread, Total & Moneyline",
+                    spread_series="KXNCAAFSPREAD",
+                    total_series="KXNCAAFTOTAL",
+                    ml_series="KXNCAAFGAME",
+                    odds_sport="americanfootball_ncaaf",
+                    abbr_map=NCAAF_ABBR,
+                    spread_std=NCAAF_SPREAD_STD,
+                    total_std=NCAAF_TOTAL_STD,
+                    game_index=ncaaf_idx,
+                )
+            except Exception as _ncaaf_exc:
+                print(f"  NCAAF scan error: {_ncaaf_exc}")
+                ncaaf, _ncaaf_snapshot = [], {}
+            _last_ncaaf_scan = now_ts
+
         # Soccer — one sweep on a shared cadence across every configured league,
         # but only leagues with enabled=True in SOCCER_LEAGUES actually scan
         # (MLS through Chile Primera stay individually paused; La Liga/EPL run).
@@ -5099,7 +5169,7 @@ def _run_scan():
                 print(f"  MMA watcher error: {_mma_exc}")
             _last_mma_scan = now_ts
 
-        all_edges = sorted(mlb + nba + mlb_props + wnba + wnba_props + nfl + nfl_props + soccer + tennis, key=lambda x: x["edge"], reverse=True)
+        all_edges = sorted(mlb + nba + mlb_props + wnba + wnba_props + nfl + nfl_props + ncaaf + soccer + tennis, key=lambda x: x["edge"], reverse=True)
 
         # Deduplicate: keep only best edge per (matchup, mkt_type, side)
         edges = _best_edge_per_game(all_edges)
@@ -5245,12 +5315,13 @@ def _run_scan():
 
             # ── Build full market snapshot: game lines + props, all sports ─────
             # MLB Totals scans every 30s, so mlb_snapshot is always fresh — merged
-            # straight in. Everything else (MLB props, NFL game lines, NFL props)
-            # runs on its own slower cadence and is []/{} most cycles, so each
-            # fresh result is MERGED (not replacing the whole dict) into
-            # _last_market_snapshot — a single miss on one ticker doesn't erase
-            # every other market's last-known-good comparison (see its
-            # declaration for the Colby Parkinson case that prompted this).
+            # straight in. Everything else (MLB props, NFL game lines, NFL
+            # props, NCAAF game lines) runs on its own slower cadence and is
+            # []/{} most cycles, so each fresh result is MERGED (not replacing
+            # the whole dict) into _last_market_snapshot — a single miss on
+            # one ticker doesn't erase every other market's last-known-good
+            # comparison (see its declaration for the Colby Parkinson case
+            # that prompted this).
             global _last_market_snapshot
             if _fresh_prop_snap:
                 _last_market_snapshot.update(_fresh_prop_snap)
@@ -5258,6 +5329,8 @@ def _run_scan():
                 _last_market_snapshot.update(_nfl_snapshot)
             if _fresh_nfl_prop_snap:
                 _last_market_snapshot.update(_fresh_nfl_prop_snap)
+            if _ncaaf_snapshot:
+                _last_market_snapshot.update(_ncaaf_snapshot)
 
             _state["market_snapshot"] = {**_last_market_snapshot, **mlb_snapshot}
 

@@ -139,15 +139,22 @@ MLB_TOTAL_STD  =  4.5   # runs (total)
 # static (see project memory on known gaps).
 WNBA_SPREAD_STD =  8.5   # points
 WNBA_TOTAL_STD  = 10.5   # points
-# NFL/NHL: not empirical, not calibrated against any settled bet -- these two
-# sports aren't in the funded/live scan, only used by the market-freshness
-# watcher's bounded check (kalshi_freshness_watcher.py). Standard textbook
-# approximations (NFL margin/total std, NHL treated as ~Poisson goals).
-# Calibrate for real before ever funding a bet off either.
+# NFL/NHL/NCAAF: not empirical, not calibrated against any settled bet.
+# Standard textbook approximations (margin/total std; NHL treated as
+# ~Poisson goals). NFL and NCAAF are in the live shadow scan (2026-09) --
+# fine for "does this look interesting," not yet a basis to trust blindly;
+# NHL remains freshness-watcher-only (kalshi_freshness_watcher.py), unused
+# by the live scan. Calibrate for real once each has a settled record.
 NFL_SPREAD_STD = 13.5   # points
 NFL_TOTAL_STD  = 10.0   # points
 NHL_SPREAD_STD =  1.8   # goals
 NHL_TOTAL_STD  =  2.0   # goals
+# NCAAF margins/totals run hotter and fatter-tailed than NFL's -- huge
+# talent-gap blowouts (Power-5 vs FCS cupcakes) are routine, unlike the NFL's
+# comparatively even matchups. Textbook-approximation bump over NFL's values,
+# not derived from real CFB margin/total data.
+NCAAF_SPREAD_STD = 17.0   # points
+NCAAF_TOTAL_STD  = 14.0   # points
 
 
 # ── Ticker date parser ───────────────────────────────────────────────────────
@@ -436,6 +443,109 @@ NHL_ABBR: Dict[str, str] = {
     "TOR": "Toronto Maple Leafs",    "UTA": "Utah Mammoth",
     "VAN": "Vancouver Canucks",      "VGK": "Vegas Golden Knights",
     "WSH": "Washington Capitals",    "WPG": "Winnipeg Jets",
+}
+
+# NCAAF team codes -> the SAME team-name string the Odds API's own game data
+# uses (e.g. "Kansas Jayhawks", not Kalshi's own short display label "Kansas").
+# This matters and isn't cosmetic: unlike NFL/MLB where the abbr_map's value
+# already equals the string Pinnacle's data will contain, Kalshi's NCAAF
+# short names ("Ole Miss", "NC St.", "Miami (FL)") don't match
+# build_consensus_game_index's keys (built from the Odds API's own
+# School+Mascot names) via the exact-normalized-string lookup _find_game()
+# does -- passing Kalshi's own labels here would silently match almost
+# nothing. Confirmed live 2026-09-09 by resolving each Kalshi code against a
+# real pull of the Odds API's current NCAAF event list (171 team names) using
+# a core_match name-matcher (same idea as _soccer_name_match), then hand-
+# auditing every collision where two different Kalshi codes resolved to the
+# same target name -- caught and fixed two real ones this way: MISS (Ole
+# Miss) had matched "Mississippi State Bulldogs" on a substring fluke, and
+# PENN (Ivy League Penn, not covered by Pinnacle this week) had matched
+# "Penn State Nittany Lions". Codes not resolved against real data (mostly
+# FCS/small schools outside this week's Odds API window) are omitted rather
+# than guessed -- those games simply have no Pinnacle line to compare
+# against yet anyway. Codes run 2-5 letters (UTRGV is the one 5-letter code
+# in the full registry), unlike NFL/MLB's clean 2-3 -- _parse_ncaaf_event's
+# split loop accounts for this.
+NCAAF_ABBR: Dict[str, str] = {
+    "AFA": "Air Force Falcons",  "AKR": "Akron Zips",
+    "ALA": "Alabama Crimson Tide",  "ALST": "Alabama State Hornets",
+    "APP": "Appalachian State Mountaineers",  "ARIZ": "Arizona Wildcats",
+    "ARK": "Arkansas Razorbacks",  "ARMY": "Army Black Knights",
+    "ASU": "Arizona State Sun Devils",  "AUB": "Auburn Tigers",
+    "BALL": "Ball State Cardinals",  "BAY": "Baylor Bears",
+    "BC": "Boston College Eagles",  "BGSU": "Bowling Green Falcons",
+    "BSU": "Boise State Broncos",  "BUFF": "Buffalo Bulls",
+    "CAL": "California Golden Bears",  "CAMP": "Campbell Fighting Camels",
+    "CCAR": "Coastal Carolina Chanticleers",  "CHAR": "Charlotte 49ers",
+    "CIN": "Cincinnati Bearcats",  "CLEM": "Clemson Tigers",
+    "CMU": "Central Michigan Chippewas",  "COLG": "Colgate Raiders",
+    "COLO": "Colorado Buffaloes",  "CP": "Cal Poly Mustangs",
+    "CSU": "Colorado State Rams",  "DEL": "Delaware Blue Hens",
+    "DUKE": "Duke Blue Devils",  "ECU": "East Carolina Pirates",
+    "EMU": "Eastern Michigan Eagles",  "ETSU": "East Tennessee State Buccaneers",
+    "FAMU": "Florida A&M Rattlers",  "FAU": "Florida Atlantic Owls",
+    "FIU": "Florida International Panthers",  "FLA": "Florida Gators",
+    "FOR": "Fordham Rams",  "FRES": "Fresno State Bulldogs",
+    "FSU": "Florida State Seminoles",  "GASO": "Georgia Southern Eagles",
+    "GAST": "Georgia State Panthers",  "GRAM": "Grambling State Tigers",
+    "GT": "Georgia Tech Yellow Jackets",  "HAW": "Hawaii Rainbow Warriors",
+    "HC": "Holy Cross Crusaders",  "HOU": "Houston Cougars",
+    "HOW": "Howard Bison",  "ILL": "Illinois Fighting Illini",
+    "ILST": "Illinois State Redbirds",  "IND": "Indiana Hoosiers",
+    "IOWA": "Iowa Hawkeyes",  "ISU": "Iowa State Cyclones",
+    "JMU": "James Madison Dukes",  "JVST": "Jacksonville State Gamecocks",
+    "KENN": "Kennesaw State Owls",  "KENT": "Kent State Golden Flashes",
+    "KSU": "Kansas State Wildcats",  "KU": "Kansas Jayhawks",
+    "LIB": "Liberty Flames",  "LINW": "Lindenwood Lions",
+    "LOU": "Louisville Cardinals",  "LSU": "LSU Tigers",
+    "LT": "Louisiana Tech Bulldogs",  "MD": "Maryland Terrapins",
+    "MEM": "Memphis Tigers",  "MHU": "Mercyhurst Lakers",
+    "MIA": "Miami Hurricanes",  "MICH": "Michigan Wolverines",
+    "MINN": "Minnesota Golden Gophers",  "MISS": "Ole Miss Rebels",
+    "MIZZ": "Missouri Tigers",  "MOH": "Miami (OH) RedHawks",
+    "MONM": "Monmouth Hawks",  "MOSU": "Missouri State Bears",
+    "MRSH": "Marshall Thundering Herd",  "MSST": "Mississippi State Bulldogs",
+    "MSU": "Michigan State Spartans",  "MTST": "Montana State Bobcats",
+    "MTU": "Middle Tennessee Blue Raiders",  "NAVY": "Navy Midshipmen",
+    "ND": "Notre Dame Fighting Irish",  "NDSU": "North Dakota State Bison",
+    "NEB": "Nebraska Cornhuskers",  "NEV": "Nevada Wolf Pack",
+    "NIU": "Northern Illinois Huskies",  "NMSU": "New Mexico State Aggies",
+    "NORF": "Norfolk State Spartans",  "ODU": "Old Dominion Monarchs",
+    "OHIO": "Ohio Bobcats",  "OKLA": "Oklahoma Sooners",
+    "OKST": "Oklahoma State Cowboys",  "ORE": "Oregon Ducks",
+    "ORST": "Oregon State Beavers",  "OSU": "Ohio State Buckeyes",
+    "PITT": "Pittsburgh Panthers",  "PSU": "Penn State Nittany Lions",
+    "PUR": "Purdue Boilermakers",  "PV": "Prairie View A&M Panthers",
+    "RICE": "Rice Owls",  "RICH": "Richmond Spiders",
+    "RMU": "Robert Morris Colonials",  "RUTG": "Rutgers Scarlet Knights",
+    "SAC": "Sacramento State Hornets",  "SCAR": "South Carolina Gamecocks",
+    "SDSU": "San Diego State Aztecs",  "SHSU": "Sam Houston State Bearkats",
+    "SHU": "Sacred Heart Pioneers",  "SJSU": "San Jose State Spartans",
+    "SOU": "Southern University Jaguars",  "STON": "Stony Brook Seawolves",
+    "SUU": "Southern Utah Thunderbirds",  "SYR": "Syracuse Orange",
+    "TCU": "TCU Horned Frogs",  "TEM": "Temple Owls",
+    "TENN": "Tennessee Volunteers",  "TEX": "Texas Longhorns",
+    "TLSA": "Tulsa Golden Hurricane",  "TOL": "Toledo Rockets",
+    "TOWS": "Towson Tigers",  "TROY": "Troy Trojans",
+    "TTU": "Texas Tech Red Raiders",  "TULN": "Tulane Green Wave",
+    "TXAM": "Texas A&M Aggies",  "TXSO": "Texas Southern Tigers",
+    "TXST": "Texas State Bobcats",  "UCD": "UC Davis Aggies",
+    "UCF": "UCF Knights",  "UCLA": "UCLA Bruins",
+    "UGA": "Georgia Bulldogs",  "UK": "Kentucky Wildcats",
+    "ULL": "Louisiana Ragin Cajuns",  "UNC": "North Carolina Tar Heels",
+    "UNCO": "Northern Colorado Bears",  "UNM": "New Mexico Lobos",
+    "UNT": "North Texas Mean Green",  "USA": "South Alabama Jaguars",
+    "USF": "South Florida Bulls",  "USM": "Southern Mississippi Golden Eagles",
+    "USU": "Utah State Aggies",  "UTAH": "Utah Utes",
+    "UVA": "Virginia Cavaliers",  "VAN": "Vanderbilt Commodores",
+    "VILL": "Villanova Wildcats",  "VT": "Virginia Tech Hokies",
+    "WAG": "Wagner Seahawks",  "WAKE": "Wake Forest Demon Deacons",
+    "WASH": "Washington Huskies",  "WCU": "Western Carolina Catamounts",
+    "WEB": "Weber State Wildcats",  "WEBB": "Gardner-Webb Runnin Bulldogs",
+    "WIS": "Wisconsin Badgers",  "WIU": "Western Illinois Leathernecks",
+    "WKU": "Western Kentucky Hilltoppers",  "WMU": "Western Michigan Broncos",
+    "WOF": "Wofford Terriers",  "WSU": "Washington State Cougars",
+    "WVU": "West Virginia Mountaineers",  "WYO": "Wyoming Cowboys",
 }
 
 

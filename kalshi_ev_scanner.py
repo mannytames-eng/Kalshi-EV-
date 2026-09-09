@@ -2425,6 +2425,35 @@ def _parse_moneyline_team(
     one of the two. Confirmed live 2026-07-14 against a real KXMLBGAME event.
     """
     title = (market.get("yes_sub_title") or market.get("title") or "").lower()
+
+    def _school_only(full_name: str) -> str:
+        """Full name minus its last word (the mascot), with 'St'/'St.' expanded
+        to 'State' so Kalshi's abbreviated titles ('Iowa St.') line up with the
+        Odds API's spelled-out names ('Iowa State Cyclones')."""
+        words = full_name.split()[:-1] or full_name.split()
+        s = " ".join(words)
+        s = re.sub(r"\bst\.?\b", "state", s, flags=re.IGNORECASE)
+        return _norm(s)
+
+    nt_school = re.sub(r"\bst\.?\b", "state", title, flags=re.IGNORECASE)
+    nt_school = _norm(nt_school)
+    # Exact school-name match, tried FIRST across both candidates, before any
+    # substring check: "Iowa" must match "Iowa Hawkeyes" exactly, never "Iowa
+    # State Cyclones" merely because "iowa" is a leading substring of
+    # "iowastatecyclones". Found live 2026-09-09 on real NCAAF moneylines —
+    # every "Team" vs "Team State" pairing (Iowa/Iowa St., Kansas/Kansas St.,
+    # Oklahoma/Oklahoma St., ...) was silently resolving to whichever name got
+    # checked first in the away-then-home loop below, manufacturing a huge
+    # phantom edge (this game showed +58%) by pricing one team's market
+    # against the OTHER team's win probability. Pro-sports city names don't
+    # have this "same first word, different team" shape, so it never
+    # surfaced before a sport with many School/School-State pairs existed.
+    for name in [away_name, home_name]:
+        if name is None:
+            continue
+        if nt_school and nt_school == _school_only(name):
+            return name
+
     for name in [away_name, home_name]:
         if name is None:
             continue

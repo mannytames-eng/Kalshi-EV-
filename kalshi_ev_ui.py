@@ -4205,6 +4205,57 @@ def _get_performance(since: Optional[str] = None) -> dict:
         _p = _tk.split("-")
         return _p[1] if len(_p) > 1 else _tk
 
+    def _clustered_significance(paired):
+        """paired: list of (value, cluster_key). Game-clustered t-stat +
+        bootstrap 95% CI on the mean, same math as the unit-P&L block below,
+        generalized so CLV can get the identical treatment (added 2026-09-13
+        — CLV previously only ever showed a bare average, no way to tell a
+        real signal from noise on a small sample). Returns
+        (mean, tstat, tstat_conf, ci95) — tstat_conf is Φ(t)·100, the
+        layperson "% chance this is a real signal, not luck" reading; ci95
+        is a [lo, hi] cluster-bootstrap interval on the mean, resampling
+        whole clusters (games) so same-game bets' correlated outcome doesn't
+        overstate precision. All None where the sample is too thin to say
+        anything (fewer than 2 values or fewer than 2 clusters)."""
+        vals = [v for v, _ in paired]
+        if not vals:
+            return None, None, None, None
+        xbar = sum(vals) / len(vals)
+        clusters: dict = {}
+        for v, k in paired:
+            clusters.setdefault(k, []).append(v)
+        tstat = None
+        tstat_conf = None
+        if len(vals) > 1 and len(clusters) > 1:
+            ss = sum((sum(v - xbar for v in vs)) ** 2 for vs in clusters.values())
+            se = (ss ** 0.5) / len(vals)
+            if se > 0:
+                _t = xbar / se
+                tstat = round(_t, 2)
+                import math as _m
+                tstat_conf = round(100 * 0.5 * (1 + _m.erf(_t / (2 ** 0.5))), 1)
+        ci = None
+        gk = list(clusters.keys())
+        if len(gk) >= 2:
+            _rand.seed(17)
+            ms = []
+            for _ in range(2000):
+                pool: list = []
+                for _ in range(len(gk)):
+                    pool.extend(clusters[gk[_rand.randrange(len(gk))]])
+                if pool:
+                    ms.append(sum(pool) / len(pool))
+            ms.sort()
+            ci = [round(ms[int(0.025 * len(ms))], 3), round(ms[int(0.975 * len(ms))], 3)]
+        return round(xbar, 3), tstat, tstat_conf, ci
+
+    def _median(vals):
+        if not vals:
+            return None
+        sv = sorted(vals)
+        mid = len(sv) // 2
+        return round(sv[mid] if len(sv) % 2 else (sv[mid - 1] + sv[mid]) / 2, 2)
+
     def _slice_stats(slice_bets):
         s = [b for b in slice_bets if b["status"] in ("won", "lost")]
         n = len(s)
@@ -4219,40 +4270,21 @@ def _get_performance(since: Optional[str] = None) -> dict:
             if b.get("unit_pnl") is not None:
                 clusters.setdefault(_game_key(b), []).append(b["unit_pnl"])
         xbar = sum(units) / len(units) if units else 0.0
-        # cluster-robust SE of the mean: sqrt( Σ_g (Σ_i (x_i−x̄))² ) / N
-        tstat = None
-        tstat_conf = None   # plain-language "% chance this edge is real (positive)"
-        if len(units) > 1 and len(clusters) > 1:
-            ss = sum((sum(u - xbar for u in us)) ** 2 for us in clusters.values())
-            se = (ss ** 0.5) / len(units)
-            if se > 0:
-                _t = xbar / se
-                tstat = round(_t, 2)
-                # One-sided confidence that the true mean unit-P&L is above 0:
-                # Φ(t) = 0.5·(1+erf(t/√2)). This is the layperson reading of the
-                # t-stat — "how likely is this a real edge, not luck." t=1.65→95%,
-                # t=1.0→84%, t=0→50%. Not a claim the edge is proven; just P(>0).
-                import math as _m
-                tstat_conf = round(100 * 0.5 * (1 + _m.erf(_t / (2 ** 0.5))), 1)
-        # cluster bootstrap 95% CI on the mean unit P&L (resample whole games)
-        ci = None
-        gk = list(clusters.keys())
-        if len(gk) >= 2 and units:
-            _rand.seed(17)
-            ms = []
-            for _ in range(2000):
-                pool: list = []
-                for _ in range(len(gk)):
-                    pool.extend(clusters[gk[_rand.randrange(len(gk))]])
-                if pool:
-                    ms.append(sum(pool) / len(pool))
-            ms.sort()
-            ci = [round(ms[int(0.025 * len(ms))], 3), round(ms[int(0.975 * len(ms))], 3)]
+        _, tstat, tstat_conf, ci = _clustered_significance(
+            [(b["unit_pnl"], _game_key(b)) for b in s if b.get("unit_pnl") is not None]
+        )
+        _, clv_tstat, clv_tstat_conf, clv_ci = _clustered_significance(
+            [(_true_clv(b), _game_key(b)) for b in s if _true_clv(b) is not None]
+        )
         return {
             "n":                   n,
             "n_games":             len(clusters),
             "win_rate":            round(100 * wins / n, 1),
             "avg_clv":             round(sum(clvs) / len(clvs), 2) if clvs else None,
+            "median_clv":          _median(clvs),
+            "clv_tstat":           clv_tstat,       # game-clustered, on mean CLV
+            "clv_tstat_conf":      clv_tstat_conf,  # Φ(t)·100 — "% chance CLV signal is real"
+            "clv_ci95":            clv_ci,          # game-cluster bootstrap CI on mean CLV
             "total_units":         round(sum(units), 2) if units else None,
             "avg_units":           round(xbar, 3) if units else None,
             "total_kelly_dollars": round(sum(kdols), 2) if kdols else None,
@@ -7899,17 +7931,19 @@ function renderPerformance(d) {
   if (d.slice_stats && (d.slice_stats.shadowed || {}).n) {
     const ss = d.slice_stats, L = ss.live, S = ss.shadowed, C = ss.combined;
     const uClr = v => v == null ? '' : v > 0 ? 'pnl-pos' : v < 0 ? 'pnl-neg' : '';
-    const ciTxt = s => s && s.unit_ci95 ? `[${s.unit_ci95[0]}, ${s.unit_ci95[1]}]` : '—';
+    const ciTxt = (s, key='unit_ci95', unit='') => s && s[key] ? `[${s[key][0]}${unit}, ${s[key][1]}${unit}]` : '—';
     // Plain-language reading of the t-stat: Φ(t) = "% chance this is a real
     // (positive) edge, not luck", with a word so non-stats readers get it.
-    const confTxt = s => {
-      if (!s || s.unit_tstat_conf == null) return '—';
-      const p = s.unit_tstat_conf;
+    // Generalized (2026-09-13) to take a field-name pair so the identical
+    // reading works for CLV's own t-stat, not just unit P&L's.
+    const confTxt = (s, confKey='unit_tstat_conf') => {
+      if (!s || s[confKey] == null) return '—';
+      const p = s[confKey];
       const word = p >= 97.5 ? 'very strong' : p >= 95 ? 'strong' : p >= 84 ? 'moderate' : p >= 70 ? 'weak' : 'noise';
       return `${p}% likely real · ${word}`;
     };
-    const confClr = s => (!s || s.unit_tstat_conf == null) ? '' :
-      s.unit_tstat_conf >= 95 ? 'pnl-pos' : s.unit_tstat_conf < 70 ? 'pnl-neg' : '';
+    const confClr = (s, confKey='unit_tstat_conf') => (!s || s[confKey] == null) ? '' :
+      s[confKey] >= 95 ? 'pnl-pos' : s[confKey] < 70 ? 'pnl-neg' : '';
     const row = (label, get, cls) => `<tr>
       <td style="color:var(--muted);">${label}</td>
       <td class="num ${cls?cls(L):''}">${L&&L.n?get(L):'—'}</td>
@@ -7927,7 +7961,11 @@ function renderPerformance(d) {
           <tbody>
             ${row('Bets (games)', s=>`${s.n} (${s.n_games})`)}
             ${row('Win rate', s=>`${s.win_rate}%`)}
-            ${row('Avg CLV', s=>s.avg_clv!=null?`${s.avg_clv>0?'+':''}${s.avg_clv}c`:'—')}
+            ${row('Avg CLV', s=>s.avg_clv!=null?`${s.avg_clv>0?'+':''}${s.avg_clv}c`:'—', s=>uClr(s.avg_clv))}
+            ${row('Median CLV', s=>s.median_clv!=null?`${s.median_clv>0?'+':''}${s.median_clv}c`:'—', s=>uClr(s.median_clv))}
+            ${row('CLV t-stat', s=>s.clv_tstat!=null?s.clv_tstat:'—')}
+            ${row('↳ CLV chance real', s=>confTxt(s,'clv_tstat_conf'), s=>confClr(s,'clv_tstat_conf'))}
+            ${row('CLV 95% CI', s=>ciTxt(s,'clv_ci95','c'))}
             ${row('Total units', s=>s.total_units!=null?`${s.total_units>0?'+':''}${s.total_units}u`:'—', s=>uClr(s.total_units))}
             ${row('Avg unit P&amp;L', s=>s.avg_units!=null?`${s.avg_units>0?'+':''}${s.avg_units}u`:'—', s=>uClr(s.avg_units))}
             ${row('Kelly P&amp;L', s=>s.total_kelly_dollars!=null?`${s.total_kelly_dollars>=0?'+$':'-$'}${Math.abs(s.total_kelly_dollars).toFixed(2)}`:'—', s=>uClr(s.total_kelly_dollars))}
@@ -7938,7 +7976,7 @@ function renderPerformance(d) {
           </tbody>
         </table>
         <p style="font-size:10px;color:var(--muted);margin:4px 0 0;line-height:1.3;">
-          Shadowed = parallel HYPOTHETICAL ledger: $0 real stake, excluded from every headline stat, but sized/tracked exactly like live (¼-Kelly, 3% per-bet + 15%/day caps). t-stat &amp; 95% CI are game-clustered on flat-unit P&amp;L (same-game bets share an outcome). "Chance it's real" = the t-stat translated to plain terms — the probability the true edge is positive, not luck (95%+ = strong, under 70% = still basically noise); it rises only as the sample grows. If Shadowed's units/CLV beat Live, the band is costing edge; if worse, it's protecting you.
+          Shadowed = parallel HYPOTHETICAL ledger: $0 real stake, excluded from every headline stat, but sized/tracked exactly like live (¼-Kelly, 3% per-bet + 15%/day caps). Unit t-stat &amp; 95% CI are game-clustered on flat-unit P&amp;L; CLV t-stat &amp; 95% CI run the identical test on Avg CLV instead (same-game bets share an outcome either way, so both cluster on it). "Chance it's real" = the t-stat translated to plain terms — the probability the true value is positive, not luck (95%+ = strong, under 70% = still basically noise); it rises only as the sample grows. Median CLV sits next to the average so one outsized line move (e.g. a late injury scratch) doesn't get mistaken for the typical bet's experience. Note: even a statistically real CLV is supporting evidence, not proof of a tradeable edge on its own — Total Bases had significant positive CLV and still lost money. If Shadowed's units/CLV beat Live, the band is costing edge; if worse, it's protecting you.
         </p>
       </details>`;
   }

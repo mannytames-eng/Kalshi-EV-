@@ -2256,10 +2256,14 @@ def _build_score_index() -> dict:
 def _lookup_box_stat(bet: dict):
     """Core box-score lookup for a prop bet. Returns (value:int, label:str)
     or None. Works on both final and in-progress (live) box scores — both the
-    MLB Stats API and ESPN's WNBA summary update the same endpoint during the
-    game. WNBA tickers dispatch to the ESPN path (defined below)."""
-    if bet.get("ticker", "").upper().startswith("KXWNBA"):
+    MLB Stats API and ESPN's WNBA/NFL summary endpoints update the same
+    endpoint during the game. WNBA/NFL tickers dispatch to their ESPN paths
+    (defined below)."""
+    _tk = bet.get("ticker", "").upper()
+    if _tk.startswith("KXWNBA"):
         return _lookup_wnba_box_stat(bet)
+    if _tk.startswith("KXNFL"):
+        return _lookup_nfl_box_stat(bet)
     import re   # re is imported locally throughout this module, not globally
     prop_type = bet.get("prop_type", "")
     matchup   = bet.get("matchup", "")
@@ -2422,10 +2426,13 @@ def _live_stat_text(bet: dict, value, label) -> str:
 
 def _fetch_game_inning(bet: dict) -> Optional[str]:
     """Return the live game state for a bet's game — MLB: 'Top 7th', 'Bot 3rd',
-    'Mid 5th'; WNBA: 'Q3 5:24', 'Half'; both: 'Final'; or None. MLB uses the
-    schedule's linescore hydrate; WNBA dispatches to the ESPN scoreboard."""
-    if bet.get("ticker", "").upper().startswith("KXWNBA"):
+    'Mid 5th'; WNBA/NFL: 'Q3 5:24', 'Half'; all: 'Final'; or None. MLB uses the
+    schedule's linescore hydrate; WNBA/NFL dispatch to their ESPN scoreboards."""
+    _tk = bet.get("ticker", "").upper()
+    if _tk.startswith("KXWNBA"):
         return _fetch_wnba_quarter(bet)
+    if _tk.startswith("KXNFL"):
+        return _fetch_nfl_quarter(bet)
     import re
     ticker = bet.get("ticker", "")
     game_date = _parse_ticker_date(ticker)
@@ -2582,6 +2589,162 @@ def _fetch_wnba_quarter(bet: dict) -> Optional[str]:
     """Live game state for a WNBA bet: 'Q3 5:24', 'Half', 'OT 2:00', 'Final',
     or None (pregame / unknown)."""
     ev = _wnba_event_for_ticker(bet.get("ticker", "").upper())
+    if not ev:
+        return None
+    if ev["state"] == "post":
+        return "Final"
+    if ev["state"] != "in":
+        return None
+    if "half" in (ev.get("detail") or "").lower():
+        return "Half"
+    p = ev.get("period")
+    if not p:
+        return None
+    lab = f"Q{p}" if p <= 4 else ("OT" if p == 5 else f"{p - 4}OT")
+    return f"{lab} {ev.get('clock') or ''}".strip()
+
+
+# ── NFL (ESPN) — live box stats + quarter/clock for player props ─────────────
+# Same plumbing as the WNBA section above, adapted for football's boxscore
+# shape: ESPN splits player stats into named groups (passing/rushing/
+# receiving/...) each with their own labels array, unlike WNBA's single flat
+# stat table -- so matching needs (group name, label), not label alone, or
+# e.g. rushing YDS and receiving YDS collide. Verified live 2026-09-11
+# against the real SF@LAR box score (site.api.espn.com .../nfl/summary).
+# Kalshi NFL prop tickers have no time component (KXNFLREC-26SEP10SFLAR-
+# LARCPARKINSON84-3), and ESPN's abbreviations differ from Kalshi's/NFL_ABBR's
+# on the same two teams already found for the logo CDN (JAC->JAX, WAS->WSH).
+_NFL_TEAMS_ESPN = set(NFL_ABBR.keys())
+_NFL_K2ESPN     = {"JAC": "JAX", "WAS": "WSH"}
+_NFL_STAT_MAP = {
+    # ticker prefix -> (ESPN stat group name, ESPN column label, display label)
+    "KXNFLREC":     ("receiving", "REC", "Rec"),
+    "KXNFLRECYDS":  ("receiving", "YDS", "Rec Yds"),
+    "KXNFLRSHYDS":  ("rushing",   "YDS", "Rush Yds"),
+    "KXNFLPASSYDS": ("passing",   "YDS", "Pass Yds"),
+    "KXNFLPASSTDS": ("passing",   "TD",  "Pass TDs"),
+}
+
+_nfl_sb_cache:  dict = {}   # "YYYYMMDD" -> (fetched_ts, events list) -- 60s TTL
+_nfl_sum_cache: dict = {}   # ESPN event id -> (fetched_ts, summary json) -- 45s TTL
+
+
+def _nfl_scoreboard(date_iso: str) -> list:
+    """ESPN NFL scoreboard for a YYYY-MM-DD date, cached 60s. Returns a list of
+    {id, away, home, start, state, period, clock, detail} (ESPN abbrs; state
+    is pre/in/post). Serves the stale cache on fetch failure."""
+    key = date_iso.replace("-", "")
+    now = time.time()
+    hit = _nfl_sb_cache.get(key)
+    if hit and now - hit[0] < 60:
+        return hit[1]
+    try:
+        import urllib.request as _ur
+        url = f"https://site.api.espn.com/apis/site/v2/sports/football/nfl/scoreboard?dates={key}"
+        with _ur.urlopen(url, timeout=5) as r:
+            data = json.loads(r.read())
+        events = []
+        for ev in data.get("events", []):
+            comp   = (ev.get("competitions") or [{}])[0]
+            byside = {c.get("homeAway"): c for c in comp.get("competitors", [])}
+            a, h   = byside.get("away", {}), byside.get("home", {})
+            st = ev.get("status", {}) or {}
+            events.append({
+                "id":         ev.get("id"),
+                "away":       (a.get("team") or {}).get("abbreviation", ""),
+                "home":       (h.get("team") or {}).get("abbreviation", ""),
+                "away_score": a.get("score"),
+                "home_score": h.get("score"),
+                "start":      ev.get("date"),
+                "state":      (st.get("type") or {}).get("state", ""),
+                "period":     st.get("period"),
+                "clock":      st.get("displayClock"),
+                "detail":     (st.get("type") or {}).get("shortDetail", ""),
+            })
+    except Exception:
+        return hit[1] if hit else []
+    _nfl_sb_cache[key] = (now, events)
+    return events
+
+
+def _nfl_event_for_ticker(ticker: str) -> Optional[dict]:
+    """Match a Kalshi NFL ticker to its ESPN scoreboard event via the
+    concatenated away+home team segment (e.g. SFLAR, NESEA). NFL codes are
+    2-3 letters (unlike WNBA's 4-letter CONN), so try longest split first."""
+    import re
+    game_date = _parse_ticker_date(ticker)
+    m = re.search(r"KXNFL[A-Z]*-\d{2}[A-Z]{3}\d{2}([A-Z]+)-", ticker.upper())
+    if not game_date or not m:
+        return None
+    seg = m.group(1)
+    for n in (3, 2):
+        a, h = seg[:n], seg[n:]
+        if a in _NFL_TEAMS_ESPN and h in _NFL_TEAMS_ESPN:
+            ea, eh = _NFL_K2ESPN.get(a, a), _NFL_K2ESPN.get(h, h)
+            for ev in _nfl_scoreboard(game_date):
+                if ev["away"] == ea and ev["home"] == eh:
+                    return ev
+    return None
+
+
+def _lookup_nfl_box_stat(bet: dict):
+    """NFL counterpart of _lookup_wnba_box_stat: (value:int, label:str) or
+    None. Works on both live and final box scores (same ESPN summary
+    endpoint). Matches on (stat group, column label) since football splits
+    passing/rushing/receiving into separate tables that each reuse column
+    names like 'YDS' and 'TD'."""
+    import re
+    ticker  = bet.get("ticker", "").upper()
+    mapped  = next((v for pfx, v in _NFL_STAT_MAP.items() if ticker.startswith(pfx)), None)
+    matchup = bet.get("matchup", "")
+    if not mapped or not matchup:
+        return None
+    group_name, espn_label, display_label = mapped
+    ev = _nfl_event_for_ticker(ticker)
+    if not ev or ev["state"] == "pre" or not ev.get("id"):
+        return None
+    player_last = re.sub(r"\s*\([^)]*\)\s*$", "", matchup).split()[-1].lower()
+    try:
+        import urllib.request as _ur
+        now = time.time()
+        hit = _nfl_sum_cache.get(ev["id"])
+        if hit and now - hit[0] < 45:
+            summ = hit[1]
+        else:
+            url = f"https://site.api.espn.com/apis/site/v2/sports/football/nfl/summary?event={ev['id']}"
+            with _ur.urlopen(url, timeout=5) as r:
+                summ = json.loads(r.read())
+            _nfl_sum_cache[ev["id"]] = (now, summ)
+        for team in (summ.get("boxscore", {}) or {}).get("players", []):
+            for stat in team.get("statistics", []):
+                if stat.get("name") != group_name:
+                    continue
+                labels = stat.get("labels") or []
+                if espn_label not in labels:
+                    continue
+                idx = labels.index(espn_label)
+                for ath in stat.get("athletes", []):
+                    nm = (ath.get("athlete") or {}).get("displayName", "")
+                    # Strip trailing "Sr."/"Jr."/"II"/"III" etc. so the last
+                    # real surname token matches (e.g. "Deebo Samuel Sr.").
+                    nm_tokens = re.sub(r"\s+(Sr\.?|Jr\.?|I{2,3}|IV)$", "", nm).split()
+                    if not nm_tokens or nm_tokens[-1].lower() != player_last:
+                        continue
+                    raw = ath.get("stats") or []
+                    if idx < len(raw) and raw[idx] not in ("", "--"):
+                        try:
+                            return (int(float(raw[idx])), display_label)
+                        except ValueError:
+                            return None
+    except Exception:
+        pass
+    return None
+
+
+def _fetch_nfl_quarter(bet: dict) -> Optional[str]:
+    """Live game state for an NFL bet: 'Q3 5:24', 'Half', 'OT 2:00', 'Final',
+    or None (pregame / unknown)."""
+    ev = _nfl_event_for_ticker(bet.get("ticker", "").upper())
     if not ev:
         return None
     if ev["state"] == "post":

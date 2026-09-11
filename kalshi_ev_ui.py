@@ -67,6 +67,7 @@ from kalshi_ev_scanner import (
     WNBA_SPREAD_STD, WNBA_TOTAL_STD,
     NFL_SPREAD_STD, NFL_TOTAL_STD,
     NCAAF_SPREAD_STD, NCAAF_TOTAL_STD, NCAAF_ABBR,
+    NFL_RETAIL_FALLBACK_BOOKS,
     MLB_ABBR, NBA_ABBR, WNBA_ABBR, NFL_ABBR,
     NFL_PROP_SERIES, NFL_PLAYER_PROP_MARKETS,
     _parse_nfl_event,
@@ -2063,9 +2064,17 @@ def _add_new_bets(edges: list) -> list:
             )
             # WNBA: only EXTRAPOLATED props run hypothetical shadow; exact-match
             # props + game lines fund normally (2026-07-22).
+            # Retail-consensus NFL props (fair_source="retail_consensus", added
+            # 2026-09-11) are ALWAYS shadow, unconditionally -- not gated by
+            # SHADOW_MARKETS ticker prefix (which would otherwise now fund them,
+            # since NFL props graduated off shadow). Structurally weaker signal
+            # than Pinnacle-anchored edges (retail books mirror each other and
+            # move on parlay/public demand, not pure probability) -- needs its
+            # own settled record before it's trusted with anything beyond $0.
             shadow      = (_is_shadow(e.get("ticker", "")) or e.get("sanity_shadow", False)
                            or _tb_high_edge or _tb_overconfident or _tb_shadow_all
-                           or _outs_high_edge or _wnba_hypo(e))
+                           or _outs_high_edge or _wnba_hypo(e)
+                           or e.get("fair_source") == "retail_consensus")
             _cal_mult = _stake_mults.get(_calib_bucket(e), 1.0)
             paper_stake = 0.0 if shadow else round(_paper_kelly_stake(
                 e["edge_pct"], e["kalshi"], _game_time_iso, e.get("ticker", ""),
@@ -2108,6 +2117,10 @@ def _add_new_bets(edges: list) -> list:
                 "consensus_reason":   e.get("consensus_reason", ""),
                 "books_used":         e.get("books_used", []),
                 "consensus_prob":     e.get("consensus_prob"),
+                "fair_source":        e.get("fair_source", "exact"),   # "retail_consensus" for
+                                       # the NFL retail-fallback signal (2026-09-11) -- lets
+                                       # _perf_label track it as its own row, separate from
+                                       # Pinnacle-anchored NFL props.
                 # ── Pinnacle source-of-truth fields ──────────────────────────
                 "pin_prob_at_flag":   pin_prob_at_flag,         # Pinnacle % at detection
                 "pin_prob_pct":       e.get("pin_prob_pct"),    # same, pre-computed by _run_scan
@@ -3969,10 +3982,11 @@ def _get_performance(since: Optional[str] = None) -> dict:
                 return ("Pitcher Outs (Whole-Inning)"
                         if b.get("pin_line_at_flag") in _OUTS_WHOLE_INNING_LINES
                         else "Pitcher Outs (Other Lines)")
+            _retail = b.get("fair_source") == "retail_consensus"
             for prefix, label in _PROP_SERIES_LABELS.items():
                 if ticker.startswith(prefix):
-                    return label
-            return "MLB Props"
+                    return f"{label} (Retail)" if _retail else label
+            return "MLB Props (Retail)" if _retail else "MLB Props"
         if ticker.startswith("KXWNBA"):
             sport = "WNBA"
         elif ticker.startswith("KXNBA"):
@@ -5294,6 +5308,12 @@ def _run_scan():
                     lookahead_hours=240,   # ~10 days -- default 48h zeroed every NFL game
                                            # live 2026-09-03 (nearest kickoff was 6+ days out
                                            # even though real Pinnacle odds already existed)
+                    retail_fallback_books=NFL_RETAIL_FALLBACK_BOOKS,   # added 2026-09-11 --
+                                           # lets 2+ mainstream retail books (DK/FD/BetMGM/
+                                           # BetRivers/Fanatics) agreeing stand in for Pinnacle
+                                           # on rungs Pinnacle never prices. Structurally
+                                           # weaker signal -- forced shadow below regardless
+                                           # of SHADOW_MARKETS, tracked as its own row.
                 )
             except Exception as _nfl_prop_exc:
                 print(f"  NFL props scan error: {_nfl_prop_exc}")
@@ -8035,8 +8055,8 @@ function renderPerformance(d) {
     </p>`;
 
   // By-type breakdown table
-  const PROP_LABELS = new Set(['Strikeouts (K)', 'Hits', 'Total Bases', 'RBIs', 'MLB Props', 'NBA Props', 'WNBA Props', 'NFL Pass Yards', 'NFL Rush Yards', 'NFL Reception Yards', 'NFL Receptions', 'NFL Pass TDs']);
-  const TYPE_ORDER  = ['MLB Total', 'MLB Spread', 'Strikeouts (K)', 'Pitcher Outs (Whole-Inning)', 'Pitcher Outs (Other Lines)', 'Hits', 'Total Bases', 'RBIs', 'MLB Props', 'NBA Props', 'WNBA Total', 'WNBA Spread', 'WNBA Props', 'NFL Moneyline', 'NFL Spread', 'NFL Total', 'NFL Pass Yards', 'NFL Rush Yards', 'NFL Reception Yards', 'NFL Receptions', 'NFL Pass TDs', 'NCAAF Moneyline', 'NCAAF Spread', 'NCAAF Total', 'La Liga Moneyline', 'La Liga Total', 'La Liga BTTS', 'La Liga Corners', 'EPL Moneyline', 'EPL Total', 'EPL BTTS', 'EPL Corners', 'MLS Moneyline', 'MLS Total', 'MLS BTTS', 'Argentina Moneyline', 'Argentina Total', 'Argentina BTTS', 'Brazil Moneyline', 'Brazil Total', 'Brazil BTTS', 'Liga MX Moneyline', 'Liga MX Total', 'Liga MX BTTS', 'Brazil B Moneyline', 'Brazil B Total', 'Brazil B BTTS', 'Sudamericana Moneyline', 'Sudamericana Total', 'Sudamericana BTTS', 'Chile Moneyline', 'Chile Total', 'Chile BTTS', 'ATP Moneyline', 'WTA Moneyline'];
+  const PROP_LABELS = new Set(['Strikeouts (K)', 'Hits', 'Total Bases', 'RBIs', 'MLB Props', 'NBA Props', 'WNBA Props', 'NFL Pass Yards', 'NFL Rush Yards', 'NFL Reception Yards', 'NFL Receptions', 'NFL Pass TDs', 'NFL Pass Yards (Retail)', 'NFL Rush Yards (Retail)', 'NFL Reception Yards (Retail)', 'NFL Receptions (Retail)', 'NFL Pass TDs (Retail)']);
+  const TYPE_ORDER  = ['MLB Total', 'MLB Spread', 'Strikeouts (K)', 'Pitcher Outs (Whole-Inning)', 'Pitcher Outs (Other Lines)', 'Hits', 'Total Bases', 'RBIs', 'MLB Props', 'NBA Props', 'WNBA Total', 'WNBA Spread', 'WNBA Props', 'NFL Moneyline', 'NFL Spread', 'NFL Total', 'NFL Pass Yards', 'NFL Rush Yards', 'NFL Reception Yards', 'NFL Receptions', 'NFL Pass TDs', 'NCAAF Moneyline', 'NCAAF Spread', 'NCAAF Total', 'La Liga Moneyline', 'La Liga Total', 'La Liga BTTS', 'La Liga Corners', 'EPL Moneyline', 'EPL Total', 'EPL BTTS', 'EPL Corners', 'MLS Moneyline', 'MLS Total', 'MLS BTTS', 'Argentina Moneyline', 'Argentina Total', 'Argentina BTTS', 'Brazil Moneyline', 'Brazil Total', 'Brazil BTTS', 'Liga MX Moneyline', 'Liga MX Total', 'Liga MX BTTS', 'Brazil B Moneyline', 'Brazil B Total', 'Brazil B BTTS', 'Sudamericana Moneyline', 'Sudamericana Total', 'Sudamericana BTTS', 'Chile Moneyline', 'Chile Total', 'Chile BTTS', 'ATP Moneyline', 'WTA Moneyline', 'NFL Pass Yards (Retail)', 'NFL Rush Yards (Retail)', 'NFL Reception Yards (Retail)', 'NFL Receptions (Retail)', 'NFL Pass TDs (Retail)'];
   // Markets no longer scanned — settled record frozen & still shown, but tagged
   // so it's clear no new bets are being placed. Total Bases terminated 2026-07-23.
   const TERMINATED_LABELS = new Set(['Total Bases']);

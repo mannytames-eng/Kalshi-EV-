@@ -124,7 +124,30 @@ BOOK_WEIGHTS: Dict[str, float] = {
     "pinnacle":   1.00,   # sharp book — sole fair-value anchor
     "draftkings": 0.00,   # confirmation only — excluded from fair-value calc
     "fanduel":    0.00,   # confirmation only — excluded from fair-value calc
+    # Added 2026-09-11 for the NFL retail-consensus fallback (see
+    # NFL_RETAIL_FALLBACK_BOOKS below) — mainstream licensed US books only,
+    # deliberately excluding offshore ones (Bovada, BetOnlineAG, MyBookieAG,
+    # BetUS) even though they showed up in the live scoping check, since this
+    # is already a lower-trust fallback and stacking a second layer of lower-
+    # trust books on top isn't worth it for a first pass. Same as DK/FanDuel:
+    # zero weight in the normal Pinnacle-anchored consensus (confirmation
+    # only there) -- adding a bookmaker to this dict costs nothing extra
+    # (Odds API bills per market key returned, not per book, confirmed live)
+    # but is required for fetch_player_prop_odds_event to even collect its
+    # data at all (see the `if bkey not in BOOK_WEIGHTS: continue` gate in
+    # build_all_player_props).
+    "betmgm":     0.00,
+    "betrivers":  0.00,
+    "fanatics":   0.00,
 }
+
+# Books allowed to form a retail-consensus fair value when Pinnacle has no
+# line at all for a given rung (see build_all_player_props's
+# retail_fallback_books param). Scoped to NFL only for now, passed explicitly
+# from the NFL props scan call -- MLB/WNBA/other sports are unaffected
+# (retail_fallback_books defaults to None, preserving their exact existing
+# behavior of dropping any line without Pinnacle + 2 weighted books).
+NFL_RETAIL_FALLBACK_BOOKS = {"draftkings", "fanduel", "betmgm", "betrivers", "fanatics"}
 
 # ── Normal-distribution standard deviations (empirical) ─────────────────────
 # Used for Gaussian extrapolation: given Pinnacle's spread cover prob at their
@@ -777,9 +800,12 @@ def fetch_player_prop_odds_event(sport: str, event_id: str, markets: str = None)
     """
     if markets is None:
         markets = "pitcher_strikeouts,batter_hits,batter_total_bases,batter_rbis"
-    # Fetch ALL configured books (incl. DraftKings/FanDuel at weight 0). They
-    # don't influence fair value, but they're needed to cross-check Pinnacle and
-    # catch stale Pinnacle-only lines (the sanity-shadow guard). Adding books to
+    # Fetch ALL configured books (incl. DraftKings/FanDuel/BetMGM/BetRivers/
+    # Fanatics, all weight 0). They don't influence the main Pinnacle-anchored
+    # fair value, but they're needed to cross-check Pinnacle (the sanity-
+    # shadow guard) and, for NFL specifically, to form a retail-consensus
+    # fallback fair value on rungs Pinnacle never prices at all (see
+    # build_all_player_props's retail_fallback_books param). Adding books to
     # the same market/region call costs no extra Odds API credits.
     sharp_books = ",".join(BOOK_WEIGHTS.keys())
     r = requests.get(
@@ -1287,6 +1313,7 @@ def _validate_book_consensus(
     books_detail: Dict[str, float],
     side: str,
     k_side: float,
+    fair_source: str = "exact",
 ) -> Tuple[bool, str]:
     """
     Validate that Pinnacle AND at least one of DraftKings / FanDuel both
@@ -1295,6 +1322,9 @@ def _validate_book_consensus(
     books_detail: {book_key: yes_side_no_vig_prob}  (canonical YES probability)
     side:   "YES" or "NO" — the proposed bet direction
     k_side: Kalshi ask price for the bet side (tradeable cost)
+    fair_source: "exact" (default, Pinnacle-anchored) or "retail_consensus"
+        (see build_all_player_props's retail_fallback_books) -- routes to a
+        different validation branch below since there's no Pinnacle to check.
 
     A book "indicates value on a side" when its no-vig probability for that
     side exceeds the Kalshi price you would pay to buy it.
@@ -1309,6 +1339,22 @@ def _validate_book_consensus(
         if p_yes is None:
             return None
         return p_yes if side == "YES" else 1.0 - p_yes
+
+    if fair_source == "retail_consensus":
+        # No Pinnacle by construction. Substitute bar: a STRICT MAJORITY of
+        # the books that formed the consensus average must themselves
+        # individually confirm value on this side, not just the average --
+        # protects against one outlier (e.g. a stale promotional line)
+        # dragging the average past the Kalshi price while most of the
+        # contributing books actually disagree.
+        sides = [_side_prob(bk) for bk in books_detail]
+        sides = [s for s in sides if s is not None]
+        if len(sides) < 2:
+            return False, "retail consensus: fewer than 2 books with usable prices"
+        confirming = sum(1 for s in sides if s > k_side)
+        if confirming * 2 <= len(sides):
+            return False, f"retail consensus: only {confirming}/{len(sides)} books individually confirm {side}"
+        return True, f"Retail consensus ({confirming}/{len(sides)} books confirm {side})"
 
     pin_p = _side_prob("pinnacle")
     dk_p  = _side_prob("draftkings")
@@ -3323,6 +3369,7 @@ def build_all_player_props(
     markets: str = None,
     lookahead_hours: float = 48.0,
     max_events: int = None,
+    retail_fallback_books: Optional[set] = None,
 ) -> Dict[str, Dict[str, dict]]:
     """
     Fetch player-prop odds for all books and build a weighted-consensus
@@ -3434,11 +3481,42 @@ def build_all_player_props(
                         print(f"    [drop] {_disp_name} {mtype} line={line_val}: no Pinnacle price, only {list(book_probs.keys())} (need Pinnacle or 2+ books)")
                         continue
 
-                    consensus_po, _ = _weighted_consensus(book_probs)
+                    fair_source  = "exact"
+                    used_probs   = book_probs
+                    if "pinnacle" in book_probs:
+                        consensus_po, _ = _weighted_consensus(book_probs)
+                    else:
+                        # No Pinnacle line for this rung. _weighted_consensus
+                        # would return 0.0 here (every remaining book carries
+                        # BOOK_WEIGHTS=0), which the sanity check below always
+                        # rejects -- confirmed live 2026-09-11: 204 real NFL
+                        # prop comparisons dropped this exact way in one 2h
+                        # window, every one backed by a single zero-weight
+                        # book. When 2+ books from the DESIGNATED retail set
+                        # (mainstream licensed US books, see
+                        # retail_fallback_books / NFL_RETAIL_FALLBACK_BOOKS)
+                        # independently land on the exact same rung, treat
+                        # their plain average as a real -- if structurally
+                        # weaker -- fair-value signal instead of discarding it.
+                        # Plain (unweighted) average, not _weighted_consensus:
+                        # none of these books individually deserves more
+                        # trust than another the way Pinnacle does.
+                        retail_probs = {bk: p for bk, p in book_probs.items()
+                                        if retail_fallback_books and bk in retail_fallback_books}
+                        if len(retail_probs) >= 2:
+                            consensus_po = sum(retail_probs.values()) / len(retail_probs)
+                            fair_source  = "retail_consensus"
+                            used_probs   = retail_probs
+                        else:
+                            consensus_po, _ = _weighted_consensus(book_probs)   # unchanged legacy path
+
                     lam = poisson_lambda_from_line(line_val, consensus_po)
                     if lam is None:
                         print(f"    [drop] {_disp_name} {mtype} line={line_val}: consensus prob {consensus_po:.3f} failed sanity bounds (books={list(book_probs.keys())})")
                         continue
+                    if fair_source == "retail_consensus":
+                        print(f"    [retail-consensus] {_disp_name} {mtype} line={line_val}: "
+                              f"fair={consensus_po:.1%} from {list(used_probs.keys())} (no Pinnacle line)")
 
                     # Per-book lambdas — each book fitted to THIS line.
                     per_book_lambdas: Dict[str, float] = {}
@@ -3457,8 +3535,9 @@ def build_all_player_props(
                         "line":              line_val,
                         "over_prob":         consensus_po,
                         "lambda":            lam,
-                        "books_used":        list(book_probs.keys()),
-                        "books_detail":      book_probs,
+                        "books_used":        list(used_probs.keys()),
+                        "books_detail":      used_probs,
+                        "fair_source":       fair_source,
                         "per_book_lambdas":  per_book_lambdas,
                         # RAW per-book over/under American odds at this line — the
                         # lossy-lost input for the de-vig study. Carried into the
@@ -3535,6 +3614,7 @@ def scan_player_props(
     parse_event_fn=None,
     lookahead_hours: float = 48.0,
     max_events: int = None,
+    retail_fallback_books: Optional[set] = None,
 ) -> List[dict]:
     """
     Scan Kalshi player-prop markets vs consensus no-vig props.
@@ -3543,6 +3623,10 @@ def scan_player_props(
     build_all_player_props (see its docstring — widen lookahead for sports whose
     books post a whole week's props at once, like NFL; raise max_events past the
     MAX_PROP_EVENTS default for a sport whose slate can exceed it).
+    retail_fallback_books: pass a set of book keys (e.g. NFL_RETAIL_FALLBACK_
+    BOOKS) to let 2+ of those books' agreement stand in for Pinnacle when
+    Pinnacle has no line at all. None (default) preserves exact prior
+    behavior for every existing caller — MLB/WNBA never pass this.
     """
     if abbr_map is None:
         abbr_map = MLB_ABBR
@@ -3667,7 +3751,8 @@ def scan_player_props(
 
     # 4. Build player prop consensus index
     player_lookup = build_all_player_props(odds_sport, odds_events, needed_teams or None, markets=prop_markets,
-                                            lookahead_hours=lookahead_hours, max_events=max_events)
+                                            lookahead_hours=lookahead_hours, max_events=max_events,
+                                            retail_fallback_books=retail_fallback_books)
     if not player_lookup:
         print("  No player prop data available — skipping.")
         return [], {}
@@ -3923,10 +4008,11 @@ def scan_player_props(
         seen_edges.add(dedup_key)
 
         books_detail = matched.get("books_detail", {})
+        prop_fair_source = matched.get("fair_source", "exact")
 
         # ── Book-consensus validation ─────────────────────────────────────
         consensus_valid, consensus_reason = _validate_book_consensus(
-            books_detail, side, k_side
+            books_detail, side, k_side, fair_source=prop_fair_source
         )
         if not consensus_valid:
             book_str_rej = "  ".join(f"{b}={p:.1%}" for b, p in sorted(books_detail.items()))
@@ -3968,6 +4054,7 @@ def scan_player_props(
             "prop_type":            prop_type,
             "books_used":           matched.get("books_used", []),
             "books_detail":         books_detail,
+            "fair_source":          prop_fair_source,
             "per_book_novig":       prop_per_book,
             # De-vig study (2026-07-14): TB-ONLY per user directive — Strikeouts
             # left as-is (Shin ≈ proportional on K's centered lines, ~0.1pp, so

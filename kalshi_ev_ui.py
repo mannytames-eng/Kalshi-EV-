@@ -2371,18 +2371,22 @@ def _lookup_wnba_total_result(bet: dict) -> Optional[str]:
 
 def _wants_actual_result(b: dict) -> bool:
     """True for any settled bet type _fetch_actual_stat knows how to resolve:
-    player props (incl. Pitcher Outs, mkt_type='prop') and WNBA Totals games
-    (mkt_type='total', same value MLB Totals uses -- ticker prefix is the only
-    way to scope this to WNBA specifically)."""
+    player props (incl. Pitcher Outs, mkt_type='prop'), WNBA Totals games, and
+    MLB Totals games (mkt_type='total' for both -- ticker prefix is the only
+    way to tell them apart)."""
     return (b.get("mkt_type") in ("prop", "wnba_prop", "nba_prop")
-            or b.get("ticker", "").upper().startswith("KXWNBATOTAL"))
+            or b.get("ticker", "").upper().startswith(("KXWNBATOTAL", "KXMLBTOTAL")))
 
 
 def _fetch_actual_stat(bet: dict) -> Optional[str]:
     """Human-readable final result like '7 K' / '2 TB' / '2 Outs' for props, or
-    'SEA 82 - 79 DAL  (Total 161)' for a WNBA Totals game. None if unavailable."""
-    if bet.get("ticker", "").upper().startswith("KXWNBATOTAL"):
+    'SEA 82 - 79 DAL  (Total 161)' for a WNBA/MLB Totals game. None if
+    unavailable."""
+    tk = bet.get("ticker", "").upper()
+    if tk.startswith("KXWNBATOTAL"):
         return _lookup_wnba_total_result(bet)
+    if tk.startswith("KXMLBTOTAL"):
+        return _lookup_mlb_total_result(bet)
     r = _lookup_box_stat(bet)
     return f"{r[0]} {r[1]}" if r else None
 
@@ -2626,11 +2630,13 @@ def _mlb_scoreboard(date_iso: str) -> list:
     return events
 
 
-def _lookup_mlb_score(bet: dict):
-    """Live state for an MLB moneyline bet: (scoreline, status, home_logo,
-    away_logo) or None. Matches the bet's matchup ('Away @ Home') to the ESPN
-    MLB scoreboard by team name + date; picks the closest start time so a
-    doubleheader's two games don't collide."""
+def _find_mlb_espn_event(bet: dict) -> Optional[dict]:
+    """Match a bet's matchup ('Away @ Home') to its ESPN MLB scoreboard event,
+    by team name + ticker date; picks the closest start time so a
+    doubleheader's two games don't collide. Shared by _lookup_mlb_score (live/
+    final scoreline for the tracker) and _lookup_mlb_total_result (final
+    combined-runs result for the settled-bet audit log) so both draw from the
+    same match instead of two independent lookups."""
     import re
     def _n(s): return re.sub(r"[^a-z0-9]", "", (s or "").lower())
     matchup = bet.get("matchup", "")
@@ -2655,7 +2661,17 @@ def _lookup_mlb_score(bet: dict):
             ) if ev.get("start") else 9e9)
         except (ValueError, AttributeError):
             pass
-    ev = cands[0]
+    return cands[0]
+
+
+def _lookup_mlb_score(bet: dict):
+    """Live state for an MLB moneyline/total/spread bet: (scoreline, status,
+    home_logo, away_logo) or None."""
+    ev = _find_mlb_espn_event(bet)
+    if ev is None:
+        return None
+    matchup = bet.get("matchup", "")
+    away_m, home_m = (p.strip() for p in matchup.split(" @ ", 1)) if " @ " in matchup else (None, None)
     as_, hs_ = ev.get("away_score"), ev.get("home_score")
     aabbr, habbr = ev["away"] or away_m, ev["home"] or home_m
     score  = f"{aabbr} {as_} – {hs_} {habbr}" if (as_ is not None and hs_ is not None) else None
@@ -2664,6 +2680,27 @@ def _lookup_mlb_score(bet: dict):
     if not score and not status:
         return None   # pregame — nothing live to show yet
     return (score or "—", status or "", ev.get("home_logo", ""), ev.get("away_logo", ""))
+
+
+def _lookup_mlb_total_result(bet: dict) -> Optional[str]:
+    """Final scoreline + combined total for a settled MLB Totals (KXMLBTOTAL)
+    bet, e.g. 'DET 3 - 5 CLE  (Total 8)' — mirrors _lookup_wnba_total_result.
+    None until the game is Final; this is a settled-record display, not a
+    live tracker (that's _lookup_mlb_score's job)."""
+    ev = _find_mlb_espn_event(bet)
+    if not ev or ev.get("state") != "post":
+        return None
+    a_s, h_s = ev.get("away_score"), ev.get("home_score")
+    if a_s is None or h_s is None:
+        return None
+    try:
+        total = int(a_s) + int(h_s)
+    except (TypeError, ValueError):
+        return None
+    matchup = bet.get("matchup", "")
+    away_m, home_m = (p.strip() for p in matchup.split(" @ ", 1)) if " @ " in matchup else ("", "")
+    aabbr, habbr = ev.get("away") or away_m, ev.get("home") or home_m
+    return f"{aabbr} {a_s} - {h_s} {habbr}  (Total {total})"
 
 
 def _is_mlb_game_line_bet(b: dict) -> bool:

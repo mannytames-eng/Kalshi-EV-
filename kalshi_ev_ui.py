@@ -467,12 +467,25 @@ SHADOW_MARKETS: list[str] = [
                       # any league here), moneyline/total/BTTS are the same math the
                       # paused leagues used. Shadow-first until it earns its own record.
     "KXEPL",          # EPL (KXEPLGAME/TOTAL/BTTS/CORNERS) — added 2026-08-19. Same.
-    "KXNFL",          # NFL (KXNFLGAME/SPREAD/TOTAL + PASSYDS/RSHYDS/RECYDS/REC/
-                      # PASSTDS props) — added 2026-09-03, the week Pinnacle
-                      # started pricing the season opener. Brand new to this
-                      # scanner on both sides (game lines AND props); shadow-
-                      # first until it earns its own record, same as everything
-                      # else here.
+    "KXNFLGAME", "KXNFLSPREAD", "KXNFLTOTAL",
+                      # NFL GAME LINES ONLY — added 2026-09-03 shadow, still
+                      # shadow: zero qualifying edges ever across a full week
+                      # of live scanning (near-misses consistently -1% to -3%),
+                      # matching the same "gets arbed fast" pattern every other
+                      # sport's game lines showed this session. No evidence
+                      # yet that funding this side would do anything but lose
+                      # the fee on every bet.
+                      #
+                      # NFL PROPS graduated off shadow 2026-09-11 (user call):
+                      # found 2 real qualifying edges in the first week
+                      # (Jadarian Price +2.8% WON, Colby Parkinson +2.2% open)
+                      # plus a live +3.5% (Drake London) the day this was
+                      # decided — thin, but the same kind of early real signal
+                      # every other market here graduated on. Both existing
+                      # prop bets keep their originally-stamped shadow=True
+                      # per freeze-settled-bets; only NEW prop bets fund live
+                      # from here. KXNFLPASSYDS/RSHYDS/RECYDS/REC/PASSTDS are
+                      # deliberately NOT in this list.
     "KXNCAAF",        # College football (KXNCAAFGAME/SPREAD/TOTAL) — added
                       # 2026-09-09. Game lines only, no player props exist on
                       # Kalshi for CFB. A live spot check found Kalshi's CFB
@@ -3741,6 +3754,11 @@ def _get_performance(since: Optional[str] = None) -> dict:
         "KXMLBRBI":  "RBIs",
         # KXMLBOUTS deliberately absent -- split below into whole-inning vs
         # other lines rather than one blended "Pitcher Outs" bucket.
+        "KXNFLPASSYDS": "NFL Pass Yards",
+        "KXNFLRSHYDS":  "NFL Rush Yards",
+        "KXNFLRECYDS":  "NFL Reception Yards",
+        "KXNFLREC":     "NFL Receptions",
+        "KXNFLPASSTDS": "NFL Pass TDs",
     }
     _OUTS_WHOLE_INNING_LINES = (14.5, 17.5)
 
@@ -3796,6 +3814,17 @@ def _get_performance(since: Optional[str] = None) -> dict:
             sport = "WNBA"
         elif ticker.startswith("KXNBA"):
             sport = "NBA"
+        elif ticker.startswith("KXNCAAF"):
+            sport = "NCAAF"
+        elif ticker.startswith("KXNFL"):
+            # Checked after KXNCAAF (distinct prefix, no real overlap, but
+            # keeps the ordering obviously safe). Game-line mtype here is the
+            # sport-agnostic "moneyline"/"spread"/"total" scan_sport() always
+            # returns -- this fallback is what actually names the sport; it
+            # previously had no NFL/NCAAF branch at all, so every NFL/NCAAF
+            # game-line bet silently landed in "MLB Moneyline"/"MLB Total"
+            # etc. in this table. Found 2026-09-11.
+            sport = "NFL"
         else:
             sport = "MLB"
         return f"{sport} {mtype.capitalize()}" if mtype else sport
@@ -7843,8 +7872,8 @@ function renderPerformance(d) {
     </p>`;
 
   // By-type breakdown table
-  const PROP_LABELS = new Set(['Strikeouts (K)', 'Hits', 'Total Bases', 'RBIs', 'MLB Props', 'NBA Props', 'WNBA Props']);
-  const TYPE_ORDER  = ['MLB Total', 'MLB Spread', 'Strikeouts (K)', 'Pitcher Outs (Whole-Inning)', 'Pitcher Outs (Other Lines)', 'Hits', 'Total Bases', 'RBIs', 'MLB Props', 'NBA Props', 'WNBA Total', 'WNBA Spread', 'WNBA Props', 'La Liga Moneyline', 'La Liga Total', 'La Liga BTTS', 'La Liga Corners', 'EPL Moneyline', 'EPL Total', 'EPL BTTS', 'EPL Corners', 'MLS Moneyline', 'MLS Total', 'MLS BTTS', 'Argentina Moneyline', 'Argentina Total', 'Argentina BTTS', 'Brazil Moneyline', 'Brazil Total', 'Brazil BTTS', 'Liga MX Moneyline', 'Liga MX Total', 'Liga MX BTTS', 'Brazil B Moneyline', 'Brazil B Total', 'Brazil B BTTS', 'Sudamericana Moneyline', 'Sudamericana Total', 'Sudamericana BTTS', 'Chile Moneyline', 'Chile Total', 'Chile BTTS', 'ATP Moneyline', 'WTA Moneyline'];
+  const PROP_LABELS = new Set(['Strikeouts (K)', 'Hits', 'Total Bases', 'RBIs', 'MLB Props', 'NBA Props', 'WNBA Props', 'NFL Pass Yards', 'NFL Rush Yards', 'NFL Reception Yards', 'NFL Receptions', 'NFL Pass TDs']);
+  const TYPE_ORDER  = ['MLB Total', 'MLB Spread', 'Strikeouts (K)', 'Pitcher Outs (Whole-Inning)', 'Pitcher Outs (Other Lines)', 'Hits', 'Total Bases', 'RBIs', 'MLB Props', 'NBA Props', 'WNBA Total', 'WNBA Spread', 'WNBA Props', 'NFL Moneyline', 'NFL Spread', 'NFL Total', 'NFL Pass Yards', 'NFL Rush Yards', 'NFL Reception Yards', 'NFL Receptions', 'NFL Pass TDs', 'NCAAF Moneyline', 'NCAAF Spread', 'NCAAF Total', 'La Liga Moneyline', 'La Liga Total', 'La Liga BTTS', 'La Liga Corners', 'EPL Moneyline', 'EPL Total', 'EPL BTTS', 'EPL Corners', 'MLS Moneyline', 'MLS Total', 'MLS BTTS', 'Argentina Moneyline', 'Argentina Total', 'Argentina BTTS', 'Brazil Moneyline', 'Brazil Total', 'Brazil BTTS', 'Liga MX Moneyline', 'Liga MX Total', 'Liga MX BTTS', 'Brazil B Moneyline', 'Brazil B Total', 'Brazil B BTTS', 'Sudamericana Moneyline', 'Sudamericana Total', 'Sudamericana BTTS', 'Chile Moneyline', 'Chile Total', 'Chile BTTS', 'ATP Moneyline', 'WTA Moneyline'];
   // Markets no longer scanned — settled record frozen & still shown, but tagged
   // so it's clear no new bets are being placed. Total Bases terminated 2026-07-23.
   const TERMINATED_LABELS = new Set(['Total Bases']);
@@ -7853,7 +7882,7 @@ function renderPerformance(d) {
       const ai = TYPE_ORDER.indexOf(a.label); const bi = TYPE_ORDER.indexOf(b.label);
       return (ai === -1 ? 99 : ai) - (bi === -1 ? 99 : bi);
     });
-    const typeRows = sorted.map(t => {
+    const rowHtml = t => {
       const insuf  = t.insufficient_data;
       const isProp = PROP_LABELS.has(t.label);
       const isShadowRow = t.shadow === true;
@@ -7894,18 +7923,39 @@ function renderPerformance(d) {
         <td class="num">${kellyCell}</td>
         <td class="num">${unitsCell}</td>
       </tr>`;
-    }).join('');
-    perfBodyHtml += `
-      <table style="margin-bottom:8px;">
-        <thead><tr>
+    };
+    // Shadow rows split into their own collapsed section — $0-stake hypothetical
+    // types were piling up inline (one row per shadow market: NFL, NCAAF,
+    // La Liga/EPL Corners, etc.) and crowding out the live breakdown that
+    // actually matters. Collapsed by default; count shown in the summary so
+    // it's still obvious how many are tucked away.
+    const liveTypes   = sorted.filter(t => t.shadow !== true);
+    const shadowTypes = sorted.filter(t => t.shadow === true);
+    const theadHtml = `<thead><tr>
           <th>Market Type</th><th class="num">Won</th><th class="num">Lost</th>
           <th class="num">Win Rate</th>
           <th class="num" title="Average Kalshi-implied win probability for this market type — the price you paid, i.e. the break-even win rate. Win Rate ABOVE this = beating the market price you paid (what drives flat units); below = losing to the price.">Expected</th>
           <th class="num" title="Kelly P&amp;L as % of bankroll (hover for dollar amount)">Kelly P&amp;L (% bank)</th>
           <th class="num" title="Total flat units — net profit per market type if you'd staked $1 on every bet. Bet-size-agnostic pick quality.">Total Units</th>
-        </tr></thead>
-        <tbody>${typeRows}</tbody>
+        </tr></thead>`;
+    perfBodyHtml += `
+      <table style="margin-bottom:8px;">
+        ${theadHtml}
+        <tbody>${liveTypes.map(rowHtml).join('')}</tbody>
       </table>`;
+    if (shadowTypes.length) {
+      perfBodyHtml += `
+      <details style="margin-bottom:12px;">
+        <summary style="cursor:pointer;font-size:12px;font-weight:600;color:var(--muted);user-select:none;padding:4px 0;list-style:none;display:flex;align-items:center;gap:6px;">
+          <span style="font-size:10px;">▶</span> Shadow markets (${shadowTypes.length})
+          <span style="font-size:10px;font-weight:400;">— $0-stake, excluded from headline stats</span>
+        </summary>
+        <table style="margin-top:4px;">
+          ${theadHtml}
+          <tbody>${shadowTypes.map(rowHtml).join('')}</tbody>
+        </table>
+      </details>`;
+    }
   }
 
   // ── Alpha section ────────────────────────────────────────────────────────

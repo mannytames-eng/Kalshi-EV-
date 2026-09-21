@@ -4633,7 +4633,14 @@ def _nfl_props_refresh_interval() -> int:
 # efficient than NFL's -- 4 of 62 side-comparisons cleared 2%+ raw edge vs
 # zero ever on NFL's game lines -- worth the same attention all week, not
 # just Saturday (lines move and get posted throughout the week regardless).
-NCAAF_SCANNING_ENABLED    = True   # shadow-first via SHADOW_MARKETS regardless of this flag
+NCAAF_SCANNING_ENABLED    = False  # PAUSED 2026-09-21 (user call, "we scrapped ncaa entirely") --
+                                    # found the code still had this flag on, a real mismatch from
+                                    # what the user believed was already off. No open NCAAF
+                                    # positions at pause time (checked live). Code intact; the
+                                    # data collected (moneyline/spread/total edges + the real
+                                    # School-vs-School-State matching bug this session found and
+                                    # fixed) stays as a real, settled reference if CFB is
+                                    # revisited later.
 NCAAF_WINDOW_START_H      = 6    # 6am PDT
 NCAAF_WINDOW_END_H        = 22   # 10pm PDT
 NCAAF_GAME_REFRESH_SECONDS = 45 * 60
@@ -5916,6 +5923,16 @@ def _sport_for_ticker(ticker: str) -> str:
         return "basketball_wnba"
     if t.startswith("KXNBA"):
         return "basketball_nba"
+    if t.startswith("KXNCAAF"):
+        return "americanfootball_ncaaf"
+    # Check NFL after NCAAF -- "KXNCAAF..." doesn't start with "KXNFL" so
+    # there's no real prefix collision, but keep the more specific college
+    # check first on general principle. Found live 2026-09-21: this function
+    # had no NFL branch at all and silently mistagged every NFL bet as
+    # "baseball_mlb", which would have made _maybe_fetch_pre_close_pinnacle
+    # fetch the wrong sport's odds entirely for any NFL bet that reached it.
+    if t.startswith("KXNFL"):
+        return "americanfootball_nfl"
     return "baseball_mlb"
 
 
@@ -5992,6 +6009,28 @@ def _maybe_fetch_pre_close_pinnacle():
     _PRE_CLOSE_FETCH_PARAMS = {
         "baseball_mlb":    dict(total_range=(5.0, 14.0),    spread_limit=3.0),
         "basketball_wnba": dict(total_range=(130.0, 190.0), spread_limit=25.0),
+        # NFL added 2026-09-21: NFL/NCAAF had NO pre-close entry at all, so
+        # closing_pin_pct (the cross-market diagnostic field) was frozen at
+        # whatever Pinnacle price the last routine 30min/2h scan happened to
+        # still have cached before a game dropped off the scan list. Closes
+        # that gap for NFL "total"/game-line bets the same way MLB/WNBA
+        # already get it.
+        # NOTE: this does NOT touch NFL props' real CLV number. _true_clv()
+        # (kalshi_ev_ui.py _true_clv, ~line 3372) -- the metric that actually
+        # drives every CLV figure shown anywhere -- is pure Kalshi
+        # entry-vs-close and never reads closing_pin_pct. Checked live
+        # 2026-09-21: NFL's observed -0.87c avg true CLV (9 of 15 bets
+        # negative) does NOT clear the game-clustered significance bar this
+        # codebase already uses elsewhere (t=-0.98, ~16% confidence real,
+        # 95% CI [-2.8, +0.93] straddles zero) -- looks like noise at n=15/12
+        # games, not a real structural problem, so no prop-specific pre-close
+        # mechanism was built to "fix" it. Revisit if the sample grows and
+        # the significance test actually flags something.
+        # Same total_range/spread_limit as the regular NFL game-line fetch.
+        # NCAAF stays excluded -- scanning paused 2026-09-21 (user call), and
+        # this mechanism only serves bets still open when it runs.
+        "americanfootball_nfl": dict(total_range=(25.0, 65.0), spread_limit=25.0,
+                                      include_h2h=True, include_spreads=True),
         # basketball_nba intentionally excluded — NBA faded permanently for
         # credit conservation (2026-05-26); no pre-close fetch for it.
     }

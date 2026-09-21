@@ -75,10 +75,13 @@ def _get_odds_bulk_h2h() -> tuple[list, Optional[object]]:
         events = json.loads(r.read())
         rem = r.headers.get("x-requests-remaining")
         used = r.headers.get("x-requests-used")
+        last = r.headers.get("x-requests-last")
         if rem is not None:
             s.LAST_ODDS_USAGE["remaining"] = int(float(rem))
         if used is not None:
             s.LAST_ODDS_USAGE["used"] = int(float(used))
+        if last is not None:
+            s.LAST_ODDS_USAGE["last_cost"] = int(float(last))
         s.LAST_ODDS_USAGE["at"] = datetime.now(timezone.utc).isoformat()
     return events, None
 

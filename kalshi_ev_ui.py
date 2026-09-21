@@ -353,6 +353,8 @@ HISTORY_FILE    = os.path.join(DATA_DIR, "ev_history.json")
 BETS_FILE       = os.path.join(DATA_DIR, "ev_bets.json")
 PIN_PRICES_FILE = os.path.join(DATA_DIR, "ev_pin_prices.json")
 CREDIT_USAGE_FILE = os.path.join(DATA_DIR, "ev_credit_usage.json")  # Odds API daily-spend baselines
+COMPONENT_CREDIT_FILE = os.path.join(DATA_DIR, "ev_credit_by_component.json")  # per-sport/market spend,
+                                       # added 2026-09-21 -- see _record_component_credit
 MAX_HISTORY     = 500       # cap stored scan snapshots
 PERF_BANKROLL        = 1000.0    # bankroll for ROI % display
 
@@ -553,6 +555,7 @@ _state   = {
     "last_scan_stats": None,   # diagnostic counters from last scan_sport call
     "market_snapshot": {},     # {ticker|side: {adj_edge, kalshi, fair, edge_pct}} — all scanned markets
     "odds_credits":    None,    # {used, remaining, cap, pct, today, days:{d:spend}} — Odds API budget
+    "credit_by_component": None,  # {since, days_counted, by_component:{label:cr}, total} — real per-sport/market spend
 }
 
 # Tracks first-seen and last-seen YES price for each edge key (for staleness + CLV)
@@ -630,6 +633,76 @@ def _update_credit_tracker() -> Optional[dict]:
         "today": today_spend, "days": day_spends,
         "at": LAST_ODDS_USAGE.get("at"),
     }
+
+
+_component_credit_lock = threading.Lock()
+
+def _record_component_credit(component: str, credits: Optional[int]) -> None:
+    """Attribute real Odds API spend to a named sport/market component,
+    persisted per UTC day to COMPONENT_CREDIT_FILE (same atomic-write pattern
+    as CREDIT_USAGE_FILE). Added 2026-09-21: a credit report built from
+    log archaeology alone (real per-call costs x real observed cadence)
+    couldn't be reconciled against the account's own month-to-date total --
+    roughly 40-50k credits/month were unaccounted for. Rather than keep
+    guessing, this tags spend at the source so the report becomes exact
+    going forward. Game-line callers pass the value read from
+    LAST_ODDS_USAGE["last_cost"] right after their fetch_odds_index() call
+    (safe: single-shot fetch, no other credit-spending call runs between the
+    fetch and this read on the same thread). Prop callers pass the
+    credits_spent value scan_player_props() now returns directly, since that
+    call internally loops over many per-event fetches and a single
+    LAST_ODDS_USAGE read afterward would only capture the last one."""
+    if not credits:
+        return
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    with _component_credit_lock:
+        try:
+            with open(COMPONENT_CREDIT_FILE, "r") as f:
+                rec = json.load(f)
+        except Exception:
+            rec = {}
+        days = rec.setdefault("days", {})
+        day = days.setdefault(today, {})
+        day[component] = day.get(component, 0) + credits
+        # keep the most recent 45 days -- enough for a full month plus margin
+        for k in sorted(days.keys())[:-45]:
+            days.pop(k, None)
+        try:
+            import tempfile as _tempfile
+            fd, tmp = _tempfile.mkstemp(dir=DATA_DIR, suffix=".tmp")
+            with os.fdopen(fd, "w") as f:
+                json.dump(rec, f)
+            os.replace(tmp, COMPONENT_CREDIT_FILE)
+        except Exception as exc:
+            print(f"  WARNING: could not save component credit usage: {exc}")
+
+
+def _get_component_credit_report(since_days: int = 30) -> dict:
+    """Sum per-component credit spend over the last `since_days` days.
+    Returns {"since": iso_date, "days_counted": n, "by_component": {label:
+    total}, "total": N} sorted by spend descending."""
+    try:
+        with open(COMPONENT_CREDIT_FILE, "r") as f:
+            rec = json.load(f)
+    except Exception:
+        rec = {}
+    days = rec.get("days", {})
+    from datetime import timedelta as _td
+    cutoff = (datetime.now(timezone.utc) - _td(days=since_days)).strftime("%Y-%m-%d")
+    totals: dict = {}
+    counted = 0
+    for d, comps in days.items():
+        if d < cutoff:
+            continue
+        counted += 1
+        for comp, cr in comps.items():
+            totals[comp] = totals.get(comp, 0) + cr
+    ordered = dict(sorted(totals.items(), key=lambda kv: -kv[1]))
+    return {
+        "since": cutoff, "days_counted": counted,
+        "by_component": ordered, "total": sum(ordered.values()),
+    }
+
 
 _edge_price_history: dict = _load_pin_prices()
 print(f"  Loaded {len(_edge_price_history)} Pinnacle price entries from disk")
@@ -5076,6 +5149,7 @@ def _run_odds_refresh():
             "baseball_mlb", total_range=(5.0, 14.0), spread_limit=3.0,
             include_h2h=False, include_spreads=False,
         )
+        _record_component_credit("MLB Totals", LAST_ODDS_USAGE.get("last_cost"))
         if mlb_idx is not None:
             n_games = len(mlb_idx) // max(1, 2)
             with _odds_cache_lock:
@@ -5128,6 +5202,7 @@ def _run_wnba_odds_refresh():
         wnba_idx, _ = fetch_odds_index(
             "basketball_wnba", total_range=(130.0, 190.0), spread_limit=25.0
         )
+        _record_component_credit("WNBA Game Lines", LAST_ODDS_USAGE.get("last_cost"))
         if wnba_idx is not None:
             n_games = len(wnba_idx) // max(1, 2)
             with _odds_cache_lock:
@@ -5244,8 +5319,9 @@ def _run_scan():
         _outs_due = (now_ts - _last_outs_scan >= OUTS_REFRESH_SECONDS) and not _all_games_commenced()
         if _outs_due:
             try:
-                mlb_props, _fresh_prop_snap = scan_player_props(
+                mlb_props, _fresh_prop_snap, _outs_credits = scan_player_props(
                     odds_sport="baseball_mlb", abbr_map=MLB_ABBR, prop_markets="pitcher_outs")
+                _record_component_credit("MLB Outs", _outs_credits)
             except Exception as _prop_exc:
                 print(f"  Props scan error: {_prop_exc}")
                 mlb_props, _fresh_prop_snap = [], {}
@@ -5282,7 +5358,8 @@ def _run_scan():
         global _last_wnba_props_scan
         if now_ts - _last_wnba_props_scan >= _wnba_props_refresh_interval():
             try:
-                wnba_props, _fresh_wnba_prop_snap = scan_wnba_player_props()
+                wnba_props, _fresh_wnba_prop_snap, _wnba_props_credits = scan_wnba_player_props()
+                _record_component_credit("WNBA Props", _wnba_props_credits)
             except Exception as _wnba_prop_exc:
                 print(f"  WNBA props scan error: {_wnba_prop_exc}")
                 wnba_props, _fresh_wnba_prop_snap = [], {}
@@ -5307,6 +5384,7 @@ def _run_scan():
                     total_range=(25.0, 65.0), spread_limit=25.0,
                     include_h2h=True, include_spreads=True,
                 )
+                _record_component_credit("NFL Game Lines", LAST_ODDS_USAGE.get("last_cost"))
                 nfl, _nfl_stats, _nfl_snapshot = scan_sport(
                     label="NFL — Spread, Total & Moneyline",
                     spread_series="KXNFLSPREAD",
@@ -5328,7 +5406,7 @@ def _run_scan():
         _fresh_nfl_prop_snap: dict = {}
         if now_ts - _last_nfl_props_scan >= _nfl_props_refresh_interval():
             try:
-                nfl_props, _fresh_nfl_prop_snap = scan_player_props(
+                nfl_props, _fresh_nfl_prop_snap, _nfl_props_credits = scan_player_props(
                     odds_sport="americanfootball_nfl", abbr_map=NFL_ABBR,
                     max_events=16,   # full Sunday slate can hit 16 games; the shared
                                      # MAX_PROP_EVENTS default (15, sized for MLB) would
@@ -5347,6 +5425,7 @@ def _run_scan():
                                            # weaker signal -- forced shadow below regardless
                                            # of SHADOW_MARKETS, tracked as its own row.
                 )
+                _record_component_credit("NFL Props", _nfl_props_credits)
             except Exception as _nfl_prop_exc:
                 print(f"  NFL props scan error: {_nfl_prop_exc}")
                 nfl_props, _fresh_nfl_prop_snap = [], {}
@@ -5368,6 +5447,7 @@ def _run_scan():
                     total_range=(20.0, 100.0), spread_limit=60.0,
                     include_h2h=True, include_spreads=True,
                 )
+                _record_component_credit("NCAAF Game Lines", LAST_ODDS_USAGE.get("last_cost"))
                 ncaaf, _ncaaf_stats, _ncaaf_snapshot = scan_sport(
                     label="NCAAF — Spread, Total & Moneyline",
                     spread_series="KXNCAAFSPREAD",
@@ -5430,6 +5510,14 @@ def _run_scan():
             try:
                 _fresh_summary = _freshness.discover_and_watch(
                     os.path.join(DATA_DIR, "freshness_watch.json"), send_discord)
+                # Approximation: discover_and_watch can make several credit-
+                # spending calls internally (up to MAX_ACTIVE_WATCH series),
+                # but only the LAST one's cost survives in LAST_ODDS_USAGE.
+                # Fine here -- this component is small and bounded (max ~8
+                # series x once/day) -- but not the accumulate-per-loop fix
+                # applied to props, where undercounting would have hidden a
+                # real cost driver.
+                _record_component_credit("Freshness Watcher", LAST_ODDS_USAGE.get("last_cost"))
                 print(f"  Freshness watcher: {_fresh_summary}")
             except Exception as _fresh_exc:
                 print(f"  Freshness watcher error: {_fresh_exc}")
@@ -5445,6 +5533,7 @@ def _run_scan():
             try:
                 _mma_summary = _mma.run(
                     os.path.join(DATA_DIR, "mma_watch.json"), send_discord)
+                _record_component_credit("MMA Watcher", LAST_ODDS_USAGE.get("last_cost"))
                 print(f"  MMA watcher: {_mma_summary}")
             except Exception as _mma_exc:
                 print(f"  MMA watcher error: {_mma_exc}")
@@ -5593,6 +5682,10 @@ def _run_scan():
                 _state["odds_credits"] = _update_credit_tracker()
             except Exception as _cred_exc:
                 print(f"  credit tracker error: {_cred_exc}")
+            try:
+                _state["credit_by_component"] = _get_component_credit_report(30)
+            except Exception as _comp_cred_exc:
+                print(f"  component credit report error: {_comp_cred_exc}")
 
             # ── Build full market snapshot: game lines + props, all sports ─────
             # MLB Totals scans every 30s, so mlb_snapshot is always fresh — merged
@@ -5912,6 +6005,7 @@ def _maybe_fetch_pre_close_pinnacle():
             try:
                 print(f"  Pre-close Pinnacle fetch: {sport} (closing line capture)")
                 idx, _ = fetch_odds_index(sport, **params)
+                _record_component_credit(f"Pre-Close ({sport})", LAST_ODDS_USAGE.get("last_cost"))
                 if idx is not None:
                     fresh_indices[sport] = idx
                     with _odds_cache_lock:
@@ -6555,6 +6649,11 @@ HTML = """<!DOCTYPE html>
     </div>
     <span id="temp-value" style="color:var(--muted);">—</span>
   </div>
+</div>
+
+<div id="credit-breakdown-card" class="card">
+  <div class="card-header" onclick="toggleCard('credit-breakdown-body')" style="border-left:3px solid #58a6ff;">💳 Credit Spend by Component &nbsp;<span style="font-size:10px;color:var(--muted);font-weight:400;">real per-call cost, tagged at the source — last 30 days</span> <span class="card-toggle" id="credit-breakdown-body-toggle">▸</span></div>
+  <div id="credit-breakdown-body" class="card-body collapsed"><div class="empty">No component spend recorded yet — added 2026-09-21, data accumulates from here.</div></div>
 </div>
 
 <div id="today-edges-card" class="card">
@@ -7347,6 +7446,45 @@ function updateStatusStrip(d) {
   }
 }
 
+// Per-component credit spend, added 2026-09-21 -- see _record_component_credit
+// (kalshi_ev_ui.py). Real cost tagged at the source (x-requests-last), not a
+// modeled estimate -- this exists because a report built from log timestamps
+// alone couldn't be reconciled against the account's real month-to-date total.
+function renderCreditBreakdown(rpt) {
+  const el = document.getElementById('credit-breakdown-body');
+  if (!el) return;
+  if (!rpt || !rpt.total) {
+    el.innerHTML = '<div class="empty">No component spend recorded yet.</div>';
+    return;
+  }
+  const rows = Object.entries(rpt.by_component).map(([label, cr]) => {
+    const pct = rpt.total ? (100 * cr / rpt.total) : 0;
+    return `<tr>
+      <td style="color:var(--text);">${label}</td>
+      <td class="num" style="font-weight:600;">${cr.toLocaleString()}</td>
+      <td class="num" style="color:var(--muted);">${pct.toFixed(1)}%</td>
+      <td style="width:120px;">
+        <div style="background:rgba(88,166,255,0.12);border-radius:3px;height:8px;overflow:hidden;">
+          <div style="width:${pct.toFixed(1)}%;height:100%;background:#58a6ff;"></div>
+        </div>
+      </td>
+    </tr>`;
+  }).join('');
+  el.innerHTML = `
+    <table style="width:100%;font-size:12px;">
+      <thead><tr>
+        <th>Component</th><th class="num">Credits (${rpt.days_counted}d)</th>
+        <th class="num">Share</th><th></th>
+      </tr></thead>
+      <tbody>${rows}</tbody>
+    </table>
+    <p style="font-size:10px;color:var(--muted);margin:6px 0 0;">
+      Real per-call cost read directly from the Odds API's own x-requests-last header at the
+      point of each fetch, tagged with which sport/market made the call, and summed since
+      ${rpt.since}. This is exact going forward — no modeling or log reconstruction.
+    </p>`;
+}
+
 function scheduleRefresh(ms) {
   if (autoRefreshTimer) clearTimeout(autoRefreshTimer);
   nextRefresh = Date.now() + ms;
@@ -7380,6 +7518,7 @@ async function fetchData() {
 
     // ── Status strip + temperature gauge ─────────────────────────────────────
     updateStatusStrip(d);
+    renderCreditBreakdown(d.credit_by_component);
 
     // While scanning: show spinner only if we have no data yet
     if (d.scanning) {

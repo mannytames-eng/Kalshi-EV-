@@ -53,16 +53,27 @@ ODDS_BASE   = "https://api.the-odds-api.com/v4"
 # to count calls ourselves. _record_odds_usage() stashes the latest into
 # LAST_ODDS_USAGE; the UI reads it for the credit-usage panel and daily-spend
 # baseline. used + remaining = the plan cap.
-LAST_ODDS_USAGE: Dict[str, object] = {"remaining": None, "used": None, "at": None}
+LAST_ODDS_USAGE: Dict[str, object] = {"remaining": None, "used": None, "at": None, "last_cost": None}
 
 def _record_odds_usage(resp) -> None:
     try:
         rem  = resp.headers.get("x-requests-remaining")
         used = resp.headers.get("x-requests-used")
+        # x-requests-last: the Odds API's own direct report of what THIS call
+        # cost (confirmed live 2026-09-11), vs. remaining/used which are
+        # month-to-date cumulative counters that need diffing to attribute
+        # spend to a moment in time. This is what the per-component credit
+        # tracker (kalshi_ev_ui.py's _record_component_credit) reads --
+        # added 2026-09-21 after a credit report couldn't be reconciled
+        # against the aggregate month-to-date numbers from log archaeology
+        # alone.
+        last = resp.headers.get("x-requests-last")
         if rem is not None:
             LAST_ODDS_USAGE["remaining"] = int(float(rem))
         if used is not None:
             LAST_ODDS_USAGE["used"] = int(float(used))
+        if last is not None:
+            LAST_ODDS_USAGE["last_cost"] = int(float(last))
         LAST_ODDS_USAGE["at"] = datetime.now(timezone.utc).isoformat()
     except (ValueError, TypeError, AttributeError):
         pass
@@ -3370,10 +3381,14 @@ def build_all_player_props(
     lookahead_hours: float = 48.0,
     max_events: int = None,
     retail_fallback_books: Optional[set] = None,
-) -> Dict[str, Dict[str, dict]]:
+) -> Tuple[Dict[str, Dict[str, dict]], int]:
     """
     Fetch player-prop odds for all books and build a weighted-consensus
     no-vig over probability per (player, prop_type).
+
+    Returns (player_lookup, credits_spent) -- credits_spent is the real sum
+    of Odds API cost across every per-event fetch this call made (added
+    2026-09-21 for the per-component credit tracker).
 
     lookahead_hours bounds how far out a game can be and still get scanned —
     48h fits MLB/WNBA (games are same-day/next-day). NFL needs it widened:
@@ -3409,10 +3424,15 @@ def build_all_player_props(
 
     player_lookup: Dict[str, Dict[str, dict]] = {}
     fetched = 0
+    credits_spent = 0   # sum of x-requests-last across every per-event fetch below —
+                         # returned to the caller so it can attribute real spend to
+                         # this scan (a single LAST_ODDS_USAGE read after the whole
+                         # loop would only capture the FINAL event's cost, not the sum)
 
     for ev in target_events:
         try:
             edata = fetch_player_prop_odds_event(odds_sport, ev["id"], markets=markets)
+            credits_spent += LAST_ODDS_USAGE.get("last_cost") or 0
             time.sleep(0.3)
         except Exception as e:
             print(f"    ERROR fetching props for {ev.get('away_team')} @ {ev.get('home_team')}: {e}")
@@ -3601,7 +3621,7 @@ def build_all_player_props(
         print(f"    [{fetched}] {ev.get('away_team')} @ {ev.get('home_team')} — props fetched")
 
     print(f"  Built player index: {len(player_lookup)} players across {fetched} game(s)")
-    return player_lookup
+    return player_lookup, credits_spent
 
 
 def scan_player_props(
@@ -3615,7 +3635,7 @@ def scan_player_props(
     lookahead_hours: float = 48.0,
     max_events: int = None,
     retail_fallback_books: Optional[set] = None,
-) -> List[dict]:
+) -> Tuple[List[dict], dict, int]:
     """
     Scan Kalshi player-prop markets vs consensus no-vig props.
     Sport-agnostic — pass prop_series, prop_markets, and sport_label for each sport.
@@ -3627,6 +3647,10 @@ def scan_player_props(
     BOOKS) to let 2+ of those books' agreement stand in for Pinnacle when
     Pinnacle has no line at all. None (default) preserves exact prior
     behavior for every existing caller — MLB/WNBA never pass this.
+
+    Returns (edges, prop_snapshot, credits_spent) -- credits_spent (added
+    2026-09-21) is the real Odds API cost of this call, for the per-
+    component credit tracker.
     """
     if abbr_map is None:
         abbr_map = MLB_ABBR
@@ -3722,7 +3746,7 @@ def scan_player_props(
 
     if not kalshi_props:
         print("  No open Kalshi prop markets found.")
-        return [], {}
+        return [], {}, 0
     print(f"  Kalshi prop markets collected: {len(kalshi_props)}")
 
     # 2. Build needed-teams set
@@ -3747,15 +3771,16 @@ def scan_player_props(
         odds_events = fetch_odds_events_list(odds_sport)
     except Exception as e:
         print(f"  ERROR — Odds API events list: {e}")
-        return [], {}
+        return [], {}, 0
 
     # 4. Build player prop consensus index
-    player_lookup = build_all_player_props(odds_sport, odds_events, needed_teams or None, markets=prop_markets,
-                                            lookahead_hours=lookahead_hours, max_events=max_events,
-                                            retail_fallback_books=retail_fallback_books)
+    player_lookup, credits_spent = build_all_player_props(
+        odds_sport, odds_events, needed_teams or None, markets=prop_markets,
+        lookahead_hours=lookahead_hours, max_events=max_events,
+        retail_fallback_books=retail_fallback_books)
     if not player_lookup:
         print("  No player prop data available — skipping.")
-        return [], {}
+        return [], {}, 0
 
     # 5. Match Kalshi markets → consensus fair value
     edges:      List[dict] = []
@@ -4110,10 +4135,10 @@ def scan_player_props(
                 f"{e['side']:<4} {e['raw_edge']:>+5.1%} "
                 f"\033[92m{e['edge']:>+5.1%}\033[0m  {stars}"
             )
-    return edges, prop_snapshot
+    return edges, prop_snapshot, credits_spent
 
 
-def scan_nba_player_props() -> List[dict]:
+def scan_nba_player_props() -> Tuple[List[dict], dict, int]:
     """Scan Kalshi NBA player-prop markets (points, assists, 3-pointers)."""
     return scan_player_props(
         odds_sport      = "basketball_nba",
@@ -4126,7 +4151,7 @@ def scan_nba_player_props() -> List[dict]:
     )
 
 
-def scan_wnba_player_props() -> List[dict]:
+def scan_wnba_player_props() -> Tuple[List[dict], dict, int]:
     """Scan Kalshi WNBA player-prop markets (points, rebounds, assists).
     WNBA tickers use the same no-time-component format as NBA — reuse
     _parse_nba_event for team-abbreviation splitting."""

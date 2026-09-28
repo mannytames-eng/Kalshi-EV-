@@ -59,6 +59,7 @@ from kalshi_ev_scanner import (
     SOCCER_SCAN_CHECKPOINTS,
     SOCCER_CHECKPOINT_TOL_M,
     kalshi_get,
+    fetch_orderbook_snapshot,
     fetch_game_scores,
     fetch_odds_index,
     validate_bet,
@@ -363,6 +364,19 @@ PAPER_START_BALANCE  = 1000.0    # starting virtual bankroll
 PAPER_START_DATE     = "2026-06-08"  # V2.0 reset — pre-throttle + Jun 7 bad-pipeline bets archived
 PAPER_KELLY_FRACTION = 0.25     # quarter-Kelly base fraction (default for all markets)
 PAPER_KELLY_CAP      = 0.03     # max 3% of current balance per bet (validation-phase cap)
+
+# ── Order-book forward-capture (2026-09-28) ───────────────────────────────────
+# Groundwork for the limit-order-fill simulation (top un-shipped profit lever
+# per project memory — monetizes CLV via resting limits instead of always
+# taking market price). The retrospective version is blocked: no bet has ever
+# stored bid/ask/depth, only a single flag-time price, and Kalshi has no
+# historical order-book API — so this has to accumulate forward before the sim
+# can be built. Observability only; never read by pricing/staking/edge logic.
+# 5s is a placeholder guess at signal-to-execution latency, not a measured
+# number — revisit once kalshi_execution.py's real order-placement latency is
+# known, or once enough captures exist to see if 5s materially differs from
+# the flag-time book.
+ORDERBOOK_LATENCY_CAPTURE_SECONDS = 5
 # Per-market Kelly override (user calls, 2026-07-29):
 #  • Strikeouts (KXMLBKS) → HALF Kelly. It's the one validated edge (calibrated
 #    +3.1pp, real hold), so size it up 2x vs the base; keeps the 3% disaster cap.
@@ -2257,6 +2271,16 @@ def _add_new_bets(edges: list) -> list:
                 # `fair` and realized outcomes once enough bets accumulate.
                 "nb_fair":            e.get("nb_fair"),
                 "nb_fit_params":      e.get("nb_fit_params"),
+                # Order-book forward-capture (2026-09-28) — see
+                # ORDERBOOK_LATENCY_CAPTURE_SECONDS above. Filled in just after
+                # this bet is appended (flag-time) and again a few seconds later
+                # (latency snapshot) by _capture_orderbook_for_new_bets /
+                # _capture_orderbook_latency_snapshot. Best-effort: stays None
+                # on any fetch failure, never blocks or retries bet placement.
+                "orderbook_at_flag":          None,
+                "orderbook_at_flag_ts":       None,
+                "orderbook_after_latency":    None,
+                "orderbook_after_latency_ts": None,
             }
 
             _bets.append(new_bet)
@@ -2280,6 +2304,60 @@ def _add_new_bets(edges: list) -> list:
                 newly_added.clear()
                 print(f"  Bet tracker: save FAILED — rolled back {added} bet(s), Discord suppressed")
     return newly_added
+
+
+def _capture_orderbook_latency_snapshot(bet_id: str) -> None:
+    """Delayed second order-book capture for one bet, fired by a one-shot
+    timer ORDERBOOK_LATENCY_CAPTURE_SECONDS after _capture_orderbook_for_new_bets
+    took the flag-time snapshot. Models "what would the book look like after
+    signal-to-execution latency" for the future fill sim. Best-effort — a
+    bet removed/resolved in the meantime (unlikely at this latency) is just
+    skipped, not treated as an error.
+    """
+    with _bets_lock:
+        bet = next((b for b in _bets if b["id"] == bet_id), None)
+        ticker = bet["ticker"] if bet else None
+    if not ticker:
+        return
+    snap = fetch_orderbook_snapshot(ticker)
+    if snap is None:
+        return
+    with _bets_lock:
+        for b in _bets:
+            if b["id"] == bet_id:
+                b["orderbook_after_latency"]    = snap
+                b["orderbook_after_latency_ts"] = snap["captured_at"]
+                break
+        else:
+            return
+        _save_bets(_bets)
+
+
+def _capture_orderbook_for_new_bets(newly_added: list) -> None:
+    """Flag-time order-book capture for bets just logged this scan cycle, plus
+    scheduling the delayed latency snapshot for each. Runs AFTER Discord alerts
+    fire so this best-effort network work never delays a real-time notification.
+    New bets are rare (a handful/day) so a per-bet HTTP round trip here is fine;
+    deliberately outside _bets_lock during the fetch itself (only the brief
+    dict update is locked) so a slow/failed Kalshi call can't block other
+    threads reading/writing _bets.
+    """
+    if not newly_added:
+        return
+    for bet in newly_added:
+        snap = fetch_orderbook_snapshot(bet["ticker"])
+        if snap is not None:
+            with _bets_lock:
+                bet["orderbook_at_flag"]    = snap
+                bet["orderbook_at_flag_ts"] = snap["captured_at"]
+        threading.Timer(
+            ORDERBOOK_LATENCY_CAPTURE_SECONDS,
+            _capture_orderbook_latency_snapshot,
+            args=[bet["id"]],
+        ).start()
+        time.sleep(0.15)   # gentle rate-limit, matches the CLV poll loop's pacing
+    with _bets_lock:
+        _save_bets(_bets)
 
 
 def _commence_to_et_date(utc_str: str) -> str:
@@ -5746,6 +5824,13 @@ def _run_scan():
     # ── Alert only on bets that were just logged this cycle ──────────────────
     # Notification and paper portfolio are now always in sync.
     _alert_top10(newly_logged)
+
+    # ── Order-book forward-capture (2026-09-28, see ORDERBOOK_LATENCY_CAPTURE_SECONDS) ──
+    # After alerts so this best-effort network work never delays a real-time ping.
+    try:
+        _capture_orderbook_for_new_bets(newly_logged)
+    except Exception as _obe:
+        print(f"  Order-book capture error: {_obe}")
 
     # ── Odds staleness check (runs every scan cycle, outside the try block) ──
     global _odds_stale_alerted

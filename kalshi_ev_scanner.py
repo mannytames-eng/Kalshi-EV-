@@ -647,6 +647,35 @@ def kalshi_get(path: str, params: Optional[Dict] = None, _retries: int = 3) -> d
     return {}
 
 
+def fetch_orderbook_snapshot(ticker: str, depth: int = 10) -> Optional[dict]:
+    """Best-effort snapshot of Kalshi's live L2 order book for one market.
+
+    Forward-capture instrumentation ONLY — groundwork for the limit-order-fill
+    simulation (see project memory: the retrospective version is blocked because
+    no historical order-book data exists, so this has to be captured going
+    forward on new bets instead). Never read by pricing/staking/edge logic;
+    failures here must never affect bet placement.
+
+    Stores the raw `orderbook` object from GET /markets/{ticker}/orderbook
+    largely as-is (trimmed to `depth` price levels per side) rather than
+    reshaping it — the exact key/level format should be verified against a
+    real captured response before any analysis code assumes a schema.
+    Returns None on any failure (unknown ticker, rate limit exhausted, schema
+    surprise) so a capture miss just leaves the field null, never raises.
+    """
+    try:
+        data = kalshi_get(f"/markets/{ticker}/orderbook")
+        ob = data.get("orderbook") or {}
+        return {
+            "yes":          (ob.get("yes") or [])[:depth],
+            "no":           (ob.get("no") or [])[:depth],
+            "captured_at":  datetime.now(timezone.utc).isoformat(),
+        }
+    except Exception as exc:
+        print(f"  orderbook capture failed for {ticker}: {exc}")
+        return None
+
+
 # ── Kalshi helpers ─────────────────────────────────────────────────────────
 def fetch_kalshi_events(series_ticker: str) -> List[dict]:
     events, cursor = [], None

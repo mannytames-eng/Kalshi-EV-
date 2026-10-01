@@ -60,6 +60,7 @@ from kalshi_ev_scanner import (
     SOCCER_CHECKPOINT_TOL_M,
     kalshi_get,
     fetch_orderbook_snapshot,
+    scan_nba_player_props,
     fetch_game_scores,
     fetch_odds_index,
     validate_bet,
@@ -198,6 +199,41 @@ def _odds_refresh_interval() -> int:
 #   Total: ~297/day -> ~8,900/month (up to ~11,760/month on an 8-game slate)
 WNBA_WINDOW_START_H = 15   # 3pm PDT
 WNBA_WINDOW_END_H   = 22   # 10pm PDT
+
+# ── NBA scheduling (props re-added 2026-10-02, user call) ────────────────────
+# NBA removed entirely 2026-05/06-2026, but confirmed via git history to be a
+# CREDIT-BUDGET decision ("Fade NBA entirely, reallocate credits to 1-min MLB
+# peak scans" — was 4 of 8 credits per refresh), not a calibration finding —
+# no accuracy problem on record, unlike Total Bases. Re-added PROPS ONLY
+# (points/assists/threes via NBA_PROP_SERIES — rebounds/PRA pending Kalshi
+# series-ticker verification, see [[project_ev_scanner_next]]); game lines
+# deliberately left at the permanent nba=[] placeholder below (user call:
+# props first). Shadow-first via SHADOW_MARKETS regardless of this flag,
+# same bar every other market here had to clear before funding.
+#
+# Reuses WNBA's evening-window hours as a starting estimate (NBA tip-offs run
+# a very similar 4-10pm PT range) — unverified for NBA specifically, retune
+# once live data shows actual game-time distribution. No zero-game short-
+# circuit yet (unlike WNBA/MLB): NBA plays most days of the season so the
+# payoff is lower than WNBA's multi-day gaps; revisit if credit data says
+# otherwise. Credit estimate (3 markets, ~10 games on a full slate, 30min
+# cadence over the 7h window): ~420 credits/day -> ~12,600/month — same order
+# of magnitude as NFL props, affordable with MLB's post-season volume drop.
+# UNVERIFIED — retune against the live credit readout (/api/scan ->
+# credit_by_component) once a real week has run, same pattern as every prior
+# sport addition.
+NBA_PROPS_ENABLED        = True
+NBA_WINDOW_START_H       = 15   # 3pm PDT — placeholder, same as WNBA
+NBA_WINDOW_END_H         = 22   # 10pm PDT — placeholder, same as WNBA
+NBA_PROPS_REFRESH_SECONDS = 30 * 60
+
+def _nba_props_refresh_interval() -> int:
+    if not NBA_PROPS_ENABLED:
+        return 10 ** 9
+    h = _pdt_hour()
+    if NBA_WINDOW_START_H <= h < NBA_WINDOW_END_H:
+        return NBA_PROPS_REFRESH_SECONDS
+    return 10 ** 9
 
 # ── WNBA scanning — paused 2026-07-14, GAME LINES resumed 2026-07-17 ─────────
 # Three days of live scanning (2026-07-10 to -13) found zero player-prop edges;
@@ -479,6 +515,17 @@ SHADOW_MARKETS: list[str] = [
                       # Shadow-first until it has a clean settled sample (walkover/
                       # retirement void handling verified) and CLV/win-rate read.
     "KXWTAMATCH",     # WTA match-winner (moneyline) — added 2026-07-27. Same.
+    "KXNBA",          # NBA player props re-added 2026-10-02 (user call) — props-
+                      # first, game lines deliberately NOT touched. NBA was
+                      # removed 2026-05/06-2026 for CREDIT BUDGET reasons
+                      # ("Fade NBA entirely, reallocate credits to 1-min MLB
+                      # peak scans") — no calibration/accuracy finding on record,
+                      # unlike TB. Treated as a fresh, unvalidated market anyway:
+                      # shadow-first until it earns its own CLV/calibration
+                      # record, same bar every other market here had to clear.
+                      # Covers KXNBAPTS/KXNBAAST/KXNBA3PT and any added series
+                      # (KXNBAREB/PRA pending Kalshi series-ticker verification —
+                      # see [[project_ev_scanner_next]]).
     "KXLALIGA",       # La Liga (KXLALIGAGAME/TOTAL/BTTS/CORNERS) — added 2026-08-19.
                       # Corners is a genuinely new market type (never priced before on
                       # any league here), moneyline/total/BTTS are the same math the
@@ -739,6 +786,7 @@ _last_wnba_odds_refresh: float   = 0.0
 _last_wnba_cache_success: float  = 0.0
 _wnba_game_count: int            = 0
 _last_wnba_props_scan: float     = 0.0
+_last_nba_props_scan: float      = 0.0   # NBA props re-added 2026-10-02
 
 # ── validate_bet result cache (saves 1 credit per click) ─────────────────────
 # validate_bet() calls fetch_book_odds() — 1 Odds API credit per call.
@@ -5452,6 +5500,23 @@ def _run_scan():
         else:
             wnba_props, _fresh_wnba_prop_snap = [], {}
 
+        # NBA props — re-added 2026-10-02 (see NBA_PROPS_ENABLED comment above
+        # for the scheduling rationale and credit estimate). Game lines stay at
+        # the permanent nba=[] placeholder a few lines up — props only, by
+        # design. scan_nba_player_props() takes no args: NBA_ABBR/NBA_PROP_SERIES/
+        # NBA_PLAYER_PROP_MARKETS are baked into the wrapper in kalshi_ev_scanner.py.
+        global _last_nba_props_scan
+        if now_ts - _last_nba_props_scan >= _nba_props_refresh_interval():
+            try:
+                nba_props, _fresh_nba_prop_snap, _nba_props_credits = scan_nba_player_props()
+                _record_component_credit("NBA Props", _nba_props_credits)
+            except Exception as _nba_prop_exc:
+                print(f"  NBA props scan error: {_nba_prop_exc}")
+                nba_props, _fresh_nba_prop_snap = [], {}
+            _last_nba_props_scan = now_ts
+        else:
+            nba_props, _fresh_nba_prop_snap = [], {}
+
         # NFL — game lines (spread/total/ml) + player props, added 2026-09-03.
         # No cached background index like MLB/WNBA — self-fetches inline on its
         # own gate (see _nfl_refresh_interval() for why). Total/spread ranges
@@ -5624,7 +5689,7 @@ def _run_scan():
                 print(f"  MMA watcher error: {_mma_exc}")
             _last_mma_scan = now_ts
 
-        all_edges = sorted(mlb + nba + mlb_props + wnba + wnba_props + nfl + nfl_props + ncaaf + soccer + tennis, key=lambda x: x["edge"], reverse=True)
+        all_edges = sorted(mlb + nba + mlb_props + wnba + wnba_props + nba_props + nfl + nfl_props + ncaaf + soccer + tennis, key=lambda x: x["edge"], reverse=True)
 
         # Deduplicate: keep only best edge per (matchup, mkt_type, side)
         edges = _best_edge_per_game(all_edges)
@@ -5788,6 +5853,8 @@ def _run_scan():
                 _last_market_snapshot.update(_nfl_snapshot)
             if _fresh_nfl_prop_snap:
                 _last_market_snapshot.update(_fresh_nfl_prop_snap)
+            if _fresh_nba_prop_snap:
+                _last_market_snapshot.update(_fresh_nba_prop_snap)
             if _ncaaf_snapshot:
                 _last_market_snapshot.update(_ncaaf_snapshot)
 

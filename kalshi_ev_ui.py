@@ -59,6 +59,8 @@ from kalshi_ev_scanner import (
     SOCCER_SCAN_CHECKPOINTS,
     SOCCER_CHECKPOINT_TOL_M,
     kalshi_get,
+    fetch_orderbook_snapshot,
+    scan_nba_player_props,
     fetch_game_scores,
     fetch_odds_index,
     validate_bet,
@@ -197,6 +199,41 @@ def _odds_refresh_interval() -> int:
 #   Total: ~297/day -> ~8,900/month (up to ~11,760/month on an 8-game slate)
 WNBA_WINDOW_START_H = 15   # 3pm PDT
 WNBA_WINDOW_END_H   = 22   # 10pm PDT
+
+# ── NBA scheduling (props re-added 2026-10-02, user call) ────────────────────
+# NBA removed entirely 2026-05/06-2026, but confirmed via git history to be a
+# CREDIT-BUDGET decision ("Fade NBA entirely, reallocate credits to 1-min MLB
+# peak scans" — was 4 of 8 credits per refresh), not a calibration finding —
+# no accuracy problem on record, unlike Total Bases. Re-added PROPS ONLY
+# (points/rebounds/assists/threes/PRA via NBA_PROP_SERIES); game lines
+# deliberately left at the permanent nba=[] placeholder below (user call:
+# props first). Shadow-first via SHADOW_MARKETS regardless of this flag,
+# same bar every other market here had to clear before funding.
+#
+# Reuses WNBA's evening-window hours as a starting estimate (NBA tip-offs run
+# a very similar 4-10pm PT range) — unverified for NBA specifically, retune
+# once live data shows actual game-time distribution. No zero-game short-
+# circuit yet (unlike WNBA/MLB): NBA plays most days of the season so the
+# payoff is lower than WNBA's multi-day gaps; revisit if credit data says
+# otherwise. Credit estimate (5 markets, ~10 games on a full slate, 30min
+# cadence over the 7h window): ~700 credits/day -> ~21,000/month (was ~12,600
+# at 3 markets) — above NFL props' ~14.7k, affordable only because MLB's
+# post-season volume drops; drop any market that shows no Pinnacle coverage.
+# UNVERIFIED — retune against the live credit readout (/api/scan ->
+# credit_by_component) once a real week has run, same pattern as every prior
+# sport addition.
+NBA_PROPS_ENABLED        = True
+NBA_WINDOW_START_H       = 15   # 3pm PDT — placeholder, same as WNBA
+NBA_WINDOW_END_H         = 22   # 10pm PDT — placeholder, same as WNBA
+NBA_PROPS_REFRESH_SECONDS = 30 * 60
+
+def _nba_props_refresh_interval() -> int:
+    if not NBA_PROPS_ENABLED:
+        return 10 ** 9
+    h = _pdt_hour()
+    if NBA_WINDOW_START_H <= h < NBA_WINDOW_END_H:
+        return NBA_PROPS_REFRESH_SECONDS
+    return 10 ** 9
 
 # ── WNBA scanning — paused 2026-07-14, GAME LINES resumed 2026-07-17 ─────────
 # Three days of live scanning (2026-07-10 to -13) found zero player-prop edges;
@@ -363,6 +400,19 @@ PAPER_START_BALANCE  = 1000.0    # starting virtual bankroll
 PAPER_START_DATE     = "2026-06-08"  # V2.0 reset — pre-throttle + Jun 7 bad-pipeline bets archived
 PAPER_KELLY_FRACTION = 0.25     # quarter-Kelly base fraction (default for all markets)
 PAPER_KELLY_CAP      = 0.03     # max 3% of current balance per bet (validation-phase cap)
+
+# ── Order-book forward-capture (2026-09-28) ───────────────────────────────────
+# Groundwork for the limit-order-fill simulation (top un-shipped profit lever
+# per project memory — monetizes CLV via resting limits instead of always
+# taking market price). The retrospective version is blocked: no bet has ever
+# stored bid/ask/depth, only a single flag-time price, and Kalshi has no
+# historical order-book API — so this has to accumulate forward before the sim
+# can be built. Observability only; never read by pricing/staking/edge logic.
+# 5s is a placeholder guess at signal-to-execution latency, not a measured
+# number — revisit once kalshi_execution.py's real order-placement latency is
+# known, or once enough captures exist to see if 5s materially differs from
+# the flag-time book.
+ORDERBOOK_LATENCY_CAPTURE_SECONDS = 5
 # Per-market Kelly override (user calls, 2026-07-29):
 #  • Strikeouts (KXMLBKS) → HALF Kelly. It's the one validated edge (calibrated
 #    +3.1pp, real hold), so size it up 2x vs the base; keeps the 3% disaster cap.
@@ -465,6 +515,18 @@ SHADOW_MARKETS: list[str] = [
                       # Shadow-first until it has a clean settled sample (walkover/
                       # retirement void handling verified) and CLV/win-rate read.
     "KXWTAMATCH",     # WTA match-winner (moneyline) — added 2026-07-27. Same.
+    "KXNBA",          # NBA player props re-added 2026-10-02 (user call) — props-
+                      # first, game lines deliberately NOT touched. NBA was
+                      # removed 2026-05/06-2026 for CREDIT BUDGET reasons
+                      # ("Fade NBA entirely, reallocate credits to 1-min MLB
+                      # peak scans") — no calibration/accuracy finding on record,
+                      # unlike TB. Treated as a fresh, unvalidated market anyway:
+                      # shadow-first until it earns its own CLV/calibration
+                      # record, same bar every other market here had to clear.
+                      # Covers KXNBAPTS/REB/AST/3PT/PRA (series verified against
+                      # Kalshi's public /series list 2026-10-06). Game lines
+                      # (KXNBAGAME/SPREAD/TOTAL) are NOT scanned -- the KXNBA
+                      # prefix would shadow them too if ever enabled.
     "KXLALIGA",       # La Liga (KXLALIGAGAME/TOTAL/BTTS/CORNERS) — added 2026-08-19.
                       # Corners is a genuinely new market type (never priced before on
                       # any league here), moneyline/total/BTTS are the same math the
@@ -725,6 +787,7 @@ _last_wnba_odds_refresh: float   = 0.0
 _last_wnba_cache_success: float  = 0.0
 _wnba_game_count: int            = 0
 _last_wnba_props_scan: float     = 0.0
+_last_nba_props_scan: float      = 0.0   # NBA props re-added 2026-10-02
 
 # ── validate_bet result cache (saves 1 credit per click) ─────────────────────
 # validate_bet() calls fetch_book_odds() — 1 Odds API credit per call.
@@ -1777,6 +1840,14 @@ def _bet_id(ticker: str, side: str) -> str:
     return f"{ticker}|{side}"
 
 
+# mkt_types that get the one-bet-per-player-per-day dedup (slot keyed on player,
+# not side/line). NBA props are tagged "nba_prop" (kept distinct for _perf_label),
+# so a bare == "prop" check silently let NBA fall through to game-line slot logic
+# (YES and NO on the same player both fundable). "wnba_prop" is deliberately NOT
+# included — WNBA is paused and its behavior is left unchanged.
+_SLOT_PROP_TYPES = ("prop", "nba_prop")
+
+
 def _best_edge_per_game(edges: list) -> list:
     """
     Keep only the single best edge per slot.
@@ -1798,7 +1869,7 @@ def _best_edge_per_game(edges: list) -> list:
 
     def _key(e: dict) -> tuple:
         mt = e.get("mkt_type", "")
-        if mt == "prop":
+        if mt in _SLOT_PROP_TYPES:
             return ("prop", e.get("matchup", ""))          # one slot per player
         if mt == "moneyline":
             # 2-way moneyline: a game has TWO Kalshi markets (one per team), and
@@ -1930,7 +2001,7 @@ def _add_new_bets(edges: list) -> list:
         # Game lines: slot includes side — YES/NO are independent markets.
         def _open_slot(b: dict) -> tuple:
             gd = _parse_ticker_date(b.get("ticker", ""))
-            if b.get("mkt_type") == "prop":
+            if b.get("mkt_type") in _SLOT_PROP_TYPES:
                 return ("prop", b["matchup"], gd)
             return (b["matchup"], b.get("mkt_type", ""), b["side"], gd)
 
@@ -1967,7 +2038,7 @@ def _add_new_bets(edges: list) -> list:
         # most-probable line is below the floor, the next one can still fund.)
         _best_prop = {}   # (matchup, game_date) -> highest qualifying Kalshi price
         for e in edges:
-            if e.get("mkt_type") != "prop" or e.get("pin_invalidated"):
+            if e.get("mkt_type") not in _SLOT_PROP_TYPES or e.get("pin_invalidated"):
                 continue
             if e.get("edge_pct", 0) < EDGE_THRESHOLD * 100:
                 continue
@@ -2058,7 +2129,7 @@ def _add_new_bets(edges: list) -> list:
                 _open_ml_games.add(_ml_ev)
 
             game_date = _parse_ticker_date(e.get("ticker", ""))
-            if e.get("mkt_type") == "prop":
+            if e.get("mkt_type") in _SLOT_PROP_TYPES:
                 slot = ("prop", e.get("matchup", ""), game_date)
             else:
                 slot = (e.get("matchup", ""), e.get("mkt_type", ""), e.get("side", ""), game_date)
@@ -2092,7 +2163,7 @@ def _add_new_bets(edges: list) -> list:
 
             # Within this batch, only the most-probable (highest-price) prop edge
             # per player is funded; lower-priced same-player edges are correlated.
-            if not is_correlated and e.get("mkt_type") == "prop":
+            if not is_correlated and e.get("mkt_type") in _SLOT_PROP_TYPES:
                 if (e.get("kalshi", 0) or 0) < _best_prop.get((e.get("matchup", ""), game_date), 0):
                     is_correlated = True
 
@@ -2257,6 +2328,16 @@ def _add_new_bets(edges: list) -> list:
                 # `fair` and realized outcomes once enough bets accumulate.
                 "nb_fair":            e.get("nb_fair"),
                 "nb_fit_params":      e.get("nb_fit_params"),
+                # Order-book forward-capture (2026-09-28) — see
+                # ORDERBOOK_LATENCY_CAPTURE_SECONDS above. Filled in just after
+                # this bet is appended (flag-time) and again a few seconds later
+                # (latency snapshot) by _capture_orderbook_for_new_bets /
+                # _capture_orderbook_latency_snapshot. Best-effort: stays None
+                # on any fetch failure, never blocks or retries bet placement.
+                "orderbook_at_flag":          None,
+                "orderbook_at_flag_ts":       None,
+                "orderbook_after_latency":    None,
+                "orderbook_after_latency_ts": None,
             }
 
             _bets.append(new_bet)
@@ -2280,6 +2361,60 @@ def _add_new_bets(edges: list) -> list:
                 newly_added.clear()
                 print(f"  Bet tracker: save FAILED — rolled back {added} bet(s), Discord suppressed")
     return newly_added
+
+
+def _capture_orderbook_latency_snapshot(bet_id: str) -> None:
+    """Delayed second order-book capture for one bet, fired by a one-shot
+    timer ORDERBOOK_LATENCY_CAPTURE_SECONDS after _capture_orderbook_for_new_bets
+    took the flag-time snapshot. Models "what would the book look like after
+    signal-to-execution latency" for the future fill sim. Best-effort — a
+    bet removed/resolved in the meantime (unlikely at this latency) is just
+    skipped, not treated as an error.
+    """
+    with _bets_lock:
+        bet = next((b for b in _bets if b["id"] == bet_id), None)
+        ticker = bet["ticker"] if bet else None
+    if not ticker:
+        return
+    snap = fetch_orderbook_snapshot(ticker)
+    if snap is None:
+        return
+    with _bets_lock:
+        for b in _bets:
+            if b["id"] == bet_id:
+                b["orderbook_after_latency"]    = snap
+                b["orderbook_after_latency_ts"] = snap["captured_at"]
+                break
+        else:
+            return
+        _save_bets(_bets)
+
+
+def _capture_orderbook_for_new_bets(newly_added: list) -> None:
+    """Flag-time order-book capture for bets just logged this scan cycle, plus
+    scheduling the delayed latency snapshot for each. Runs AFTER Discord alerts
+    fire so this best-effort network work never delays a real-time notification.
+    New bets are rare (a handful/day) so a per-bet HTTP round trip here is fine;
+    deliberately outside _bets_lock during the fetch itself (only the brief
+    dict update is locked) so a slow/failed Kalshi call can't block other
+    threads reading/writing _bets.
+    """
+    if not newly_added:
+        return
+    for bet in newly_added:
+        snap = fetch_orderbook_snapshot(bet["ticker"])
+        if snap is not None:
+            with _bets_lock:
+                bet["orderbook_at_flag"]    = snap
+                bet["orderbook_at_flag_ts"] = snap["captured_at"]
+        threading.Timer(
+            ORDERBOOK_LATENCY_CAPTURE_SECONDS,
+            _capture_orderbook_latency_snapshot,
+            args=[bet["id"]],
+        ).start()
+        time.sleep(0.15)   # gentle rate-limit, matches the CLV poll loop's pacing
+    with _bets_lock:
+        _save_bets(_bets)
 
 
 def _commence_to_et_date(utc_str: str) -> str:
@@ -5374,6 +5509,23 @@ def _run_scan():
         else:
             wnba_props, _fresh_wnba_prop_snap = [], {}
 
+        # NBA props — re-added 2026-10-02 (see NBA_PROPS_ENABLED comment above
+        # for the scheduling rationale and credit estimate). Game lines stay at
+        # the permanent nba=[] placeholder a few lines up — props only, by
+        # design. scan_nba_player_props() takes no args: NBA_ABBR/NBA_PROP_SERIES/
+        # NBA_PLAYER_PROP_MARKETS are baked into the wrapper in kalshi_ev_scanner.py.
+        global _last_nba_props_scan
+        if now_ts - _last_nba_props_scan >= _nba_props_refresh_interval():
+            try:
+                nba_props, _fresh_nba_prop_snap, _nba_props_credits = scan_nba_player_props()
+                _record_component_credit("NBA Props", _nba_props_credits)
+            except Exception as _nba_prop_exc:
+                print(f"  NBA props scan error: {_nba_prop_exc}")
+                nba_props, _fresh_nba_prop_snap = [], {}
+            _last_nba_props_scan = now_ts
+        else:
+            nba_props, _fresh_nba_prop_snap = [], {}
+
         # NFL — game lines (spread/total/ml) + player props, added 2026-09-03.
         # No cached background index like MLB/WNBA — self-fetches inline on its
         # own gate (see _nfl_refresh_interval() for why). Total/spread ranges
@@ -5546,7 +5698,7 @@ def _run_scan():
                 print(f"  MMA watcher error: {_mma_exc}")
             _last_mma_scan = now_ts
 
-        all_edges = sorted(mlb + nba + mlb_props + wnba + wnba_props + nfl + nfl_props + ncaaf + soccer + tennis, key=lambda x: x["edge"], reverse=True)
+        all_edges = sorted(mlb + nba + mlb_props + wnba + wnba_props + nba_props + nfl + nfl_props + ncaaf + soccer + tennis, key=lambda x: x["edge"], reverse=True)
 
         # Deduplicate: keep only best edge per (matchup, mkt_type, side)
         edges = _best_edge_per_game(all_edges)
@@ -5710,6 +5862,8 @@ def _run_scan():
                 _last_market_snapshot.update(_nfl_snapshot)
             if _fresh_nfl_prop_snap:
                 _last_market_snapshot.update(_fresh_nfl_prop_snap)
+            if _fresh_nba_prop_snap:
+                _last_market_snapshot.update(_fresh_nba_prop_snap)
             if _ncaaf_snapshot:
                 _last_market_snapshot.update(_ncaaf_snapshot)
 
@@ -5746,6 +5900,13 @@ def _run_scan():
     # ── Alert only on bets that were just logged this cycle ──────────────────
     # Notification and paper portfolio are now always in sync.
     _alert_top10(newly_logged)
+
+    # ── Order-book forward-capture (2026-09-28, see ORDERBOOK_LATENCY_CAPTURE_SECONDS) ──
+    # After alerts so this best-effort network work never delays a real-time ping.
+    try:
+        _capture_orderbook_for_new_bets(newly_logged)
+    except Exception as _obe:
+        print(f"  Order-book capture error: {_obe}")
 
     # ── Odds staleness check (runs every scan cycle, outside the try block) ──
     global _odds_stale_alerted

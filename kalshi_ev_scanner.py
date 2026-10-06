@@ -647,6 +647,35 @@ def kalshi_get(path: str, params: Optional[Dict] = None, _retries: int = 3) -> d
     return {}
 
 
+def fetch_orderbook_snapshot(ticker: str, depth: int = 10) -> Optional[dict]:
+    """Best-effort snapshot of Kalshi's live L2 order book for one market.
+
+    Forward-capture instrumentation ONLY — groundwork for the limit-order-fill
+    simulation (see project memory: the retrospective version is blocked because
+    no historical order-book data exists, so this has to be captured going
+    forward on new bets instead). Never read by pricing/staking/edge logic;
+    failures here must never affect bet placement.
+
+    Stores the raw `orderbook` object from GET /markets/{ticker}/orderbook
+    largely as-is (trimmed to `depth` price levels per side) rather than
+    reshaping it — the exact key/level format should be verified against a
+    real captured response before any analysis code assumes a schema.
+    Returns None on any failure (unknown ticker, rate limit exhausted, schema
+    surprise) so a capture miss just leaves the field null, never raises.
+    """
+    try:
+        data = kalshi_get(f"/markets/{ticker}/orderbook")
+        ob = data.get("orderbook") or {}
+        return {
+            "yes":          (ob.get("yes") or [])[:depth],
+            "no":           (ob.get("no") or [])[:depth],
+            "captured_at":  datetime.now(timezone.utc).isoformat(),
+        }
+    except Exception as exc:
+        print(f"  orderbook capture failed for {ticker}: {exc}")
+        return None
+
+
 # ── Kalshi helpers ─────────────────────────────────────────────────────────
 def fetch_kalshi_events(series_ticker: str) -> List[dict]:
     events, cursor = [], None
@@ -3255,7 +3284,19 @@ def scan_sport(
 # is fetched, priced, or flagged. This also ends the TB_NO_EXPERIMENT under-side
 # capture (its premise was already weak — see project-tb-full-shadow).
 PLAYER_PROP_MARKETS = "pitcher_strikeouts"
-NBA_PLAYER_PROP_MARKETS = "player_points,player_assists,player_threes"
+# Expanded 2026-10-06 (user call): + rebounds and the points+rebounds+assists
+# combo. Odds API keys verified against its docs; Kalshi series (KXNBAREB,
+# KXNBAPRA) verified against Kalshi's public /series list. The other combos
+# (KXNBAPR/KXNBAPA/KXNBARA -> player_points_rebounds / player_points_assists /
+# player_rebounds_assists) also exist on both sides but are deliberately NOT
+# added: each market is +1 credit/event/scan and they're near-duplicates of
+# PRA/the singles (and share the one-bet-per-player dedup), so marginal edge
+# opportunity is low. Pinnacle coverage per market is UNVERIFIED for NBA (WNBA
+# Pinnacle had no threes) -- the "Pinnacle coverage" log line in
+# scan_player_props shows it on the first live slate; prune any market that
+# never shows Pinnacle lines (it can't produce a valid fair and just burns
+# credits).
+NBA_PLAYER_PROP_MARKETS = "player_points,player_rebounds,player_assists,player_threes,player_points_rebounds_assists"
 # WNBA: Pinnacle carries points/rebounds/assists but NOT threes (verified
 # 2026-07-10 against the live Odds API — DK/FanDuel have player_threes,
 # Pinnacle doesn't). Pinnacle is the required sole fair-value anchor
@@ -3305,8 +3346,10 @@ MLB_PROP_SERIES: Dict[str, str] = {
 
 NBA_PROP_SERIES: Dict[str, str] = {
     "KXNBAPTS": "player_points",
+    "KXNBAREB": "player_rebounds",
     "KXNBAAST": "player_assists",
     "KXNBA3PT": "player_threes",
+    "KXNBAPRA": "player_points_rebounds_assists",
 }
 
 WNBA_PROP_SERIES: Dict[str, str] = {
@@ -3621,6 +3664,20 @@ def build_all_player_props(
         print(f"    [{fetched}] {ev.get('away_team')} @ {ev.get('home_team')} — props fetched")
 
     print(f"  Built player index: {len(player_lookup)} players across {fetched} game(s)")
+    # Per-market Pinnacle coverage (observability only). Pinnacle is the sole
+    # fair-value anchor, so a market with no Pinnacle lines can never produce a
+    # valid edge -- this makes that visible on the first live slate of a new
+    # sport instead of discovering it from a credit bill.
+    _pin_cov: Dict[str, List[int]] = {}
+    for _by_type in player_lookup.values():
+        for _mt, _ent in _by_type.items():
+            _c = _pin_cov.setdefault(_mt, [0, 0])
+            _c[0] += 1
+            if any("pinnacle" in (_le.get("books_used") or [])
+                   for _le in (_ent.get("lines") or {}).values()):
+                _c[1] += 1
+    for _mt, (_n, _np) in sorted(_pin_cov.items()):
+        print(f"    Pinnacle coverage {_mt}: {_np}/{_n} players")
     return player_lookup, credits_spent
 
 

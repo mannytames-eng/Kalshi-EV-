@@ -205,8 +205,7 @@ WNBA_WINDOW_END_H   = 22   # 10pm PDT
 # CREDIT-BUDGET decision ("Fade NBA entirely, reallocate credits to 1-min MLB
 # peak scans" — was 4 of 8 credits per refresh), not a calibration finding —
 # no accuracy problem on record, unlike Total Bases. Re-added PROPS ONLY
-# (points/assists/threes via NBA_PROP_SERIES — rebounds/PRA pending Kalshi
-# series-ticker verification, see [[project_ev_scanner_next]]); game lines
+# (points/rebounds/assists/threes/PRA via NBA_PROP_SERIES); game lines
 # deliberately left at the permanent nba=[] placeholder below (user call:
 # props first). Shadow-first via SHADOW_MARKETS regardless of this flag,
 # same bar every other market here had to clear before funding.
@@ -216,9 +215,10 @@ WNBA_WINDOW_END_H   = 22   # 10pm PDT
 # once live data shows actual game-time distribution. No zero-game short-
 # circuit yet (unlike WNBA/MLB): NBA plays most days of the season so the
 # payoff is lower than WNBA's multi-day gaps; revisit if credit data says
-# otherwise. Credit estimate (3 markets, ~10 games on a full slate, 30min
-# cadence over the 7h window): ~420 credits/day -> ~12,600/month — same order
-# of magnitude as NFL props, affordable with MLB's post-season volume drop.
+# otherwise. Credit estimate (5 markets, ~10 games on a full slate, 30min
+# cadence over the 7h window): ~700 credits/day -> ~21,000/month (was ~12,600
+# at 3 markets) — above NFL props' ~14.7k, affordable only because MLB's
+# post-season volume drops; drop any market that shows no Pinnacle coverage.
 # UNVERIFIED — retune against the live credit readout (/api/scan ->
 # credit_by_component) once a real week has run, same pattern as every prior
 # sport addition.
@@ -523,9 +523,10 @@ SHADOW_MARKETS: list[str] = [
                       # unlike TB. Treated as a fresh, unvalidated market anyway:
                       # shadow-first until it earns its own CLV/calibration
                       # record, same bar every other market here had to clear.
-                      # Covers KXNBAPTS/KXNBAAST/KXNBA3PT and any added series
-                      # (KXNBAREB/PRA pending Kalshi series-ticker verification —
-                      # see [[project_ev_scanner_next]]).
+                      # Covers KXNBAPTS/REB/AST/3PT/PRA (series verified against
+                      # Kalshi's public /series list 2026-10-06). Game lines
+                      # (KXNBAGAME/SPREAD/TOTAL) are NOT scanned -- the KXNBA
+                      # prefix would shadow them too if ever enabled.
     "KXLALIGA",       # La Liga (KXLALIGAGAME/TOTAL/BTTS/CORNERS) — added 2026-08-19.
                       # Corners is a genuinely new market type (never priced before on
                       # any league here), moneyline/total/BTTS are the same math the
@@ -1839,6 +1840,14 @@ def _bet_id(ticker: str, side: str) -> str:
     return f"{ticker}|{side}"
 
 
+# mkt_types that get the one-bet-per-player-per-day dedup (slot keyed on player,
+# not side/line). NBA props are tagged "nba_prop" (kept distinct for _perf_label),
+# so a bare == "prop" check silently let NBA fall through to game-line slot logic
+# (YES and NO on the same player both fundable). "wnba_prop" is deliberately NOT
+# included — WNBA is paused and its behavior is left unchanged.
+_SLOT_PROP_TYPES = ("prop", "nba_prop")
+
+
 def _best_edge_per_game(edges: list) -> list:
     """
     Keep only the single best edge per slot.
@@ -1860,7 +1869,7 @@ def _best_edge_per_game(edges: list) -> list:
 
     def _key(e: dict) -> tuple:
         mt = e.get("mkt_type", "")
-        if mt == "prop":
+        if mt in _SLOT_PROP_TYPES:
             return ("prop", e.get("matchup", ""))          # one slot per player
         if mt == "moneyline":
             # 2-way moneyline: a game has TWO Kalshi markets (one per team), and
@@ -1992,7 +2001,7 @@ def _add_new_bets(edges: list) -> list:
         # Game lines: slot includes side — YES/NO are independent markets.
         def _open_slot(b: dict) -> tuple:
             gd = _parse_ticker_date(b.get("ticker", ""))
-            if b.get("mkt_type") == "prop":
+            if b.get("mkt_type") in _SLOT_PROP_TYPES:
                 return ("prop", b["matchup"], gd)
             return (b["matchup"], b.get("mkt_type", ""), b["side"], gd)
 
@@ -2029,7 +2038,7 @@ def _add_new_bets(edges: list) -> list:
         # most-probable line is below the floor, the next one can still fund.)
         _best_prop = {}   # (matchup, game_date) -> highest qualifying Kalshi price
         for e in edges:
-            if e.get("mkt_type") != "prop" or e.get("pin_invalidated"):
+            if e.get("mkt_type") not in _SLOT_PROP_TYPES or e.get("pin_invalidated"):
                 continue
             if e.get("edge_pct", 0) < EDGE_THRESHOLD * 100:
                 continue
@@ -2120,7 +2129,7 @@ def _add_new_bets(edges: list) -> list:
                 _open_ml_games.add(_ml_ev)
 
             game_date = _parse_ticker_date(e.get("ticker", ""))
-            if e.get("mkt_type") == "prop":
+            if e.get("mkt_type") in _SLOT_PROP_TYPES:
                 slot = ("prop", e.get("matchup", ""), game_date)
             else:
                 slot = (e.get("matchup", ""), e.get("mkt_type", ""), e.get("side", ""), game_date)
@@ -2154,7 +2163,7 @@ def _add_new_bets(edges: list) -> list:
 
             # Within this batch, only the most-probable (highest-price) prop edge
             # per player is funded; lower-priced same-player edges are correlated.
-            if not is_correlated and e.get("mkt_type") == "prop":
+            if not is_correlated and e.get("mkt_type") in _SLOT_PROP_TYPES:
                 if (e.get("kalshi", 0) or 0) < _best_prop.get((e.get("matchup", ""), game_date), 0):
                     is_correlated = True
 

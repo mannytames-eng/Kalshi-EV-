@@ -4195,8 +4195,8 @@ def scan_player_props(
     return edges, prop_snapshot, credits_spent
 
 
-def scan_nba_player_props() -> Tuple[List[dict], dict, int]:
-    """Scan Kalshi NBA player-prop markets (points, assists, 3-pointers)."""
+def scan_nba_player_props(lookahead_hours: float = 48.0) -> Tuple[List[dict], dict, int]:
+    """Scan Kalshi NBA player-prop markets (points, rebounds, assists, 3s, PRA)."""
     return scan_player_props(
         odds_sport      = "basketball_nba",
         abbr_map        = NBA_ABBR,
@@ -4205,6 +4205,7 @@ def scan_nba_player_props() -> Tuple[List[dict], dict, int]:
         sport_label     = "NBA",
         mkt_type_label  = "nba_prop",
         parse_event_fn  = _parse_nba_event,
+        lookahead_hours = lookahead_hours,
     )
 
 

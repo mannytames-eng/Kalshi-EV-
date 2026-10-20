@@ -222,10 +222,20 @@ WNBA_WINDOW_END_H   = 22   # 10pm PDT
 # UNVERIFIED — retune against the live credit readout (/api/scan ->
 # credit_by_component) once a real week has run, same pattern as every prior
 # sport addition.
+# 2026-10-20 (opening night) retune: the 3pm-PDT placeholder start missed the
+# noon-PDT BOS@DET tip entirely and gave the 4pm game only two scans. Start
+# moved to 9am PDT (covers noon-ET weekend matinees), and the scan now only
+# prices games tipping within NBA_PROPS_LOOKAHEAD_HOURS -- scan_nba_player_props
+# was using scan_player_props' default 48h lookahead, so a full slate filled
+# the 15-event cap with tomorrow's games too (cost is per event per market, so
+# that roughly doubled spend vs the estimate above). Early-day scans now cost
+# nothing until a game is inside the lookahead. Still UNVERIFIED against live
+# credit_by_component -- recheck after the first full week.
 NBA_PROPS_ENABLED        = True
-NBA_WINDOW_START_H       = 15   # 3pm PDT — placeholder, same as WNBA
-NBA_WINDOW_END_H         = 22   # 10pm PDT — placeholder, same as WNBA
+NBA_WINDOW_START_H       = 9    # 9am PDT
+NBA_WINDOW_END_H         = 22   # 10pm PDT -- last tips ~7:30pm PDT
 NBA_PROPS_REFRESH_SECONDS = 30 * 60
+NBA_PROPS_LOOKAHEAD_HOURS = 6.0
 
 def _nba_props_refresh_interval() -> int:
     if not NBA_PROPS_ENABLED:
@@ -5517,7 +5527,8 @@ def _run_scan():
         global _last_nba_props_scan
         if now_ts - _last_nba_props_scan >= _nba_props_refresh_interval():
             try:
-                nba_props, _fresh_nba_prop_snap, _nba_props_credits = scan_nba_player_props()
+                nba_props, _fresh_nba_prop_snap, _nba_props_credits = scan_nba_player_props(
+                    lookahead_hours=NBA_PROPS_LOOKAHEAD_HOURS)
                 _record_component_credit("NBA Props", _nba_props_credits)
             except Exception as _nba_prop_exc:
                 print(f"  NBA props scan error: {_nba_prop_exc}")

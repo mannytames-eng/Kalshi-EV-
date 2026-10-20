@@ -4851,6 +4851,14 @@ def _ncaaf_refresh_interval() -> int:
     h = _pdt_hour()
     return NCAAF_GAME_REFRESH_SECONDS if (NCAAF_WINDOW_START_H <= h < NCAAF_WINDOW_END_H) else 10 ** 9
 
+def _scan_due(now_ts: float, last_ts: float, interval: int) -> bool:
+    """True when a gated scan should run. An interval >= 10**9 means OFF
+    (disabled / outside window). Without this check, `now_ts - last >= 10**9`
+    is TRUE on the first cycle after every restart (last starts at 0 and epoch
+    time is ~1.76e9), so every paused sport fired one paid sweep per deploy.
+    Found 2026-10-20 when NCAAF (paused 2026-09-21) fetched after a deploy."""
+    return interval < 10 ** 9 and now_ts - last_ts >= interval
+
 _zero_edge_alerted     = False      # suppresses duplicate alerts per drought
 _ZERO_EDGE_ALERT_SCANS = 60         # 60 × 2-min scan = 2 hours of silence
 
@@ -5571,7 +5579,7 @@ def _run_scan():
             wnba, wnba_stats = [], {}
 
         global _last_wnba_props_scan
-        if now_ts - _last_wnba_props_scan >= _wnba_props_refresh_interval():
+        if _scan_due(now_ts, _last_wnba_props_scan, _wnba_props_refresh_interval()):
             try:
                 wnba_props, _fresh_wnba_prop_snap, _wnba_props_credits = scan_wnba_player_props()
                 _record_component_credit("WNBA Props", _wnba_props_credits)
@@ -5588,7 +5596,7 @@ def _run_scan():
         # design. scan_nba_player_props() takes no args: NBA_ABBR/NBA_PROP_SERIES/
         # NBA_PLAYER_PROP_MARKETS are baked into the wrapper in kalshi_ev_scanner.py.
         global _last_nba_props_scan
-        if now_ts - _last_nba_props_scan >= _nba_props_refresh_interval():
+        if _scan_due(now_ts, _last_nba_props_scan, _nba_props_refresh_interval()):
             try:
                 nba_props, _fresh_nba_prop_snap, _nba_props_credits = scan_nba_player_props(
                     lookahead_hours=NBA_PROPS_LOOKAHEAD_HOURS)
@@ -5610,7 +5618,7 @@ def _run_scan():
         global _last_nfl_scan
         nfl: list = []
         _nfl_snapshot: dict = {}
-        if now_ts - _last_nfl_scan >= _nfl_refresh_interval():
+        if _scan_due(now_ts, _last_nfl_scan, _nfl_refresh_interval()):
             try:
                 nfl_idx, _ = fetch_odds_index(
                     "americanfootball_nfl",
@@ -5637,7 +5645,7 @@ def _run_scan():
         global _last_nfl_props_scan
         nfl_props: list = []
         _fresh_nfl_prop_snap: dict = {}
-        if now_ts - _last_nfl_props_scan >= _nfl_props_refresh_interval():
+        if _scan_due(now_ts, _last_nfl_props_scan, _nfl_props_refresh_interval()):
             try:
                 nfl_props, _fresh_nfl_prop_snap, _nfl_props_credits = scan_player_props(
                     odds_sport="americanfootball_nfl", abbr_map=NFL_ABBR,
@@ -5673,7 +5681,7 @@ def _run_scan():
         global _last_ncaaf_scan
         ncaaf: list = []
         _ncaaf_snapshot: dict = {}
-        if now_ts - _last_ncaaf_scan >= _ncaaf_refresh_interval():
+        if _scan_due(now_ts, _last_ncaaf_scan, _ncaaf_refresh_interval()):
             try:
                 ncaaf_idx, _ = fetch_odds_index(
                     "americanfootball_ncaaf",
@@ -5705,7 +5713,7 @@ def _run_scan():
         # the paid Pinnacle call. All shadow-first via SHADOW_MARKETS.
         global _last_soccer_scan
         soccer: list = []
-        if now_ts - _last_soccer_scan >= _soccer_refresh_interval():
+        if _scan_due(now_ts, _last_soccer_scan, _soccer_refresh_interval()):
             for _cfg in SOCCER_LEAGUES:
                 if not _cfg.get("enabled", True):
                     continue
@@ -5723,7 +5731,7 @@ def _run_scan():
         # SHADOW_MARKETS.
         global _last_tennis_scan
         tennis: list = []
-        if now_ts - _last_tennis_scan >= _tennis_refresh_interval():
+        if _scan_due(now_ts, _last_tennis_scan, _tennis_refresh_interval()):
             for _tcfg in TENNIS_LEAGUES:
                 try:
                     _tour_edges, _ = scan_tennis(_tcfg)

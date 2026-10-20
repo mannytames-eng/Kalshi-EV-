@@ -61,6 +61,7 @@ from kalshi_ev_scanner import (
     kalshi_get,
     fetch_orderbook_snapshot,
     scan_nba_player_props,
+    scan_nhl_player_props,
     fetch_game_scores,
     fetch_odds_index,
     validate_bet,
@@ -257,32 +258,52 @@ NBA_PROPS_LOOKAHEAD_HOURS = 6.0
 # tips inside it (also skips the free Kalshi/Odds-events calls). UNVERIFIED:
 # the near-tip bump is a prior, not a measured finding; recheck CLV by
 # minutes-to-tip and credit_by_component after a couple of weeks.
-_nba_tip_cache: dict = {"ts": 0.0, "tips": None}
+_espn_tip_caches: dict = {}   # sport path -> {"ts": float, "tips": list|None}
 
-def _nba_upcoming_tip_minutes() -> Optional[list]:
-    """Minutes until each not-yet-started NBA game on ESPN's current slate,
-    cached 10 min. None if ESPN is unreachable and nothing is cached."""
+def _espn_upcoming_tip_minutes(sport_path: str) -> Optional[list]:
+    """Minutes until each not-yet-started game on ESPN's current scoreboard for
+    `sport_path` (e.g. "basketball/nba", "hockey/nhl"), cached 10 min. None if
+    ESPN is unreachable and nothing is cached."""
+    cache = _espn_tip_caches.setdefault(sport_path, {"ts": 0.0, "tips": None})
     now = time.time()
-    if _nba_tip_cache["tips"] is not None and now - _nba_tip_cache["ts"] < 600:
-        tips = _nba_tip_cache["tips"]
+    if cache["tips"] is not None and now - cache["ts"] < 600:
+        tips = cache["tips"]
     else:
         try:
             import urllib.request as _ur
-            with _ur.urlopen("https://site.api.espn.com/apis/site/v2/sports/basketball/nba/scoreboard",
-                             timeout=5) as r:
-                data = json.loads(r.read())
+            from datetime import timedelta as _td
+            # ESPN's DEFAULT scoreboard can still be showing yesterday's finished
+            # slate in the morning (seen 2026-10-20 for NHL), which would read as
+            # "no upcoming games" and silently disable scanning. Ask for explicit
+            # Eastern dates (today + tomorrow) instead.
+            et_now = datetime.now(timezone.utc) - _td(hours=_et_offset_hours())
             tips = []
-            for ev in data.get("events", []):
-                if ((ev.get("status") or {}).get("type") or {}).get("state") != "pre":
-                    continue
-                tips.append(datetime.fromisoformat(ev["date"].replace("Z", "+00:00")))
-            _nba_tip_cache.update(ts=now, tips=tips)
+            for dd in (et_now, et_now + _td(days=1)):
+                with _ur.urlopen(f"https://site.api.espn.com/apis/site/v2/sports/{sport_path}/"
+                                 f"scoreboard?dates={dd.strftime('%Y%m%d')}", timeout=5) as r:
+                    data = json.loads(r.read())
+                for ev in data.get("events", []):
+                    if ((ev.get("status") or {}).get("type") or {}).get("state") != "pre":
+                        continue
+                    tips.append(datetime.fromisoformat(ev["date"].replace("Z", "+00:00")))
+            cache.update(ts=now, tips=tips)
         except Exception:
-            if _nba_tip_cache["tips"] is None:
+            if cache["tips"] is None:
                 return None
-            tips = _nba_tip_cache["tips"]
+            tips = cache["tips"]
     nowdt = datetime.now(timezone.utc)
     return [m for m in ((t - nowdt).total_seconds() / 60 for t in tips) if m > 0]
+
+def _nba_upcoming_tip_minutes() -> Optional[list]:
+    return _espn_upcoming_tip_minutes("basketball/nba")
+
+def _tip_driven_interval(mins: Optional[list], lookahead_h: float, near_min: int,
+                         base_s: int, near_s: int) -> int:
+    if mins is None:
+        return base_s                              # ESPN down: fall back to base cadence
+    if not mins or min(mins) > lookahead_h * 60:
+        return 10 ** 9                             # nothing tips inside the lookahead
+    return near_s if min(mins) <= near_min else base_s
 
 def _nba_props_refresh_interval() -> int:
     if not NBA_PROPS_ENABLED:
@@ -290,14 +311,38 @@ def _nba_props_refresh_interval() -> int:
     h = _pdt_hour()
     if not (NBA_WINDOW_START_H <= h < NBA_WINDOW_END_H):
         return 10 ** 9
-    mins = _nba_upcoming_tip_minutes()
-    if mins is None:
-        return NBA_PROPS_REFRESH_SECONDS          # ESPN down: fall back to base cadence
-    if not mins or min(mins) > NBA_PROPS_LOOKAHEAD_HOURS * 60:
-        return 10 ** 9                            # nothing tips inside the lookahead
-    if min(mins) <= NBA_PROPS_NEAR_TIP_MINUTES:
-        return NBA_PROPS_NEAR_TIP_REFRESH_SECONDS
-    return NBA_PROPS_REFRESH_SECONDS
+    return _tip_driven_interval(_nba_upcoming_tip_minutes(), NBA_PROPS_LOOKAHEAD_HOURS,
+                                NBA_PROPS_NEAR_TIP_MINUTES, NBA_PROPS_REFRESH_SECONDS,
+                                NBA_PROPS_NEAR_TIP_REFRESH_SECONDS)
+
+# ── NHL goalie saves (added 2026-10-20, shadow-first) ────────────────────────
+# Kalshi's only NHL player-stat series with a Pinnacle-comparable stat is
+# KXNHLSAVE (goalie saves; no shots-on-goal series exists on Kalshi). One
+# threshold per goalie, listed ~11am PT on game day, so the window opens at
+# 10am PT. Cadence follows real puck-drop times from ESPN like NBA props. Cost
+# is 1 credit/event/market -> ~11 credits per full-slate scan, and the scan is
+# free when Kalshi has no open KXNHLSAVE markets. Fair values come from the
+# calibrated Negative-Binomial count model (kalshi_ev_scanner.count_model_fair_band),
+# NOT Poisson (saves variance/mean ~2.0). Whole KXNHL prefix is in SHADOW_MARKETS.
+# UNVERIFIED live: whether Pinnacle posts NHL saves via the Odds API at all --
+# first slate's "Pinnacle coverage" log line answers it; without Pinnacle the
+# edges can only come from the shadow-forced retail-consensus fallback.
+NHL_PROPS_ENABLED                  = True
+NHL_WINDOW_START_H                 = 10
+NHL_WINDOW_END_H                   = 22
+NHL_PROPS_REFRESH_SECONDS          = 20 * 60
+NHL_PROPS_NEAR_TIP_REFRESH_SECONDS = 10 * 60
+NHL_PROPS_NEAR_TIP_MINUTES         = 90
+NHL_PROPS_LOOKAHEAD_HOURS          = 6.0
+
+def _nhl_props_refresh_interval() -> int:
+    if not NHL_PROPS_ENABLED:
+        return 10 ** 9
+    if not (NHL_WINDOW_START_H <= _pdt_hour() < NHL_WINDOW_END_H):
+        return 10 ** 9
+    return _tip_driven_interval(_espn_upcoming_tip_minutes("hockey/nhl"), NHL_PROPS_LOOKAHEAD_HOURS,
+                                NHL_PROPS_NEAR_TIP_MINUTES, NHL_PROPS_REFRESH_SECONDS,
+                                NHL_PROPS_NEAR_TIP_REFRESH_SECONDS)
 
 # ── WNBA scanning — paused 2026-07-14, GAME LINES resumed 2026-07-17 ─────────
 # Three days of live scanning (2026-07-10 to -13) found zero player-prop edges;
@@ -579,6 +624,7 @@ SHADOW_MARKETS: list[str] = [
                       # Shadow-first until it has a clean settled sample (walkover/
                       # retirement void handling verified) and CLV/win-rate read.
     "KXWTAMATCH",     # WTA match-winner (moneyline) — added 2026-07-27. Same.
+    "KXNHL",          # NHL goalie saves (2026-10-20): shadow-first, calibrated NB count model
     "KXNBA",          # NBA player props re-added 2026-10-02 (user call) — props-
                       # first, game lines deliberately NOT touched. NBA was
                       # removed 2026-05/06-2026 for CREDIT BUDGET reasons
@@ -852,6 +898,7 @@ _last_wnba_cache_success: float  = 0.0
 _wnba_game_count: int            = 0
 _last_wnba_props_scan: float     = 0.0
 _last_nba_props_scan: float      = 0.0   # NBA props re-added 2026-10-02
+_last_nhl_props_scan: float      = 0.0   # NHL goalie saves added 2026-10-20
 
 # ── validate_bet result cache (saves 1 credit per click) ─────────────────────
 # validate_bet() calls fetch_book_odds() — 1 Odds API credit per call.
@@ -1909,7 +1956,7 @@ def _bet_id(ticker: str, side: str) -> str:
 # so a bare == "prop" check silently let NBA fall through to game-line slot logic
 # (YES and NO on the same player both fundable). "wnba_prop" is deliberately NOT
 # included — WNBA is paused and its behavior is left unchanged.
-_SLOT_PROP_TYPES = ("prop", "nba_prop")
+_SLOT_PROP_TYPES = ("prop", "nba_prop", "nhl_prop")
 
 
 def _best_edge_per_game(edges: list) -> list:
@@ -3423,7 +3470,7 @@ def _live_stats_loop():
                 inplay = []
                 for b in _bets:
                     if b.get("status") != "open" or not (
-                            b.get("mkt_type") in ("prop", "wnba_prop", "nba_prop")
+                            b.get("mkt_type") in ("prop", "wnba_prop", "nba_prop", "nhl_prop")
                             or _is_soccer_bet(b) or _is_mlb_game_line_bet(b)):
                         continue
                     gt = b.get("game_time")
@@ -3963,7 +4010,7 @@ def _get_performance(since: Optional[str] = None) -> dict:
 
     # Game lines only — exclude all props (MLB + NBA) from top-level pills.
     def _is_prop(b: dict) -> bool:
-        return _infer_mkt_type(b) in ("prop", "nba_prop", "wnba_prop")
+        return _infer_mkt_type(b) in ("prop", "nba_prop", "wnba_prop", "nhl_prop")
 
     # correlated=True bets are logged for the paper record but excluded from
     # win-rate and Kelly P&L stats — they share the same game outcome as their
@@ -4213,6 +4260,8 @@ def _get_performance(since: Optional[str] = None) -> dict:
     def _perf_label(b: dict) -> str:
         ticker = b.get("ticker", "").upper()
         mtype  = _infer_mkt_type(b)
+        if mtype == "nhl_prop":
+            return "NHL Saves (Retail)" if b.get("fair_source") == "retail_consensus" else "NHL Saves"
         if mtype == "nba_prop":
             return "NBA Props"
         if mtype == "wnba_prop":
@@ -4261,6 +4310,8 @@ def _get_performance(since: Optional[str] = None) -> dict:
             return "MLB Props (Retail)" if _retail else "MLB Props"
         if ticker.startswith("KXWNBA"):
             sport = "WNBA"
+        elif ticker.startswith("KXNHL"):
+            sport = "NHL"
         elif ticker.startswith("KXNBA"):
             sport = "NBA"
         elif ticker.startswith("KXNCAAF"):
@@ -5608,6 +5659,20 @@ def _run_scan():
         else:
             nba_props, _fresh_nba_prop_snap = [], {}
 
+        # NHL goalie saves (added 2026-10-20) -- see NHL_PROPS_ENABLED block.
+        global _last_nhl_props_scan
+        if _scan_due(now_ts, _last_nhl_props_scan, _nhl_props_refresh_interval()):
+            try:
+                nhl_props, _fresh_nhl_prop_snap, _nhl_props_credits = scan_nhl_player_props(
+                    lookahead_hours=NHL_PROPS_LOOKAHEAD_HOURS)
+                _record_component_credit("NHL Saves", _nhl_props_credits)
+            except Exception as _nhl_prop_exc:
+                print(f"  NHL props scan error: {_nhl_prop_exc}")
+                nhl_props, _fresh_nhl_prop_snap = [], {}
+            _last_nhl_props_scan = now_ts
+        else:
+            nhl_props, _fresh_nhl_prop_snap = [], {}
+
         # NFL — game lines (spread/total/ml) + player props, added 2026-09-03.
         # No cached background index like MLB/WNBA — self-fetches inline on its
         # own gate (see _nfl_refresh_interval() for why). Total/spread ranges
@@ -5780,7 +5845,7 @@ def _run_scan():
                 print(f"  MMA watcher error: {_mma_exc}")
             _last_mma_scan = now_ts
 
-        all_edges = sorted(mlb + nba + mlb_props + wnba + wnba_props + nba_props + nfl + nfl_props + ncaaf + soccer + tennis, key=lambda x: x["edge"], reverse=True)
+        all_edges = sorted(mlb + nba + mlb_props + wnba + wnba_props + nba_props + nhl_props + nfl + nfl_props + ncaaf + soccer + tennis, key=lambda x: x["edge"], reverse=True)
 
         # Deduplicate: keep only best edge per (matchup, mkt_type, side)
         edges = _best_edge_per_game(all_edges)
@@ -5946,6 +6011,8 @@ def _run_scan():
                 _last_market_snapshot.update(_fresh_nfl_prop_snap)
             if _fresh_nba_prop_snap:
                 _last_market_snapshot.update(_fresh_nba_prop_snap)
+            if _fresh_nhl_prop_snap:
+                _last_market_snapshot.update(_fresh_nhl_prop_snap)
             if _ncaaf_snapshot:
                 _last_market_snapshot.update(_ncaaf_snapshot)
 
@@ -6176,6 +6243,8 @@ def _sport_for_ticker(ticker: str) -> str:
     # fetch the wrong sport's odds entirely for any NFL bet that reached it.
     if t.startswith("KXNFL"):
         return "americanfootball_nfl"
+    if t.startswith("KXNHL"):
+        return "icehockey_nhl"
     return "baseball_mlb"
 
 
@@ -6464,7 +6533,8 @@ def _capture_clv_prices():
             # so without an anchor we CANNOT distinguish pre-game from in-game —
             # freeze at entry (CLV stays 0, neutral) rather than trust the clock.
             if game_start is None and bet.get("game_time") is None \
-                    and "NBA" in bet["ticker"].upper():   # matches KXNBA* and KXWNBA*
+                    and ("NBA" in bet["ticker"].upper()      # matches KXNBA* and KXWNBA*
+                         or "NHL" in bet["ticker"].upper()):   # NHL tickers omit the time too
                 with _bets_lock:
                     for b in _bets:
                         if b["id"] == bet["id"] and not b.get("clv_frozen"):
@@ -7608,6 +7678,7 @@ function sportOf(e) {
   const t = (e.ticker || '').toUpperCase();
   if (t.startsWith('KXWNBA')) return 'wnba';
   if (t.startsWith('KXNBA')) return 'nba';
+  if (t.startsWith('KXNHL')) return 'nhl';
   if (t.startsWith('KXMLB')) return 'mlb';
   return 'mlb';
 }
@@ -8514,8 +8585,8 @@ function renderPerformance(d) {
     </p>`;
 
   // By-type breakdown table
-  const PROP_LABELS = new Set(['Strikeouts (K)', 'Hits', 'Total Bases', 'RBIs', 'MLB Props', 'NBA Props', 'WNBA Props', 'NFL Pass Yards', 'NFL Rush Yards', 'NFL Reception Yards', 'NFL Receptions', 'NFL Pass TDs', 'NFL Pass Yards (Retail)', 'NFL Rush Yards (Retail)', 'NFL Reception Yards (Retail)', 'NFL Receptions (Retail)', 'NFL Pass TDs (Retail)']);
-  const TYPE_ORDER  = ['MLB Total', 'MLB Spread', 'Strikeouts (K)', 'Pitcher Outs (Whole-Inning)', 'Pitcher Outs (Other Lines)', 'Hits', 'Total Bases', 'RBIs', 'MLB Props', 'NBA Props', 'WNBA Total', 'WNBA Spread', 'WNBA Props', 'NFL Moneyline', 'NFL Spread', 'NFL Total', 'NFL Pass Yards', 'NFL Rush Yards', 'NFL Reception Yards', 'NFL Receptions', 'NFL Pass TDs', 'NCAAF Moneyline', 'NCAAF Spread', 'NCAAF Total', 'La Liga Moneyline', 'La Liga Total', 'La Liga BTTS', 'La Liga Corners', 'EPL Moneyline', 'EPL Total', 'EPL BTTS', 'EPL Corners', 'MLS Moneyline', 'MLS Total', 'MLS BTTS', 'Argentina Moneyline', 'Argentina Total', 'Argentina BTTS', 'Brazil Moneyline', 'Brazil Total', 'Brazil BTTS', 'Liga MX Moneyline', 'Liga MX Total', 'Liga MX BTTS', 'Brazil B Moneyline', 'Brazil B Total', 'Brazil B BTTS', 'Sudamericana Moneyline', 'Sudamericana Total', 'Sudamericana BTTS', 'Chile Moneyline', 'Chile Total', 'Chile BTTS', 'ATP Moneyline', 'WTA Moneyline', 'NFL Pass Yards (Retail)', 'NFL Rush Yards (Retail)', 'NFL Reception Yards (Retail)', 'NFL Receptions (Retail)', 'NFL Pass TDs (Retail)'];
+  const PROP_LABELS = new Set(['Strikeouts (K)', 'Hits', 'Total Bases', 'RBIs', 'MLB Props', 'NBA Props', 'NHL Saves', 'NHL Saves (Retail)', 'WNBA Props', 'NFL Pass Yards', 'NFL Rush Yards', 'NFL Reception Yards', 'NFL Receptions', 'NFL Pass TDs', 'NFL Pass Yards (Retail)', 'NFL Rush Yards (Retail)', 'NFL Reception Yards (Retail)', 'NFL Receptions (Retail)', 'NFL Pass TDs (Retail)']);
+  const TYPE_ORDER  = ['MLB Total', 'MLB Spread', 'Strikeouts (K)', 'Pitcher Outs (Whole-Inning)', 'Pitcher Outs (Other Lines)', 'Hits', 'Total Bases', 'RBIs', 'MLB Props', 'NBA Props', 'NHL Saves', 'NHL Saves (Retail)', 'WNBA Total', 'WNBA Spread', 'WNBA Props', 'NFL Moneyline', 'NFL Spread', 'NFL Total', 'NFL Pass Yards', 'NFL Rush Yards', 'NFL Reception Yards', 'NFL Receptions', 'NFL Pass TDs', 'NCAAF Moneyline', 'NCAAF Spread', 'NCAAF Total', 'La Liga Moneyline', 'La Liga Total', 'La Liga BTTS', 'La Liga Corners', 'EPL Moneyline', 'EPL Total', 'EPL BTTS', 'EPL Corners', 'MLS Moneyline', 'MLS Total', 'MLS BTTS', 'Argentina Moneyline', 'Argentina Total', 'Argentina BTTS', 'Brazil Moneyline', 'Brazil Total', 'Brazil BTTS', 'Liga MX Moneyline', 'Liga MX Total', 'Liga MX BTTS', 'Brazil B Moneyline', 'Brazil B Total', 'Brazil B BTTS', 'Sudamericana Moneyline', 'Sudamericana Total', 'Sudamericana BTTS', 'Chile Moneyline', 'Chile Total', 'Chile BTTS', 'ATP Moneyline', 'WTA Moneyline', 'NFL Pass Yards (Retail)', 'NFL Rush Yards (Retail)', 'NFL Reception Yards (Retail)', 'NFL Receptions (Retail)', 'NFL Pass TDs (Retail)'];
   // Markets no longer scanned — settled record frozen & still shown, but tagged
   // so it's clear no new bets are being placed. Total Bases terminated 2026-07-23.
   const TERMINATED_LABELS = new Set(['Total Bases']);

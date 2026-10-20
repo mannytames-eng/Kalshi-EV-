@@ -441,6 +441,27 @@ MLB_ABBR: Dict[str, str] = {
 # cross-referencing each city's ticker-code prefix/suffix across many
 # different opponents to resolve the New York I/R and Los Angeles K
 # disambiguation Kalshi encodes in the title, not the ticker.
+# Kalshi NHL ticker codes (verified 2026-10-20: all 32 split unambiguously across
+# 385 live/settled KXNHLGAME + KXNHLSAVE events) -> The Odds API team names.
+NHL_ABBR: Dict[str, str] = {
+    "ANA": "Anaheim Ducks",          "BOS": "Boston Bruins",
+    "BUF": "Buffalo Sabres",         "CGY": "Calgary Flames",
+    "CAR": "Carolina Hurricanes",    "CHI": "Chicago Blackhawks",
+    "COL": "Colorado Avalanche",     "CBJ": "Columbus Blue Jackets",
+    "DAL": "Dallas Stars",           "DET": "Detroit Red Wings",
+    "EDM": "Edmonton Oilers",        "FLA": "Florida Panthers",
+    "LA":  "Los Angeles Kings",      "MIN": "Minnesota Wild",
+    "MTL": "Montreal Canadiens",     "NSH": "Nashville Predators",
+    "NJ":  "New Jersey Devils",      "NYI": "New York Islanders",
+    "NYR": "New York Rangers",       "OTT": "Ottawa Senators",
+    "PHI": "Philadelphia Flyers",    "PIT": "Pittsburgh Penguins",
+    "SJ":  "San Jose Sharks",        "SEA": "Seattle Kraken",
+    "STL": "St Louis Blues",         "TB":  "Tampa Bay Lightning",
+    "TOR": "Toronto Maple Leafs",    "UTA": "Utah Mammoth",
+    "VAN": "Vancouver Canucks",      "VGK": "Vegas Golden Knights",
+    "WPG": "Winnipeg Jets",          "WSH": "Washington Capitals",
+}
+
 NFL_ABBR: Dict[str, str] = {
     "ARI": "Arizona Cardinals",      "ATL": "Atlanta Falcons",
     "BAL": "Baltimore Ravens",       "BUF": "Buffalo Bills",
@@ -2276,6 +2297,102 @@ def fit_neg_binom_two_point(
     return (mu_fit, r_fit)
 
 
+# ── Calibrated count-model rung pricing (added 2026-10-20, NHL goalie saves) ──
+# Problem: Pinnacle posts ONE line per player; Kalshi lists a rung (threshold)
+# that may sit 0-3 saves away. The mathematically sound bridge is to (1) de-vig
+# Pinnacle's over/under to the true P(over) at ITS line, (2) fit a count
+# distribution whose survival function passes exactly through that anchor, then
+# (3) read the Kalshi rung off the fitted distribution. Steps (1) and (3) each
+# carry model uncertainty, so instead of one point estimate this returns a
+# BAND over plausible specs and the edge is judged against the corner least
+# favorable to the bet ("robust edge": a bet must survive every plausible spec).
+#
+# Distribution: Negative Binomial, NOT Poisson. Measured on 4,955 NHL goalie
+# starts (2024-25 + 2025-26, NHL public API): saves have variance/mean ~2.0
+# (pooled NB r ~ 25), and a Poisson fit is 5-7pp too thin in BOTH tails -- the
+# same thin-tail failure that produced Total Bases' phantom edges. Anchored-NB
+# tail error vs. realized frequencies, rungs up to +/-9 from the anchor:
+# r=25 -> 0.9pp mean abs error, r=35 -> 0.9pp, Poisson -> 5.4pp. Fitted on one
+# season and scored on the other it stays ~1.3pp, so the r bracket is stable.
+# Sensitivity at a 50/50 anchor: pricing 1 rung away moves only 1.6pp between
+# r=15 and r=50, 2 rungs 3.2pp, 3 rungs 4.5pp -- hence the rung cap below.
+#
+# De-vig: proportional vs power differ <0.2pp near even odds but 0.8-1.0pp at
+# -165/+130 and beyond (favorite-longshot bias), so both are carried as corners.
+COUNT_MODEL_R = {
+    "player_total_saves": (20.0, 30.0, 45.0),   # (r_low, r_mid, r_high) -> wide/centre/narrow tails
+}
+COUNT_MODEL_MAX_RUNGS = 2          # refuse to price >2 rungs from the anchor
+COUNT_MODEL_MAX_BAND  = 0.06       # refuse if (hi - lo) fair band exceeds 6pp
+# Extra model-error margin applied to lo/hi on any EXTRAPOLATED rung. The r/de-vig
+# band alone missed 3 of 8 held-out cells (by 0.2-1.2pp) because realized rates
+# also carry sampling noise (~1pp at n~2,500) and season-to-season drift.
+# Judgment call, sized to the observed misses, not a fitted parameter.
+COUNT_MODEL_MARGIN    = 0.015
+
+
+def _nb_prob_over_line(mu: float, r: float, line: float) -> float:
+    """P(over `line`) for NB(mu, r), conditioned on no push (integer lines
+    redistribute the push mass, matching how books quote the no-vig over)."""
+    k = int(math.floor(line))
+    sf_k = 1.0 - neg_binom_cdf(k, mu, r)              # P(X > k)
+    if float(line).is_integer():
+        pmf_k = neg_binom_pmf(k, mu, r)
+        denom = 1.0 - pmf_k
+        return sf_k / denom if denom > 1e-12 else sf_k
+    return sf_k                                          # half-line: P(X >= k+1)
+
+
+def _nb_mu_for_anchor(line: float, over_prob: float, r: float) -> Optional[float]:
+    """mu such that NB(mu, r) reproduces P(over `line`) = over_prob."""
+    if not (0.03 < over_prob < 0.97):
+        return None
+    lo, hi = 0.05, max(line * 4 + 10, 40.0)
+    if _nb_prob_over_line(hi, r, line) < over_prob:
+        return None
+    for _ in range(60):
+        mid = (lo + hi) / 2
+        if _nb_prob_over_line(mid, r, line) < over_prob:
+            lo = mid
+        else:
+            hi = mid
+    return (lo + hi) / 2
+
+
+def count_model_fair_band(anchor_line: float, over_probs: Dict[str, float],
+                          kalshi_thresh: float, r_values: Tuple[float, float, float]
+                          ) -> Optional[Dict[str, float]]:
+    """P(stat >= Kalshi rung) from a calibrated NB anchored at the book's line.
+
+    over_probs: {devig_name: no-vig P(over anchor_line)} -- one entry per
+    plausible de-vig spec (e.g. proportional, power). r_values: (low, mid,
+    high) dispersion. Returns {"point", "lo", "hi", "rungs"}: point = mid r
+    averaged over de-vig specs; lo/hi = min/max over every (devig, r) corner.
+    None when any corner is unfittable or the rung is too far to price.
+    """
+    anchor_k = int(math.floor(anchor_line)) + 1        # smallest count that is "over"
+    rung_k   = int(math.floor(kalshi_thresh)) + 1      # Kalshi "k+" = P(X >= k)
+    rungs    = abs(rung_k - anchor_k)
+    if rungs > COUNT_MODEL_MAX_RUNGS:
+        return None
+    vals_all, vals_mid = [], []
+    for p in over_probs.values():
+        for r in r_values:
+            mu = _nb_mu_for_anchor(anchor_line, p, r)
+            if mu is None:
+                return None
+            v = 1.0 - neg_binom_cdf(rung_k - 1, mu, r)
+            vals_all.append(v)
+            if r == r_values[1]:
+                vals_mid.append(v)
+    lo, hi = min(vals_all), max(vals_all)
+    if hi - lo > COUNT_MODEL_MAX_BAND:
+        return None
+    if rungs > 0:
+        lo, hi = max(0.0, lo - COUNT_MODEL_MARGIN), min(1.0, hi + COUNT_MODEL_MARGIN)
+    return {"point": sum(vals_mid) / len(vals_mid), "lo": lo, "hi": hi, "rungs": rungs}
+
+
 def fair_spread_prob(threshold: float, mean_margin: float, std: float) -> float:
     return 1 - norm_cdf(threshold, mu=mean_margin, sigma=std)
 
@@ -3388,6 +3505,18 @@ NFL_PLAYER_PROP_MARKETS = (
     "player_pass_tds"
 )
 
+# NHL goalie saves (added 2026-10-20). Verified against Kalshi's live /series
+# list: the only NHL player-stat series are KXNHLSAVE (saves, ONE threshold per
+# goalie, listed ~11am PT on game day), KXNHLPTS/KXNHLAST (points/assists) and
+# goalscorer markets. There is NO shots-on-goal series on Kalshi at all (the
+# only "SOG"/"SHOT" series are soccer: UCL/World Cup), so SOG cannot be wired.
+# Priced via the calibrated Negative-Binomial count model (see
+# count_model_fair_band), never Poisson -- saves variance/mean ~2.0.
+NHL_PROP_SERIES: Dict[str, str] = {
+    "KXNHLSAVE": "player_total_saves",
+}
+NHL_PLAYER_PROP_MARKETS = "player_total_saves"
+
 
 def _norm_player(name: str) -> str:
     return re.sub(r"[^a-z]", "", _ascii_fold(name).lower())
@@ -3759,7 +3888,12 @@ def scan_player_props(
                     from datetime import timedelta as _tde
                     exp_dt_g = datetime.fromisoformat(exp_str.replace("Z", "+00:00"))
                     is_nba   = any(s in ev_ticker.upper() for s in ("NBA", "KXNBA"))
-                    game_dt  = exp_dt_g - _tde(hours=4.0 if is_nba else 3.5)
+                    # NHL: observed close_time ~2.8h after puck drop (2026-10-19 PIT@UTA),
+                    # so 3.5h would stop scanning ~45min early. 2.5h is safe because the
+                    # Odds API commence_time filter in build_all_player_props independently
+                    # drops any game that has actually started.
+                    is_nhl   = "NHL" in ev_ticker.upper()
+                    game_dt  = exp_dt_g - _tde(hours=4.0 if is_nba else (2.5 if is_nhl else 3.5))
                 except (ValueError, AttributeError):
                     pass
             if game_dt is not None and game_dt <= now_utc:
@@ -3922,7 +4056,11 @@ def scan_player_props(
             and prop_type in WNBA_EXTRAP_PROP_TYPES
             and abs(pin_line - kalshi_thresh) <= WNBA_EXTRAP_MAX_RUNGS
         )
-        if int(pin_line) != int(kalshi_thresh) and not _wnba_extrap:
+        # NHL saves: priced by the calibrated NB count model, which extrapolates a
+        # bounded number of rungs off the anchor (COUNT_MODEL_MAX_RUNGS) with an
+        # explicit uncertainty band -- see count_model_fair_band.
+        _count_model = (mkt_type_label == "nhl_prop" and prop_type in COUNT_MODEL_R)
+        if int(pin_line) != int(kalshi_thresh) and not _wnba_extrap and not _count_model:
             print(
                 f"  ✗ prop  {matched.get('player','?'):<25} REJECTED — line mismatch  "
                 f"pin={pin_line} (int={int(pin_line)})  kalshi_thresh={kalshi_thresh} (int={int(kalshi_thresh)})"
@@ -3930,7 +4068,7 @@ def scan_player_props(
             continue
         # Also catch any remaining large absolute differences (>0.6) as an extra
         # belt-and-suspenders guard in case a book uses full-integer lines.
-        if abs(pin_line - kalshi_thresh) > 0.6 and not _wnba_extrap:
+        if abs(pin_line - kalshi_thresh) > 0.6 and not _wnba_extrap and not _count_model:
             print(
                 f"  ✗ prop  {matched.get('player','?'):<25} REJECTED — abs line diff too large  "
                 f"pin={pin_line}  kalshi_thresh={kalshi_thresh}  diff={abs(pin_line - kalshi_thresh):.2f}"
@@ -3962,6 +4100,32 @@ def scan_player_props(
             fair_over = 1.0 - poisson_cdf(t_int, lam)
         fair_under = 1.0 - fair_over
 
+        # Conservative per-side fair values (default = the point estimate). For the
+        # NHL count model each side is judged against the corner of the
+        # (de-vig spec x dispersion) band LEAST favorable to that bet.
+        fair_over_y  = fair_over
+        fair_under_n = fair_under
+        _count_band  = None
+        if _count_model:
+            _ro = (matched.get("raw_odds") or {}).get("pinnacle")
+            _corners = {"anchor": matched["over_prob"]}
+            if _ro and _ro.get("over") is not None and _ro.get("under") is not None \
+                    and matched.get("fair_source", "exact") == "exact":
+                _corners = {"proportional": no_vig_prob(_ro["over"], _ro["under"])[0],
+                            "power":        power_devig_prob(_ro["over"], _ro["under"])[0]}
+            _count_band = count_model_fair_band(pin_line, _corners, threshold, COUNT_MODEL_R[prop_type])
+            if _count_band is None:
+                print(f"  ✗ prop  {matched.get('player','?'):<25} REJECTED — count model cannot price rung "
+                      f"pin={pin_line} → kalshi={threshold} (>{COUNT_MODEL_MAX_RUNGS} rungs, unfittable, or band >{COUNT_MODEL_MAX_BAND:.0%})")
+                continue
+            fair_over    = _count_band["point"]
+            fair_under   = 1.0 - fair_over
+            fair_over_y  = _count_band["lo"]
+            fair_under_n = 1.0 - _count_band["hi"]
+            if _count_band["rungs"] > 0:
+                print(f"  ↝ NHL count-model  {matched.get('player','?'):<25} pin={pin_line} → kalshi={threshold} "
+                      f"({_count_band['rungs']} rung(s))  fair={fair_over:.1%}  band=[{_count_band['lo']:.1%}, {_count_band['hi']:.1%}]")
+
         # ── TB-only: parallel Negative Binomial fair value (diagnostic) ─────
         # Computed alongside the live Poisson fair_over above but NEVER used
         # for fair/edge/raw_edge below -- those stay Poisson-only. Purely for
@@ -3983,7 +4147,24 @@ def scan_player_props(
         _per_book_lams = matched.get("per_book_lambdas", {})
         _retail_lams   = {b: l for b, l in _per_book_lams.items() if b != "pinnacle"}
         _prop_sanity_shadow = False
-        if "pinnacle" in _per_book_lams and _retail_lams:
+        if _count_model:
+            # Poisson per-book lambdas are the wrong shape for saves; compare the
+            # retail books' own de-vigged over at the SAME line, pushed through the
+            # same NB model, against the Pinnacle-anchored point fair value.
+            _nhl_retail = []
+            for _bk, _bp in (matched.get("books_detail") or {}).items():
+                if _bk == "pinnacle":
+                    continue
+                _rb = count_model_fair_band(pin_line, {"b": _bp}, threshold, COUNT_MODEL_R[prop_type])
+                if _rb is not None:
+                    _nhl_retail.append(_rb["point"])
+            if "pinnacle" in _per_book_lams and _nhl_retail:
+                _avg_retail = sum(_nhl_retail) / len(_nhl_retail)
+                if abs(fair_over - _avg_retail) > PROP_LAMBDA_SANITY_GAP:
+                    print(f"  ⚠ prop  {matched.get('player','?'):<25} SANITY SHADOW — NB fair={fair_over:.1%} "
+                          f"vs retail NB avg={_avg_retail:.1%}")
+                    _prop_sanity_shadow = True
+        elif "pinnacle" in _per_book_lams and _retail_lams:
             _retail_fairs = [1.0 - poisson_cdf(t_int, l) for l in _retail_lams.values()]
             _avg_retail   = sum(_retail_fairs) / len(_retail_fairs)
             _gap          = abs(fair_over - _avg_retail)
@@ -4000,11 +4181,11 @@ def scan_player_props(
                 _prop_sanity_shadow = True
 
         yes_bid, yes_ask = kp["yes_bid"], kp["yes_ask"]
-        yes_raw  = fair_over  - yes_ask
-        no_raw   = fair_under - (1.0 - yes_bid)
+        yes_raw  = fair_over_y  - yes_ask
+        no_raw   = fair_under_n - (1.0 - yes_bid)
 
-        yes_fee  = KALSHI_FEE_RATE * fair_over  * (1 - yes_ask)
-        no_fee   = KALSHI_FEE_RATE * fair_under * yes_bid
+        yes_fee  = KALSHI_FEE_RATE * fair_over_y  * (1 - yes_ask)
+        no_fee   = KALSHI_FEE_RATE * fair_under_n * yes_bid
         yes_adj  = (yes_raw - yes_fee) * (1 - EV_HAIRCUT)
         no_adj   = (no_raw  - no_fee)  * (1 - EV_HAIRCUT)
 
@@ -4073,10 +4254,10 @@ def scan_player_props(
             side, k_side, f_side, raw_edge, adj_edge = "NO",  1 - yes_bid, fair_under, no_raw,  no_adj
             nb_f_side = nb_fair_under
         elif yes_adj >= no_adj:
-            side, k_side, f_side, raw_edge, adj_edge = "YES", yes_ask,     fair_over,  yes_raw, yes_adj
+            side, k_side, f_side, raw_edge, adj_edge = "YES", yes_ask,     fair_over_y,  yes_raw, yes_adj
             nb_f_side = nb_fair_over
         else:
-            side, k_side, f_side, raw_edge, adj_edge = "NO",  1 - yes_bid, fair_under, no_raw,  no_adj
+            side, k_side, f_side, raw_edge, adj_edge = "NO",  1 - yes_bid, fair_under_n, no_raw,  no_adj
             nb_f_side = nb_fair_under
 
         # Price floor — same rule as game-line scanner
@@ -4091,6 +4272,18 @@ def scan_player_props(
 
         books_detail = matched.get("books_detail", {})
         prop_fair_source = matched.get("fair_source", "exact")
+        # NHL count model: books_detail holds each book's P(over) at the ANCHOR
+        # line, but the consensus check compares it to a Kalshi price at the
+        # RUNG. Push every book through the same NB model to the rung first, so
+        # the cross-check is like-for-like instead of rubber-stamping extrapolations.
+        if _count_model and _count_band and _count_band["rungs"] > 0:
+            _bd_rung = {}
+            for _bk, _bp in books_detail.items():
+                _rb = count_model_fair_band(pin_line, {"b": _bp}, threshold, COUNT_MODEL_R[prop_type])
+                if _rb is not None:
+                    _bd_rung[_bk] = _rb["point"]
+            if _bd_rung:
+                books_detail = _bd_rung
 
         # ── Book-consensus validation ─────────────────────────────────────
         consensus_valid, consensus_reason = _validate_book_consensus(
@@ -4137,6 +4330,7 @@ def scan_player_props(
             "books_used":           matched.get("books_used", []),
             "books_detail":         books_detail,
             "fair_source":          prop_fair_source,
+            "fair_band":            ({k: round(v, 4) for k, v in _count_band.items()} if _count_band else None),
             "per_book_novig":       prop_per_book,
             # De-vig study (2026-07-14): TB-ONLY per user directive — Strikeouts
             # left as-is (Shin ≈ proportional on K's centered lines, ~0.1pp, so
@@ -4206,6 +4400,23 @@ def scan_nba_player_props(lookahead_hours: float = 48.0) -> Tuple[List[dict], di
         mkt_type_label  = "nba_prop",
         parse_event_fn  = _parse_nba_event,
         lookahead_hours = lookahead_hours,
+    )
+
+
+def scan_nhl_player_props(lookahead_hours: float = 48.0) -> Tuple[List[dict], dict, int]:
+    """Scan Kalshi NHL goalie-saves markets (KXNHLSAVE). Priced by the calibrated
+    Negative-Binomial count model; DK/FanDuel/etc. fill in via the retail-consensus
+    fallback when Pinnacle posts no saves line."""
+    return scan_player_props(
+        odds_sport      = "icehockey_nhl",
+        abbr_map        = NHL_ABBR,
+        prop_series     = NHL_PROP_SERIES,
+        prop_markets    = NHL_PLAYER_PROP_MARKETS,
+        sport_label     = "NHL",
+        mkt_type_label  = "nhl_prop",
+        parse_event_fn  = _parse_nba_event,   # date-only tickers, same split logic
+        lookahead_hours = lookahead_hours,
+        retail_fallback_books = NFL_RETAIL_FALLBACK_BOOKS,
     )
 
 

@@ -135,6 +135,14 @@ def _all_games_commenced() -> bool:
     with _odds_cache_lock:
         return _last_odds_cache_success > 0 and _odds_game_count == 0
 
+# MLB master switch -- OFF 2026-10-20 (user call): World Series only, ~1-2
+# games/day, no edge found there; ~14.3k credits/mo (MLB Totals) + Outs
+# reallocated to NBA. Gates the Pinnacle totals refresh loop, the Outs props
+# scan, and the MLB scan_sport call. Code, settled records and open-bet
+# settlement/CLV capture (free, Kalshi-only) are untouched. Flip to True at
+# spring training (late Feb) -- nothing else needs restoring.
+MLB_SCANNING_ENABLED = False
+
 def _odds_refresh_interval() -> int:
     """Return seconds until next Pinnacle odds refresh (PDT context-aware schedule).
 
@@ -170,6 +178,8 @@ def _odds_refresh_interval() -> int:
       Sleep          (4/hr ×  8h × 2):    64/day
       Total odds: ~1,004/day  (less on any day the short-circuit fires early)
     """
+    if not MLB_SCANNING_ENABLED:
+        return 60 * 60       # Paused -- loop just idles; _run_odds_refresh no-ops
     h = _pdt_hour()
     if _all_games_commenced():
         return 15 * 60       # Slate over, or no games today at all — Sleep rate
@@ -234,16 +244,60 @@ WNBA_WINDOW_END_H   = 22   # 10pm PDT
 NBA_PROPS_ENABLED        = True
 NBA_WINDOW_START_H       = 9    # 9am PDT
 NBA_WINDOW_END_H         = 22   # 10pm PDT -- last tips ~7:30pm PDT
-NBA_PROPS_REFRESH_SECONDS = 30 * 60
+NBA_PROPS_REFRESH_SECONDS = 20 * 60   # base cadence once a game is inside the lookahead
+NBA_PROPS_NEAR_TIP_REFRESH_SECONDS = 10 * 60
+NBA_PROPS_NEAR_TIP_MINUTES = 90
 NBA_PROPS_LOOKAHEAD_HOURS = 6.0
+
+# 2026-10-20: MLB scanning switched off (see MLB_SCANNING_ENABLED), freeing
+# ~14k+ credits/mo, so NBA props cadence is now driven by REAL tip times
+# (ESPN's free scoreboard) instead of a fixed clock: 10min inside 90min of the
+# next tip -- where Kalshi lags Pinnacle on late injury/lineup news -- 20min
+# while a game is inside the 6h lookahead, and no scan at all when nothing
+# tips inside it (also skips the free Kalshi/Odds-events calls). UNVERIFIED:
+# the near-tip bump is a prior, not a measured finding; recheck CLV by
+# minutes-to-tip and credit_by_component after a couple of weeks.
+_nba_tip_cache: dict = {"ts": 0.0, "tips": None}
+
+def _nba_upcoming_tip_minutes() -> Optional[list]:
+    """Minutes until each not-yet-started NBA game on ESPN's current slate,
+    cached 10 min. None if ESPN is unreachable and nothing is cached."""
+    now = time.time()
+    if _nba_tip_cache["tips"] is not None and now - _nba_tip_cache["ts"] < 600:
+        tips = _nba_tip_cache["tips"]
+    else:
+        try:
+            import urllib.request as _ur
+            with _ur.urlopen("https://site.api.espn.com/apis/site/v2/sports/basketball/nba/scoreboard",
+                             timeout=5) as r:
+                data = json.loads(r.read())
+            tips = []
+            for ev in data.get("events", []):
+                if ((ev.get("status") or {}).get("type") or {}).get("state") != "pre":
+                    continue
+                tips.append(datetime.fromisoformat(ev["date"].replace("Z", "+00:00")))
+            _nba_tip_cache.update(ts=now, tips=tips)
+        except Exception:
+            if _nba_tip_cache["tips"] is None:
+                return None
+            tips = _nba_tip_cache["tips"]
+    nowdt = datetime.now(timezone.utc)
+    return [m for m in ((t - nowdt).total_seconds() / 60 for t in tips) if m > 0]
 
 def _nba_props_refresh_interval() -> int:
     if not NBA_PROPS_ENABLED:
         return 10 ** 9
     h = _pdt_hour()
-    if NBA_WINDOW_START_H <= h < NBA_WINDOW_END_H:
-        return NBA_PROPS_REFRESH_SECONDS
-    return 10 ** 9
+    if not (NBA_WINDOW_START_H <= h < NBA_WINDOW_END_H):
+        return 10 ** 9
+    mins = _nba_upcoming_tip_minutes()
+    if mins is None:
+        return NBA_PROPS_REFRESH_SECONDS          # ESPN down: fall back to base cadence
+    if not mins or min(mins) > NBA_PROPS_LOOKAHEAD_HOURS * 60:
+        return 10 ** 9                            # nothing tips inside the lookahead
+    if min(mins) <= NBA_PROPS_NEAR_TIP_MINUTES:
+        return NBA_PROPS_NEAR_TIP_REFRESH_SECONDS
+    return NBA_PROPS_REFRESH_SECONDS
 
 # ── WNBA scanning — paused 2026-07-14, GAME LINES resumed 2026-07-17 ─────────
 # Three days of live scanning (2026-07-10 to -13) found zero player-prop edges;
@@ -5294,6 +5348,8 @@ def _run_odds_refresh():
     """
     global _cached_mlb_index, _cached_nba_index, _last_odds_refresh, \
            _last_odds_cache_success, _odds_game_count
+    if not MLB_SCANNING_ENABLED:
+        return
     print(f"\n  ── Odds index refresh  {datetime.now().strftime('%H:%M:%S')} ──")
 
     try:
@@ -5426,7 +5482,7 @@ def _run_scan():
             nba_idx  = _cached_nba_index
             wnba_idx = _cached_wnba_index
 
-        if mlb_idx is None:
+        if mlb_idx is None and MLB_SCANNING_ENABLED:
             print("  Odds cache cold — skipping scan cycle (background refresh in progress)")
             with _lock:
                 _state["scanning"] = False
@@ -5440,17 +5496,22 @@ def _run_scan():
         # spread_series/ml_series dropped here to match rather than run scan
         # logic against an index that will never have anything for them. Pass
         # them back in (and flip the fetch flags) to restore either.
-        mlb, mlb_stats, mlb_snapshot = scan_sport(
-            label="MLB — Totals",
-            spread_series=None,
-            total_series="KXMLBTOTAL",
-            ml_series=None,
-            odds_sport="baseball_mlb",
-            abbr_map=MLB_ABBR,
-            spread_std=MLB_SPREAD_STD,
-            total_std=MLB_TOTAL_STD,
-            game_index=mlb_idx,
-        )
+        if MLB_SCANNING_ENABLED:
+            mlb, mlb_stats, mlb_snapshot = scan_sport(
+                label="MLB — Totals",
+                spread_series=None,
+                total_series="KXMLBTOTAL",
+                ml_series=None,
+                odds_sport="baseball_mlb",
+                abbr_map=MLB_ABBR,
+                spread_std=MLB_SPREAD_STD,
+                total_std=MLB_TOTAL_STD,
+                game_index=mlb_idx,
+            )
+        else:
+            # Never call scan_sport with an empty index -- its self-fetch
+            # fallback would spend credits on a live Pinnacle pull.
+            mlb, mlb_stats, mlb_snapshot = [], {}, {}
 
         # NBA faded permanently — credits reallocated to faster MLB scans
         nba = []
@@ -5468,7 +5529,9 @@ def _run_scan():
         # on K's props-scan gate, which only existed to serve K's cadence).
         global _last_outs_scan
         now_ts = time.time()
-        _outs_due = (now_ts - _last_outs_scan >= OUTS_REFRESH_SECONDS) and not _all_games_commenced()
+        _outs_due = (MLB_SCANNING_ENABLED
+                     and now_ts - _last_outs_scan >= OUTS_REFRESH_SECONDS
+                     and not _all_games_commenced())
         if _outs_due:
             try:
                 mlb_props, _fresh_prop_snap, _outs_credits = scan_player_props(

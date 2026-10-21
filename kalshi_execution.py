@@ -20,6 +20,23 @@ shared infra, not flagging logic.
 ║  first live order.                                                             ║
 ╚══════════════════════════════════════════════════════════════════════════════╝
 
+PORTED TO KALSHI'S V2 ORDER API 2026-10-20. The legacy POST /portfolio/orders now
+returns HTTP 410 (Gone) -- verified live -- so the original module could not have
+placed any order, and its fill check read legacy fields (filled_count /
+taker_fill_count) that the current order object no longer has (it would have logged
+every real fill as NO_FILL). V2 differences handled here:
+  * endpoint POST /portfolio/events/orders (quotes everything on the YES leg):
+      buy YES at p  -> side "bid", price p
+      buy NO  at q  -> side "ask", price 1-q   (== selling YES at 1-q; docs:
+                       outcome_side=no <-> book_side=ask)
+  * count is a fixed-point string; price a fixed-point dollar string; time_in_force
+    and self_trade_prevention_type are REQUIRED. We use immediate_or_cancel so the
+    flagged price is a hard limit and nothing ever rests on the book.
+  * fills are read from fill_count_fp / taker_fill_cost_dollars on
+    GET /portfolio/orders/{id} (status: resting | canceled | executed).
+Still INERT: nothing here was run live. Verify with ONE 1-contract order before trust
+(this port is checked only against the docs and unauthenticated route probes).
+
 Fulfils the 6-point spec:
   (1) acts only on bets where shadow is False (real positions);
   (2) pre-trade checks: absolute per-bet $ ceiling + optional daily $ ceiling +
@@ -87,6 +104,10 @@ MIN_CONTRACTS     = 1       # skip if Kelly size rounds to <1 contract
 FILL_POLL_TRIES   = 6       # times to poll order status before giving up
 FILL_POLL_SLEEP   = 1.0     # seconds between fill-status polls
 
+ORDERS_PATH       = "/portfolio/events/orders"      # Kalshi V2 create-order (legacy /portfolio/orders is 410 Gone)
+ORDER_TIF         = "immediate_or_cancel"           # flagged price is a hard limit; never rests on the book
+ORDER_STP         = "taker_at_cross"                # required by V2
+
 _DATA_DIR = os.environ.get("DATA_DIR", os.path.dirname(os.path.abspath(__file__)))
 EXECUTION_LOG_FILE = os.path.join(_DATA_DIR, "execution_log.jsonl")
 PENDING_FILE       = os.path.join(_DATA_DIR, "pending_orders.json")  # awaiting-approval queue
@@ -126,8 +147,10 @@ def fetch_bankroll_dollars() -> Optional[float]:
     Caps are computed against this — never against the paper bankroll."""
     try:
         code, data = kalshi_get_signed("/portfolio/balance")
+        if code == 200 and data.get("balance_dollars") not in (None, ""):
+            return round(float(data["balance_dollars"]), 2)
         if code == 200 and "balance" in data:
-            return round(data["balance"] / 100.0, 2)   # Kalshi returns cents
+            return round(data["balance"] / 100.0, 2)   # cents integer
     except Exception:
         pass
     return None
@@ -304,39 +327,81 @@ def _order_size(bet: dict, price: float) -> Tuple[int, float]:
     return count, round(count * price, 2)
 
 
+def _fp(x) -> float:
+    """Parse a Kalshi fixed-point string/number to float (None/'' -> 0.0)."""
+    try:
+        return float(x)
+    except (TypeError, ValueError):
+        return 0.0
+
+
 def _build_order_body(bet: dict, count: int, price: float, client_order_id: str) -> dict:
-    """Marketable LIMIT order at the flagged entry price (maker rests get taken
-    immediately at Kalshi per the maker-execution finding; taker fee is already
-    priced into the edge). VERIFY field names against current Kalshi API docs."""
-    side = "yes" if bet.get("side") == "YES" else "no"
-    price_cents = int(round(price * 100))
-    body = {
-        "ticker":          bet["ticker"],
-        "client_order_id": client_order_id,
-        "action":          "buy",
-        "side":            side,
-        "count":           count,
-        "type":            "limit",
+    """V2 order body. `price` is the BET-SIDE price per contract (what we pay: the
+    YES price for YES bets, the NO price for NO bets). The V2 endpoint quotes the
+    YES leg only, so a NO bet is expressed as an ASK at 1 - price. Immediate-or-
+    cancel at that limit: fills only at the flagged price or better, else nothing.
+    """
+    is_yes = bet.get("side") == "YES"
+    yes_price = price if is_yes else 1.0 - price
+    return {
+        "ticker":                     bet["ticker"],
+        "side":                       "bid" if is_yes else "ask",
+        "count":                      str(int(count)),
+        "price":                      f"{round(yes_price, 2):.2f}",
+        "time_in_force":              ORDER_TIF,
+        "self_trade_prevention_type": ORDER_STP,
+        "client_order_id":            client_order_id,
     }
-    body["yes_price" if side == "yes" else "no_price"] = price_cents
-    return body
 
 
-def verify_fill(order_id: str) -> Tuple[str, int]:
-    """Poll the order until terminal. Returns (status, filled_count). NEVER assume
-    a 200 on submit means filled — a resting/canceled order fills nothing."""
+def validate_order_body(body: dict, bet_side: str, bet_price: float, count: int) -> Tuple[bool, str]:
+    """Local sanity check of a V2 body BEFORE it could be sent: required fields,
+    sane numbers, and that the direction/price mapping matches the bet (a YES bet
+    must be a bid at its own price; a NO bet an ask at 1 - its price)."""
+    need = ("ticker", "side", "count", "price", "time_in_force", "self_trade_prevention_type")
+    missing = [k for k in need if not body.get(k)]
+    if missing:
+        return False, f"missing fields {missing}"
+    if body["side"] not in ("bid", "ask"):
+        return False, f"side must be bid/ask, got {body['side']!r}"
+    try:
+        n, px = int(body["count"]), float(body["price"])
+    except (TypeError, ValueError):
+        return False, "count/price not numeric"
+    if n != count or n < 1:
+        return False, f"count {body['count']} does not match sized count {count}"
+    if not (0.0 < px < 1.0):
+        return False, f"price {px} outside (0,1)"
+    want_side  = "bid" if bet_side == "YES" else "ask"
+    want_price = bet_price if bet_side == "YES" else 1.0 - bet_price
+    if body["side"] != want_side:
+        return False, f"{bet_side} bet must be {want_side}, got {body['side']}"
+    if abs(px - round(want_price, 2)) > 0.0051:
+        return False, f"price {px} != expected {round(want_price, 2)} for {bet_side} @ {bet_price}"
+    if body["time_in_force"] != "immediate_or_cancel":
+        return False, "time_in_force must stay immediate_or_cancel (no resting orders)"
+    return True, "ok"
+
+
+def verify_fill(order_id: str) -> Tuple[str, int, Optional[float]]:
+    """Poll the V2 order object until terminal. Returns (status, filled_count,
+    cost_dollars incl. fees or None). NEVER assume a 201 on submit means filled.
+    Fields per current docs: status (resting|canceled|executed), fill_count_fp,
+    taker_fill_cost_dollars, taker_fees_dollars."""
+    status, filled, cost = "unknown", 0, None
     for _ in range(FILL_POLL_TRIES):
         code, data = kalshi_get_signed(f"/portfolio/orders/{order_id}")
         order = data.get("order", data) if isinstance(data, dict) else {}
-        status = (order.get("status") or "").lower()
-        filled = int(order.get("filled_count") or order.get("taker_fill_count") or 0)
-        if status in ("executed", "filled") or (status == "canceled" and filled > 0):
-            return "filled" if filled > 0 else status, filled
-        if status in ("canceled", "expired", "rejected"):
-            return status, filled
+        status = (order.get("status") or "").lower() or status
+        filled = int(round(_fp(order.get("fill_count_fp"))))
+        if order.get("taker_fill_cost_dollars") not in (None, ""):
+            cost = round(_fp(order.get("taker_fill_cost_dollars")) + _fp(order.get("taker_fees_dollars")), 2)
+        # IOC orders are terminal immediately: fully filled -> executed; remainder
+        # cancelled (possibly after a partial fill) -> canceled.
+        if status in ("executed", "canceled"):
+            return status, filled, cost
         time.sleep(FILL_POLL_SLEEP)
-    # last read
-    return status or "unknown", filled
+    return status, filled, cost
 
 
 # ── Pre-trade checks (spec #2) ────────────────────────────────────────────────
@@ -388,9 +453,19 @@ def place_order_for_bet(bet: dict, bankroll: float, daily_committed: float) -> d
 
     client_order_id = f"exec-{bet_id}"[:64]   # deterministic → Kalshi dedups re-runs
 
+    body = _build_order_body(bet, count, price, client_order_id)
+    valid, why = validate_order_body(body, bet.get("side"), price, count)
+    if not valid:
+        rec = {**base, "outcome": "REJECTED_RISK", "order_body": body,
+               "detail": f"invalid order body: {why}"}
+        _log_attempt(rec)
+        _alert("Order body INVALID", f"`{bet.get('ticker')}` {bet.get('side')} - {why}", ok=False)
+        return rec
+
     if DRY_RUN:
-        rec = {**base, "outcome": "DRY_RUN", "client_order_id": client_order_id,
-               "detail": f"would BUY {count} {bet.get('side')} @ {int(price*100)}c (${cost:.2f})"}
+        rec = {**base, "outcome": "DRY_RUN", "client_order_id": client_order_id, "order_body": body,
+               "detail": f"would BUY {count} {bet.get('side')} @ {int(price*100)}c (${cost:.2f}) "
+                         f"via V2 {body['side']} @ {body['price']}"}
         _log_attempt(rec)
         return rec
 
@@ -417,7 +492,7 @@ def _submit_and_verify(bet: dict, count: int, price: float, cost: float,
     means filled — a resting/canceled order fills nothing."""
     body = _build_order_body(bet, count, price, client_order_id)
     try:
-        code, resp = kalshi_post("/portfolio/orders", body)
+        code, resp = kalshi_post(ORDERS_PATH, body)
     except Exception as exc:
         rec = {**base, "outcome": "SUBMIT_ERROR", "detail": f"POST raised: {exc}"}
         _log_attempt(rec)
@@ -431,14 +506,14 @@ def _submit_and_verify(bet: dict, count: int, price: float, cost: float,
         _alert("Order SUBMIT ERROR", f"`{bet.get('ticker')}` {bet.get('side')} — HTTP {code}", ok=False)
         return rec
 
-    order_id = (resp.get("order") or {}).get("order_id") or resp.get("order_id")
+    order_id = resp.get("order_id") or (resp.get("order") or {}).get("order_id")
 
     # The POST succeeded — an order is now LIVE on Kalshi. If the fill-check itself
     # errors (network), we must NOT let the exception escape: that would leave the
     # order placed but unlogged, and the next sweep would re-submit it. Record a
     # TERMINAL "unverified" outcome + alert so it's never re-tried and you reconcile.
     try:
-        status, filled = verify_fill(order_id) if order_id else ("unknown", 0)
+        status, filled, real_cost = verify_fill(order_id) if order_id else ("unknown", 0, None)
     except Exception as exc:
         rec = {**base, "outcome": "SUBMITTED_UNVERIFIED", "order_id": order_id,
                "detail": f"order POSTed but fill-check failed: {exc} — RECONCILE on Kalshi"}
@@ -447,11 +522,12 @@ def _submit_and_verify(bet: dict, count: int, price: float, cost: float,
                f"`{bet.get('ticker')}` {bet.get('side')} — order {order_id} placed but fill "
                f"unconfirmed ({exc}). Check Kalshi manually.", ok=False)
         return rec
-    filled_cost = round(filled * price, 2)
+    # Real cash committed (fill cost + fees) when Kalshi reports it, else the flagged price.
+    filled_cost = real_cost if real_cost is not None else round(filled * price, 2)
 
     if filled >= count and count > 0:
         rec = {**base, "outcome": "FILLED", "order_id": order_id, "filled": filled,
-               "cost_dollars": filled_cost, "detail": f"filled {filled}/{count} @ {int(price*100)}c"}
+               "cost_dollars": filled_cost, "detail": f"filled {filled}/{count} @ {int(price*100)}c flagged (cash ${filled_cost:.2f} incl. fees)"}
         _log_attempt(rec)
         _alert("FILLED", f"`{bet.get('ticker')}` {bet.get('side')} — {filled}/{count} @ "
                          f"{int(price*100)}c (${filled_cost:.2f})", ok=True)
@@ -464,7 +540,7 @@ def _submit_and_verify(bet: dict, count: int, price: float, cost: float,
                                f"(status={status})", ok=False)
     else:
         rec = {**base, "outcome": "NO_FILL", "order_id": order_id, "filled": 0,
-               "status": status, "detail": f"submitted but UNFILLED (status={status})"}
+               "cost_dollars": 0.0, "status": status, "detail": f"submitted but UNFILLED (status={status})"}
         _log_attempt(rec)
         _alert("NO FILL", f"`{bet.get('ticker')}` {bet.get('side')} — order {order_id} "
                           f"unfilled (status={status})", ok=False)
@@ -546,6 +622,48 @@ def execute_flagged_bets(bets: list, bankroll: Optional[float] = None) -> list:
     return results
 
 
+def simulate_order(bet: dict, stake: float) -> dict:
+    """Build + validate the V2 order that WOULD be sent for `bet` at `stake` dollars.
+    NO network, NO execution-log writes (so it can never affect daily totals or the
+    already-attempted guards), ignores the shadow flag on purpose -- it exists so a
+    flagged signal's exact payload can be inspected before anything is armed."""
+    price = float(bet.get("kalshi_price") or bet.get("kalshi") or 0.0)
+    count = int(stake // price) if price > 0 else 0
+    body = _build_order_body(bet, count, price, f"sim-{bet.get('id','')}"[:64])
+    ok, why = validate_order_body(body, bet.get("side"), price, count)
+    return {"ticker": bet.get("ticker"), "bet_side": bet.get("side"), "bet_price": price,
+            "count": count, "cost_dollars": round(count * price, 2),
+            "order_body": body, "valid": ok, "why": why}
+
+
+def _selftest() -> bool:
+    """Offline checks of the V2 mapping. Must all pass; includes cases that MUST be rejected."""
+    good = True
+    def check(name, cond):
+        nonlocal good
+        print(f"  [{'ok' if cond else 'FAIL'}] {name}")
+        good &= cond
+    yes = {"id": "t1", "ticker": "KXMLBKS-X-1", "side": "YES", "kalshi_price": 0.56}
+    no  = {"id": "t2", "ticker": "KXNBAAST-X-6", "side": "NO",  "kalshi_price": 0.45}
+    ry, rn = simulate_order(yes, 10.0), simulate_order(no, 10.0)
+    check("YES @56c -> bid @0.56", ry["order_body"]["side"] == "bid" and ry["order_body"]["price"] == "0.56" and ry["valid"])
+    check("NO  @45c -> ask @0.55 (sell-YES leg)", rn["order_body"]["side"] == "ask" and rn["order_body"]["price"] == "0.55" and rn["valid"])
+    check("count/price are fixed-point strings", isinstance(rn["order_body"]["count"], str) and isinstance(rn["order_body"]["price"], str))
+    check("IOC + STP present, no resting orders", rn["order_body"]["time_in_force"] == "immediate_or_cancel"
+          and rn["order_body"]["self_trade_prevention_type"] == "taker_at_cross")
+    check("$10 @45c sizes to 22 contracts", rn["count"] == 22 and abs(rn["cost_dollars"] - 9.9) < 1e-9)
+    bad = dict(rn["order_body"]); bad["side"] = "bid"
+    check("REJECTS a NO bet sent as a bid (wrong direction)", not validate_order_body(bad, "NO", 0.45, rn["count"])[0])
+    bad = dict(rn["order_body"]); bad["price"] = "0.45"
+    check("REJECTS a NO bet priced at 0.45 instead of 1-0.45", not validate_order_body(bad, "NO", 0.45, rn["count"])[0])
+    bad = dict(ry["order_body"]); bad["time_in_force"] = "good_till_canceled"
+    check("REJECTS a resting (GTC) order", not validate_order_body(bad, "YES", 0.56, ry["count"])[0])
+    bad = dict(ry["order_body"]); bad["count"] = "0"
+    check("REJECTS zero contracts", not validate_order_body(bad, "YES", 0.56, 0)[0])
+    check("module is inert by default", (not EXECUTION_ENABLED) and DRY_RUN)
+    return good
+
+
 def _print_config():
     print("kalshi_execution config:")
     print(f"  EXECUTION_ENABLED = {EXECUTION_ENABLED}  (kill switch; must be True to trade)")
@@ -554,6 +672,7 @@ def _print_config():
     print(f"  MARKET_ALLOWLIST  = {MARKET_ALLOWLIST}   LIVE_SIZE_FRACTION = {LIVE_SIZE_FRACTION}")
     print(f"  MAX_POSITION_DOLLARS = ${MAX_POSITION_DOLLARS:.0f}/bet   "
           f"MAX_DAILY_DOLLARS = {'off' if not MAX_DAILY_DOLLARS else '$'+format(MAX_DAILY_DOLLARS,'.0f')+'/day'}  (no %-of-funds cap)")
+    print(f"  order API = V2 {ORDERS_PATH}  ({ORDER_TIF}, NO bets quoted as YES-leg asks)")
     print(f"  log → {EXECUTION_LOG_FILE}")
     if EXECUTION_ENABLED and not DRY_RUN:
         mode = "APPROVAL-GATED" if APPROVAL_REQUIRED else "FULLY AUTONOMOUS"
@@ -573,9 +692,33 @@ if __name__ == "__main__":
     ap.add_argument("--reject", metavar="BET_ID", help="reject/remove one queued order")
     ap.add_argument("--process", action="store_true",
                     help="place APPROVED unexpired orders (live only) + expire stale ones")
+    ap.add_argument("--selftest", action="store_true", help="offline checks of the V2 order mapping (no network)")
+    ap.add_argument("--check-balance", action="store_true", help="read-only: signed GET of the account balance")
+    ap.add_argument("--simulate", metavar="TICKER_SUBSTR",
+                    help="build the V2 order for a flagged open bet from the live dashboard; sends NOTHING")
+    ap.add_argument("--stake", type=float, default=5.0, help="dollars to size --simulate with (default 5)")
     a = ap.parse_args()
 
-    if a.list_pending:
+    if a.selftest:
+        print("kalshi_execution V2 self-test (offline):")
+        raise SystemExit(0 if _selftest() else 1)
+    elif a.check_balance:
+        bal = fetch_bankroll_dollars()
+        print(f"balance: ${bal:.2f} (read-only signed GET /portfolio/balance)" if bal is not None
+              else "balance fetch FAILED (auth/network)")
+    elif a.simulate:
+        url = os.environ.get("EVSCANNER_URL", "https://evscanner-production.up.railway.app")
+        bets = requests.get(url + "/api/performance?since=2026-10-01", timeout=30).json().get("bets", [])
+        hit = [b for b in bets if b.get("status") == "open" and a.simulate.upper() in (b.get("ticker") or "").upper()]
+        if not hit:
+            print(f"no open bet matching {a.simulate!r}")
+        for b in hit[:3]:
+            r = simulate_order(b, a.stake)
+            print(json.dumps(r, indent=1))
+            print(f"  -> {'VALID' if r['valid'] else 'INVALID: ' + r['why']} | "
+                  f"{b.get('side')} @ {r['bet_price']:.2f} = V2 {r['order_body']['side']} @ {r['order_body']['price']} "
+                  f"x{r['count']} (${r['cost_dollars']:.2f}) | NOTHING WAS SENT")
+    elif a.list_pending:
         p = list_pending()
         if not p:
             print("no pending orders.")

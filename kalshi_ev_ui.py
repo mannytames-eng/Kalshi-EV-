@@ -2594,6 +2594,8 @@ def _lookup_box_stat(bet: dict):
     _tk = bet.get("ticker", "").upper()
     if _tk.startswith("KXWNBA"):
         return _lookup_wnba_box_stat(bet)
+    if _tk.startswith("KXNBA"):
+        return _lookup_nba_box_stat(bet)
     if _tk.startswith("KXNFL"):
         return _lookup_nfl_box_stat(bet)
     import re   # re is imported locally throughout this module, not globally
@@ -2763,6 +2765,8 @@ def _fetch_game_inning(bet: dict) -> Optional[str]:
     _tk = bet.get("ticker", "").upper()
     if _tk.startswith("KXWNBA"):
         return _fetch_wnba_quarter(bet)
+    if _tk.startswith("KXNBA"):
+        return _fetch_nba_quarter(bet)
     if _tk.startswith("KXNFL"):
         return _fetch_nfl_quarter(bet)
     import re
@@ -2921,6 +2925,165 @@ def _fetch_wnba_quarter(bet: dict) -> Optional[str]:
     """Live game state for a WNBA bet: 'Q3 5:24', 'Half', 'OT 2:00', 'Final',
     or None (pregame / unknown)."""
     ev = _wnba_event_for_ticker(bet.get("ticker", "").upper())
+    if not ev:
+        return None
+    if ev["state"] == "post":
+        return "Final"
+    if ev["state"] != "in":
+        return None
+    if "half" in (ev.get("detail") or "").lower():
+        return "Half"
+    p = ev.get("period")
+    if not p:
+        return None
+    lab = f"Q{p}" if p <= 4 else ("OT" if p == 5 else f"{p - 4}OT")
+    return f"{lab} {ev.get('clock') or ''}".strip()
+
+
+# ── NBA (ESPN) — final + live box stats and quarter/clock for player props ───
+# Added 2026-10-22: NBA props previously fell through to the MLB lookup and
+# returned nothing, so no NBA bet ever showed a live or final stat. Same ESPN
+# endpoints as the WNBA section above. Differences: all NBA codes are 3 letters
+# (ESPN uses GS/NO/NY/SA/UTAH/WSH where Kalshi uses GSW/NOP/NYK/SAS/UTA/WAS), and
+# the player is matched by TEAM + JERSEY NUMBER -- Kalshi's player code is
+# <TEAM><INITIAL><LASTNAME><JERSEY> (BOSJTATUM0 = Boston, J. Tatum, #0) -- so two
+# players with the same last name (e.g. the Williamses) can't be confused; a name
+# match is only the fallback. ESPN's 3PT column is "made-attempted" ("0-7").
+_NBA_K2ESPN = {"GSW": "GS", "NOP": "NO", "NYK": "NY", "SAS": "SA", "UTA": "UTAH", "WAS": "WSH"}
+_NBA_STAT_MAP = {
+    # Kalshi series -> (ESPN column, display label); PRA is PTS+REB+AST.
+    "KXNBAPTS": ("PTS", "PTS"),
+    "KXNBAREB": ("REB", "REB"),
+    "KXNBAAST": ("AST", "AST"),
+    "KXNBA3PT": ("3PT", "3PM"),
+    "KXNBAPRA": ("PRA", "PRA"),
+}
+_nba_sb_cache:  dict = {}   # "YYYYMMDD" -> (fetched_ts, events list) -- 60s TTL
+_nba_sum_cache: dict = {}   # ESPN event id -> (fetched_ts, summary json) -- 45s TTL
+
+
+def _nba_scoreboard(date_iso: str) -> list:
+    """ESPN NBA scoreboard for a YYYY-MM-DD (ET) date, cached 60s. Returns a list
+    of {id, away, home, start, state, period, clock, detail}; state is pre/in/post.
+    Serves the stale cache on fetch failure."""
+    key = date_iso.replace("-", "")
+    now = time.time()
+    hit = _nba_sb_cache.get(key)
+    if hit and now - hit[0] < 60:
+        return hit[1]
+    try:
+        import urllib.request as _ur
+        url = f"https://site.api.espn.com/apis/site/v2/sports/basketball/nba/scoreboard?dates={key}"
+        with _ur.urlopen(url, timeout=5) as r:
+            data = json.loads(r.read())
+        events = []
+        for ev in data.get("events", []):
+            comp   = (ev.get("competitions") or [{}])[0]
+            byside = {c.get("homeAway"): c for c in comp.get("competitors", [])}
+            a, h   = byside.get("away", {}), byside.get("home", {})
+            st = ev.get("status", {}) or {}
+            events.append({
+                "id":         ev.get("id"),
+                "away":       (a.get("team") or {}).get("abbreviation", ""),
+                "home":       (h.get("team") or {}).get("abbreviation", ""),
+                "away_score": a.get("score"),
+                "home_score": h.get("score"),
+                "start":      ev.get("date"),
+                "state":      (st.get("type") or {}).get("state", ""),
+                "period":     st.get("period"),
+                "clock":      st.get("displayClock"),
+                "detail":     (st.get("type") or {}).get("shortDetail", ""),
+            })
+    except Exception:
+        return hit[1] if hit else []
+    _nba_sb_cache[key] = (now, events)
+    return events
+
+
+def _nba_event_for_ticker(ticker: str) -> Optional[dict]:
+    """Match a Kalshi NBA ticker to its ESPN scoreboard event via the 6-letter
+    away+home segment (e.g. KXNBAAST-26OCT20BOSDET-... -> BOS @ DET)."""
+    import re
+    game_date = _parse_ticker_date(ticker)
+    m = re.search(r"KXNBA[A-Z0-9]*-\d{2}[A-Z]{3}\d{2}([A-Z]{6})-", ticker.upper())
+    if not game_date or not m:
+        return None
+    a, h = m.group(1)[:3], m.group(1)[3:]
+    ea, eh = _NBA_K2ESPN.get(a, a), _NBA_K2ESPN.get(h, h)
+    for ev in _nba_scoreboard(game_date):
+        if ev["away"] == ea and ev["home"] == eh:
+            return ev
+    return None
+
+
+def _lookup_nba_box_stat(bet: dict):
+    """NBA counterpart of _lookup_wnba_box_stat: (value:int, label:str) or None.
+    Works on live and final box scores (same ESPN summary endpoint)."""
+    import re, unicodedata
+    ticker = bet.get("ticker", "").upper()
+    spec = _NBA_STAT_MAP.get(ticker.split("-")[0])
+    if not spec:
+        return None
+    col, label = spec
+    ev = _nba_event_for_ticker(ticker)
+    if not ev or ev["state"] == "pre" or not ev.get("id"):
+        return None
+    pm = re.search(r"-([A-Z]+?)(\d+)-\d+$", ticker)      # player code + jersey + threshold
+    team_k = pm.group(1)[:3] if pm else ""
+    jersey = pm.group(2) if pm else ""
+    team_e = _NBA_K2ESPN.get(team_k, team_k)
+    def fold(x):
+        x = unicodedata.normalize("NFKD", x or "").encode("ascii", "ignore").decode().lower()
+        return re.sub(r"[^a-z0-9]", "", x)
+    name = re.sub(r"\s*\([^)]*\)\s*$", "", bet.get("matchup", "") or "")
+    try:
+        import urllib.request as _ur
+        now = time.time()
+        hit = _nba_sum_cache.get(ev["id"])
+        if hit and now - hit[0] < 45:
+            summ = hit[1]
+        else:
+            url = f"https://site.api.espn.com/apis/site/v2/sports/basketball/nba/summary?event={ev['id']}"
+            with _ur.urlopen(url, timeout=5) as r:
+                summ = json.loads(r.read())
+            _nba_sum_cache[ev["id"]] = (now, summ)
+        cands = []
+        for tb in (summ.get("boxscore", {}) or {}).get("players", []):
+            if team_e and (tb.get("team") or {}).get("abbreviation") != team_e:
+                continue
+            for grp in tb.get("statistics", []):
+                labels = grp.get("labels") or grp.get("names") or []
+                for ath in grp.get("athletes", []):
+                    cands.append(((ath.get("athlete") or {}), ath.get("stats") or [], labels))
+        pick = [c for c in cands if jersey and str(c[0].get("jersey")) == jersey]
+        if len(pick) != 1 and name:                       # fallback: name, then unique last name
+            full = [c for c in cands if fold(c[0].get("displayName")) == fold(name)]
+            last = fold(name.split()[-1]) if name.split() else ""
+            lastm = [c for c in cands if last and fold((c[0].get("displayName") or "").split()[-1]) == last]
+            pick = full if len(full) == 1 else (lastm if len(lastm) == 1 else [])
+        if len(pick) != 1:
+            return None
+        _, raw, labels = pick[0]
+        def cell(c):
+            if c not in labels or labels.index(c) >= len(raw):
+                return None
+            v = raw[labels.index(c)]
+            return None if v in ("", "--", None) else v        # DNP rows have empty stats
+        if col == "PRA":
+            parts = [cell("PTS"), cell("REB"), cell("AST")]
+            return (sum(int(x) for x in parts), label) if None not in parts else None
+        v = cell(col)
+        if v is None:
+            return None
+        return (int(str(v).split("-")[0]), label)         # "0-7" 3PT -> made = 0
+    except Exception:
+        return None
+
+
+def _fetch_nba_quarter(bet: dict) -> Optional[str]:
+    """Live game state for an NBA bet: 'Q3 5:24', 'Half', 'OT 2:00', 'Final', or
+    None (pregame / unknown)."""
+    ev = _nba_event_for_ticker(bet.get("ticker", "").upper())
     if not ev:
         return None
     if ev["state"] == "post":
@@ -7216,6 +7379,23 @@ function wnbaGameLogo(ticker) {
   return `<img src="https://a.espncdn.com/i/teamlogos/wnba/500/${slug}.png" onerror="this.style.display='none'" style="width:18px;height:18px;vertical-align:middle;margin-right:6px;object-fit:contain;">`;
 }
 
+// NBA player-prop logo (KXNBAPTS/REB/AST/3PT/PRA). Ticker has no time component
+// (KXNBAAST-26OCT20BOSDET-BOSJTATUM0-6); every NBA code is 3 letters and the
+// player segment starts with the player's team (BOS). ESPN's CDN slugs differ
+// from Kalshi's codes on 5 teams: GSW->gs, NOP->no, NYK->ny, SAS->sa, UTA->utah
+// (and WAS->wsh), same kind of mapping as the WNBA/NFL logos above.
+const _NBA_SLUG = {ATL:'atl',BKN:'bkn',BOS:'bos',CHA:'cha',CHI:'chi',CLE:'cle',DAL:'dal',DEN:'den',DET:'det',GSW:'gs',HOU:'hou',IND:'ind',LAC:'lac',LAL:'lal',MEM:'mem',MIA:'mia',MIL:'mil',MIN:'min',NOP:'no',NYK:'ny',OKC:'okc',ORL:'orl',PHI:'phi',PHX:'phx',POR:'por',SAC:'sac',SAS:'sa',TOR:'tor',UTA:'utah',WAS:'wsh'};
+function nbaLogo(ticker) {
+  if (!ticker) return '';
+  const m = ticker.match(/^KXNBA(?:PTS|REB|AST|3PT|PRA)-\d{2}[A-Z]{3}\d{2}([A-Z]{6})-([A-Z]+?)\d/);
+  if (!m) return '';
+  const away = m[1].slice(0, 3), home = m[1].slice(3), playerSeg = m[2];
+  const team = playerSeg.startsWith(away) ? away : (playerSeg.startsWith(home) ? home : null);
+  const slug = team && _NBA_SLUG[team];
+  if (!slug) return '';
+  return `<img src="https://a.espncdn.com/i/teamlogos/nba/500/${slug}.png" onerror="this.style.display='none'" style="width:18px;height:18px;vertical-align:middle;margin-right:6px;object-fit:contain;">`;
+}
+
 // NFL team code -> ESPN CDN slug. ESPN's own abbreviations differ from
 // Kalshi's/NFL_ABBR's on two teams: Jacksonville (JAC here, but ESPN's slug
 // is "jax") and Washington (WAS here, ESPN's slug is "wsh") — same kind of
@@ -7276,7 +7456,7 @@ function nflGameLogo(ticker) {
 // teamLogo(name) used by matchupHtml further below; JS would let the later
 // declaration win and silently break ticker-based logos.
 function sportLogo(ticker) {
-  return mlbLogo(ticker) || mlbGameLogo(ticker) || wnbaLogo(ticker) || wnbaGameLogo(ticker) || nflLogo(ticker) || nflGameLogo(ticker) || mlsLogo(ticker);
+  return mlbLogo(ticker) || mlbGameLogo(ticker) || wnbaLogo(ticker) || wnbaGameLogo(ticker) || nbaLogo(ticker) || nflLogo(ticker) || nflGameLogo(ticker) || mlsLogo(ticker);
 }
 
 // Edge color by strength: orange (weakest) → yellow → green → bright green (strongest)
@@ -8834,7 +9014,7 @@ function renderPerformance(d) {
         const fg = hit ? 'var(--green)' : 'var(--red)';
         const bg = hit ? 'rgba(63,185,80,0.12)' : 'rgba(248,81,73,0.12)';
         const bd = hit ? 'rgba(63,185,80,0.4)' : 'rgba(248,81,73,0.4)';
-        return `<div style="margin-top:4px;"><span title="Actual result for this player/game (official box score — MLB Stats API / ESPN for WNBA)" style="display:inline-block;font-size:11px;font-weight:700;color:${fg};background:${bg};border:1px solid ${bd};border-radius:4px;padding:1px 6px;letter-spacing:0.2px;">${b.actual_result}</span></div>`;
+        return `<div style="margin-top:4px;"><span title="Actual result for this player/game (official box score — MLB Stats API / ESPN for WNBA, NBA and NFL)" style="display:inline-block;font-size:11px;font-weight:700;color:${fg};background:${bg};border:1px solid ${bd};border-radius:4px;padding:1px 6px;letter-spacing:0.2px;">${b.actual_result}</span></div>`;
       })() : ''}</td>
       <td class="num">${kBet}</td>
       <td class="num">${kPnl}</td>

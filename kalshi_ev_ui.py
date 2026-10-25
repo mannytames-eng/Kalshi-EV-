@@ -3190,7 +3190,10 @@ def _lookup_nfl_box_stat(bet: dict):
     names like 'YDS' and 'TD'."""
     import re
     ticker  = bet.get("ticker", "").upper()
-    mapped  = next((v for pfx, v in _NFL_STAT_MAP.items() if ticker.startswith(pfx)), None)
+    # EXACT series match, not startswith: "KXNFLRECYDS-..." also starts with
+    # "KXNFLREC", and the first prefix hit used to win -- so every receiving-yards
+    # bet showed the receptions column (live stat "3 Rec" for a 70+ yards bet).
+    mapped  = _NFL_STAT_MAP.get(ticker.split("-")[0])
     matchup = bet.get("matchup", "")
     if not mapped or not matchup:
         return None
@@ -3198,7 +3201,12 @@ def _lookup_nfl_box_stat(bet: dict):
     ev = _nfl_event_for_ticker(ticker)
     if not ev or ev["state"] == "pre" or not ev.get("id"):
         return None
-    player_last = re.sub(r"\s*\([^)]*\)\s*$", "", matchup).split()[-1].lower()
+    # Strip a "(TEAM)" disambiguator AND a trailing Jr./Sr./II/III/IV, mirroring the
+    # ESPN-side strip below -- otherwise "Travis Etienne Jr." was matched on "jr."
+    # and every suffixed player silently got no live/final stat.
+    _mname = re.sub(r"\s*\([^)]*\)\s*$", "", matchup).strip()
+    _mname = re.sub(r"\s+(Sr\.?|Jr\.?|I{2,3}|IV)$", "", _mname)
+    player_last = _mname.split()[-1].lower()
     try:
         import urllib.request as _ur
         now = time.time()
@@ -4417,6 +4425,11 @@ def _get_performance(since: Optional[str] = None) -> dict:
         "KXNFLRECYDS":  "NFL Reception Yards",
         "KXNFLREC":     "NFL Receptions",
         "KXNFLPASSTDS": "NFL Pass TDs",
+        "KXNBAPTS":     "NBA Points",
+        "KXNBAREB":     "NBA Rebounds",
+        "KXNBAAST":     "NBA Assists",
+        "KXNBA3PT":     "NBA Threes",
+        "KXNBAPRA":     "NBA PRA",
     }
     _OUTS_WHOLE_INNING_LINES = (14.5, 17.5)
 
@@ -4426,9 +4439,11 @@ def _get_performance(since: Optional[str] = None) -> dict:
         if mtype == "nhl_prop":
             return "NHL Saves (Retail)" if b.get("fair_source") == "retail_consensus" else "NHL Saves"
         if mtype == "nba_prop":
+            _retail = b.get("fair_source") == "retail_consensus"
+            for prefix, label in _PROP_SERIES_LABELS.items():
+                if ticker.startswith(prefix):
+                    return f"{label} (Retail)" if _retail else label
             return "NBA Props"
-        if mtype == "wnba_prop":
-            return "WNBA Props"
         # Tennis: mkt_type is "atp_moneyline"/"wta_moneyline" (binary match-winner).
         if mtype == "atp_moneyline": return "ATP Moneyline"
         if mtype == "wta_moneyline": return "WTA Moneyline"
@@ -4498,6 +4513,8 @@ def _get_performance(since: Optional[str] = None) -> dict:
         # skip them here too so the by_type rows reconcile with the headline.
         if _is_correlated(b):
             continue
+        if _infer_mkt_type(b) == "wnba_prop":
+            continue   # WNBA props removed from the Market Type section (2026-10-25, user call); bets stay in the record
         is_shad = _is_shadow_bet(b)
         # Shadow bets get their OWN "(shadow)" row and accumulate HYPOTHETICAL units
         # and Kelly P&L exactly like live rows — so their results/P&L/units show up
@@ -8765,8 +8782,8 @@ function renderPerformance(d) {
     </p>`;
 
   // By-type breakdown table
-  const PROP_LABELS = new Set(['Strikeouts (K)', 'Hits', 'Total Bases', 'RBIs', 'MLB Props', 'NBA Props', 'NHL Saves', 'NHL Saves (Retail)', 'WNBA Props', 'NFL Pass Yards', 'NFL Rush Yards', 'NFL Reception Yards', 'NFL Receptions', 'NFL Pass TDs', 'NFL Pass Yards (Retail)', 'NFL Rush Yards (Retail)', 'NFL Reception Yards (Retail)', 'NFL Receptions (Retail)', 'NFL Pass TDs (Retail)']);
-  const TYPE_ORDER  = ['MLB Total', 'MLB Spread', 'Strikeouts (K)', 'Pitcher Outs (Whole-Inning)', 'Pitcher Outs (Other Lines)', 'Hits', 'Total Bases', 'RBIs', 'MLB Props', 'NBA Props', 'NHL Saves', 'NHL Saves (Retail)', 'WNBA Total', 'WNBA Spread', 'WNBA Props', 'NFL Moneyline', 'NFL Spread', 'NFL Total', 'NFL Pass Yards', 'NFL Rush Yards', 'NFL Reception Yards', 'NFL Receptions', 'NFL Pass TDs', 'NCAAF Moneyline', 'NCAAF Spread', 'NCAAF Total', 'La Liga Moneyline', 'La Liga Total', 'La Liga BTTS', 'La Liga Corners', 'EPL Moneyline', 'EPL Total', 'EPL BTTS', 'EPL Corners', 'MLS Moneyline', 'MLS Total', 'MLS BTTS', 'Argentina Moneyline', 'Argentina Total', 'Argentina BTTS', 'Brazil Moneyline', 'Brazil Total', 'Brazil BTTS', 'Liga MX Moneyline', 'Liga MX Total', 'Liga MX BTTS', 'Brazil B Moneyline', 'Brazil B Total', 'Brazil B BTTS', 'Sudamericana Moneyline', 'Sudamericana Total', 'Sudamericana BTTS', 'Chile Moneyline', 'Chile Total', 'Chile BTTS', 'ATP Moneyline', 'WTA Moneyline', 'NFL Pass Yards (Retail)', 'NFL Rush Yards (Retail)', 'NFL Reception Yards (Retail)', 'NFL Receptions (Retail)', 'NFL Pass TDs (Retail)'];
+  const PROP_LABELS = new Set(['Strikeouts (K)', 'Hits', 'Total Bases', 'RBIs', 'MLB Props', 'NBA Points', 'NBA Rebounds', 'NBA Assists', 'NBA Threes', 'NBA PRA', 'NHL Saves', 'NHL Saves (Retail)', 'NFL Pass Yards', 'NFL Rush Yards', 'NFL Reception Yards', 'NFL Receptions', 'NFL Pass TDs', 'NFL Pass Yards (Retail)', 'NFL Rush Yards (Retail)', 'NFL Reception Yards (Retail)', 'NFL Receptions (Retail)', 'NFL Pass TDs (Retail)']);
+  const TYPE_ORDER  = ['MLB Total', 'MLB Spread', 'Strikeouts (K)', 'Pitcher Outs (Whole-Inning)', 'Pitcher Outs (Other Lines)', 'Hits', 'Total Bases', 'RBIs', 'MLB Props', 'NBA Points', 'NBA Rebounds', 'NBA Assists', 'NBA Threes', 'NBA PRA', 'NHL Saves', 'NHL Saves (Retail)', 'WNBA Total', 'WNBA Spread', 'NFL Moneyline', 'NFL Spread', 'NFL Total', 'NFL Pass Yards', 'NFL Rush Yards', 'NFL Reception Yards', 'NFL Receptions', 'NFL Pass TDs', 'NCAAF Moneyline', 'NCAAF Spread', 'NCAAF Total', 'La Liga Moneyline', 'La Liga Total', 'La Liga BTTS', 'La Liga Corners', 'EPL Moneyline', 'EPL Total', 'EPL BTTS', 'EPL Corners', 'MLS Moneyline', 'MLS Total', 'MLS BTTS', 'Argentina Moneyline', 'Argentina Total', 'Argentina BTTS', 'Brazil Moneyline', 'Brazil Total', 'Brazil BTTS', 'Liga MX Moneyline', 'Liga MX Total', 'Liga MX BTTS', 'Brazil B Moneyline', 'Brazil B Total', 'Brazil B BTTS', 'Sudamericana Moneyline', 'Sudamericana Total', 'Sudamericana BTTS', 'Chile Moneyline', 'Chile Total', 'Chile BTTS', 'ATP Moneyline', 'WTA Moneyline', 'NFL Pass Yards (Retail)', 'NFL Rush Yards (Retail)', 'NFL Reception Yards (Retail)', 'NFL Receptions (Retail)', 'NFL Pass TDs (Retail)'];
   // Markets no longer scanned — settled record frozen & still shown, but tagged
   // so it's clear no new bets are being placed. Total Bases terminated 2026-07-23.
   const TERMINATED_LABELS = new Set(['Total Bases']);
@@ -9968,10 +9985,17 @@ def _backfill_actual_results():
     import time as _t
     _t.sleep(15)   # let startup settle before hitting the MLB Stats API
     with _bets_lock:
+        # Also re-check receiving-yards bets stored with the receptions label
+        # ("2 Rec"): the NFL series-prefix bug (fixed 2026-10-23) wrote the wrong
+        # stat. Display-only annotation -- stake/classification/P&L untouched.
+        def _wrong_nfl_recyds(b):
+            ar = b.get("actual_result") or ""
+            return (b.get("ticker", "").upper().startswith("KXNFLRECYDS")
+                    and ar != "" and not ar.endswith("Rec Yds"))
         todo = [b for b in _bets
                 if b.get("status") in ("won", "lost")
                 and _wants_actual_result(b)
-                and not b.get("actual_result")
+                and (not b.get("actual_result") or _wrong_nfl_recyds(b))
                 and not b.get("ticker", "").upper().startswith("KXMLBHR")]
     if not todo:
         return

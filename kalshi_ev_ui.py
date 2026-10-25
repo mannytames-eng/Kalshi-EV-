@@ -71,7 +71,7 @@ from kalshi_ev_scanner import (
     NFL_SPREAD_STD, NFL_TOTAL_STD,
     NCAAF_SPREAD_STD, NCAAF_TOTAL_STD, NCAAF_ABBR,
     NFL_RETAIL_FALLBACK_BOOKS,
-    MLB_ABBR, NBA_ABBR, WNBA_ABBR, NFL_ABBR,
+    MLB_ABBR, NBA_ABBR, WNBA_ABBR, NFL_ABBR, NHL_ABBR,
     NFL_PROP_SERIES, NFL_PLAYER_PROP_MARKETS,
     _parse_nfl_event,
     EDGE_THRESHOLD,
@@ -2596,6 +2596,8 @@ def _lookup_box_stat(bet: dict):
         return _lookup_wnba_box_stat(bet)
     if _tk.startswith("KXNBA"):
         return _lookup_nba_box_stat(bet)
+    if _tk.startswith("KXNHL"):
+        return _lookup_nhl_box_stat(bet)
     if _tk.startswith("KXNFL"):
         return _lookup_nfl_box_stat(bet)
     import re   # re is imported locally throughout this module, not globally
@@ -2725,7 +2727,7 @@ def _wants_actual_result(b: dict) -> bool:
     player props (incl. Pitcher Outs, mkt_type='prop'), WNBA Totals games, and
     MLB Totals games (mkt_type='total' for both -- ticker prefix is the only
     way to tell them apart)."""
-    return (b.get("mkt_type") in ("prop", "wnba_prop", "nba_prop")
+    return (b.get("mkt_type") in ("prop", "wnba_prop", "nba_prop", "nhl_prop")
             or b.get("ticker", "").upper().startswith(("KXWNBATOTAL", "KXMLBTOTAL")))
 
 
@@ -2767,6 +2769,8 @@ def _fetch_game_inning(bet: dict) -> Optional[str]:
         return _fetch_wnba_quarter(bet)
     if _tk.startswith("KXNBA"):
         return _fetch_nba_quarter(bet)
+    if _tk.startswith("KXNHL"):
+        return _fetch_nhl_period(bet)
     if _tk.startswith("KXNFL"):
         return _fetch_nfl_quarter(bet)
     import re
@@ -3099,6 +3103,141 @@ def _fetch_nba_quarter(bet: dict) -> Optional[str]:
     return f"{lab} {ev.get('clock') or ''}".strip()
 
 
+# ── NHL (ESPN) — final + live goalie saves for KXNHLSAVE ─────────────────────
+# Added 2026-10-25 (same shape as the NBA section above). ESPN's NHL
+# abbreviations are identical to Kalshi's for all 32 teams, so no code map is
+# needed. Kalshi's goalie code is <TEAM><INITIAL><LASTNAME><JERSEY> (UTASCOSSA33 =
+# Utah, S. Cossa, #33); the goalie is matched by team + jersey, name as fallback.
+_NHL_STAT_MAP = {"KXNHLSAVE": ("SV", "Saves")}
+_nhl_sb_cache:  dict = {}
+_nhl_sum_cache: dict = {}
+
+
+def _nhl_scoreboard(date_iso: str) -> list:
+    key = date_iso.replace("-", "")
+    now = time.time()
+    hit = _nhl_sb_cache.get(key)
+    if hit and now - hit[0] < 60:
+        return hit[1]
+    try:
+        import urllib.request as _ur
+        url = f"https://site.api.espn.com/apis/site/v2/sports/hockey/nhl/scoreboard?dates={key}"
+        with _ur.urlopen(url, timeout=5) as r:
+            data = json.loads(r.read())
+        events = []
+        for ev in data.get("events", []):
+            comp   = (ev.get("competitions") or [{}])[0]
+            byside = {c.get("homeAway"): c for c in comp.get("competitors", [])}
+            a, h   = byside.get("away", {}), byside.get("home", {})
+            st = ev.get("status", {}) or {}
+            events.append({
+                "id":     ev.get("id"),
+                "away":   (a.get("team") or {}).get("abbreviation", ""),
+                "home":   (h.get("team") or {}).get("abbreviation", ""),
+                "state":  (st.get("type") or {}).get("state", ""),
+                "period": st.get("period"),
+                "clock":  st.get("displayClock"),
+                "detail": (st.get("type") or {}).get("shortDetail", ""),
+            })
+    except Exception:
+        return hit[1] if hit else []
+    _nhl_sb_cache[key] = (now, events)
+    return events
+
+
+def _nhl_event_for_ticker(ticker: str) -> Optional[dict]:
+    """Match a Kalshi NHL ticker (KXNHLSAVE-26OCT19PITUTA-...) to its ESPN game."""
+    import re
+    game_date = _parse_ticker_date(ticker)
+    m = re.search(r"KXNHL[A-Z0-9]*-\d{2}[A-Z]{3}\d{2}([A-Z]+)-", ticker.upper())
+    if not game_date or not m:
+        return None
+    seg = m.group(1)
+    for n in (3, 2):                       # codes are 2-3 letters (LA, NJ, SJ, TB vs PIT, UTA ...)
+        a, h = seg[:n], seg[n:]
+        if a in NHL_ABBR and h in NHL_ABBR:
+            for ev in _nhl_scoreboard(game_date):
+                if ev["away"] == a and ev["home"] == h:
+                    return ev
+    return None
+
+
+def _lookup_nhl_box_stat(bet: dict):
+    """(saves:int, 'Saves') for a KXNHLSAVE bet, or None. Works live and final."""
+    import re, unicodedata
+    ticker = bet.get("ticker", "").upper()
+    spec = _NHL_STAT_MAP.get(ticker.split("-")[0])
+    if not spec:
+        return None
+    col, label = spec
+    ev = _nhl_event_for_ticker(ticker)
+    if not ev or ev["state"] == "pre" or not ev.get("id"):
+        return None
+    pm = re.search(r"-([A-Z]+?)(\d+)-\d+$", ticker)
+    if not pm:
+        return None
+    code_part, jersey = pm.group(1), pm.group(2)
+    teams = [t for t in (ev["away"], ev["home"]) if code_part.startswith(t)]
+    team_e = max(teams, key=len) if teams else ""
+    def fold(x):
+        x = unicodedata.normalize("NFKD", x or "").encode("ascii", "ignore").decode().lower()
+        return re.sub(r"[^a-z0-9]", "", x)
+    name = re.sub(r"\s*\([^)]*\)\s*$", "", bet.get("matchup", "") or "")
+    try:
+        import urllib.request as _ur
+        now = time.time()
+        hit = _nhl_sum_cache.get(ev["id"])
+        if hit and now - hit[0] < 45:
+            summ = hit[1]
+        else:
+            url = f"https://site.api.espn.com/apis/site/v2/sports/hockey/nhl/summary?event={ev['id']}"
+            with _ur.urlopen(url, timeout=5) as r:
+                summ = json.loads(r.read())
+            _nhl_sum_cache[ev["id"]] = (now, summ)
+        cands = []
+        for tb in (summ.get("boxscore", {}) or {}).get("players", []):
+            if team_e and (tb.get("team") or {}).get("abbreviation") != team_e:
+                continue
+            for grp in tb.get("statistics", []):
+                if grp.get("name") != "goalies":
+                    continue
+                labels = grp.get("labels") or []
+                for ath in grp.get("athletes", []):
+                    cands.append(((ath.get("athlete") or {}), ath.get("stats") or [], labels))
+        pick = [c for c in cands if jersey and str(c[0].get("jersey")) == jersey]
+        if len(pick) != 1 and name:
+            full = [c for c in cands if fold(c[0].get("displayName")) == fold(name)]
+            last = fold(name.split()[-1]) if name.split() else ""
+            lastm = [c for c in cands if last and fold((c[0].get("displayName") or "").split()[-1]) == last]
+            pick = full if len(full) == 1 else (lastm if len(lastm) == 1 else [])
+        if len(pick) != 1:
+            return None
+        _, raw, labels = pick[0]
+        if col not in labels or labels.index(col) >= len(raw) or raw[labels.index(col)] in ("", "--", None):
+            return None
+        return (int(float(raw[labels.index(col)])), label)
+    except Exception:
+        return None
+
+
+def _fetch_nhl_period(bet: dict) -> Optional[str]:
+    """Live state for an NHL bet: 'P2 5:10', 'INT', 'OT 3:00', 'SO', 'Final', or None."""
+    ev = _nhl_event_for_ticker(bet.get("ticker", "").upper())
+    if not ev:
+        return None
+    if ev["state"] == "post":
+        return "Final"
+    if ev["state"] != "in":
+        return None
+    if "end of" in (ev.get("detail") or "").lower() or "intermission" in (ev.get("detail") or "").lower():
+        return "INT"
+    p = ev.get("period")
+    if not p:
+        return None
+    lab = f"P{p}" if p <= 3 else ("OT" if p == 4 else "SO")
+    return f"{lab} {ev.get('clock') or ''}".strip()
+
+
 # ── NFL (ESPN) — live box stats + quarter/clock for player props ─────────────
 # Same plumbing as the WNBA section above, adapted for football's boxscore
 # shape: ESPN splits player stats into named groups (passing/rushing/
@@ -3239,6 +3378,18 @@ def _lookup_nfl_box_stat(bet: dict):
                             return (int(float(raw[idx])), display_label)
                         except ValueError:
                             return None
+        # No row in this stat table. ESPN lists only players who recorded something
+        # in the group (a back with no targets isn't in the receiving table), so a
+        # player who appears in ANY other table clearly played and the stat is 0.
+        # Found 2026-10-25: Kenny Gainwell 3+ rec showed no result -- 14 carries, 0 targets.
+        first_init = _mname[:1].lower()
+        for team in (summ.get("boxscore", {}) or {}).get("players", []):
+            for stat in team.get("statistics", []):
+                for ath in stat.get("athletes", []):
+                    nm = (ath.get("athlete") or {}).get("displayName", "")
+                    toks = re.sub(r"\s+(Sr\.?|Jr\.?|I{2,3}|IV)$", "", nm).split()
+                    if toks and toks[-1].lower() == player_last and nm[:1].lower() == first_init:
+                        return (0, display_label)
     except Exception:
         pass
     return None
@@ -4586,6 +4737,18 @@ def _get_performance(since: Optional[str] = None) -> dict:
             "shadow":            d.get("shadow", False),
         })
     type_breakdown.sort(key=lambda x: -(x["won"] + x["lost"]))
+    # Always list every NBA market in the Market Type section, even before it has a
+    # settled bet -- a market with no bets has no row otherwise, so e.g. NBA PRA never
+    # appeared (2026-10-25, user request). NBA is shadow, so placeholders are shadow rows.
+    _have_labels = {t["label"] for t in type_breakdown}
+    for _lab in ("NBA Points", "NBA Rebounds", "NBA Assists", "NBA Threes", "NBA PRA"):
+        if _lab not in _have_labels and (_lab + " (shadow)") not in _have_labels:
+            type_breakdown.append({
+                "label": _lab + " (shadow)", "won": 0, "lost": 0, "win_rate": None,
+                "expected_win_rate": None, "kelly_pct": None, "kelly_dollars": None,
+                "avg_clv": None, "avg_pin_drift": None, "total_units": None,
+                "insufficient_data": True, "sample_size": 0, "shadow": True,
+            })
 
     # Total Kelly P&L as % of bankroll
     total_kelly_pct = round(sum(kelly_pnls) * 100, 3) if kelly_pnls else None

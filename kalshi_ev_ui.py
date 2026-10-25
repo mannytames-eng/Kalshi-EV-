@@ -8952,7 +8952,10 @@ function renderPerformance(d) {
   const TERMINATED_LABELS = new Set(['Total Bases']);
   if (d.by_type && d.by_type.length) {
     const sorted = [...d.by_type].sort((a, b) => {
-      const ai = TYPE_ORDER.indexOf(a.label); const bi = TYPE_ORDER.indexOf(b.label);
+      // NBA shadow rows ("NBA Points (shadow)") sort by their base label so they sit
+      // with the other NBA/prop rows instead of falling to the bottom (-1 -> 99).
+      const _ord = l => TYPE_ORDER.indexOf(/^NBA /.test(l) ? l.replace(' (shadow)', '') : l);
+      const ai = _ord(a.label); const bi = _ord(b.label);
       return (ai === -1 ? 99 : ai) - (bi === -1 ? 99 : bi);
     });
     const rowHtml = t => {
@@ -9002,8 +9005,12 @@ function renderPerformance(d) {
     // La Liga/EPL Corners, etc.) and crowding out the live breakdown that
     // actually matters. Collapsed by default; count shown in the summary so
     // it's still obvious how many are tucked away.
-    const liveTypes   = sorted.filter(t => t.shadow !== true);
-    const shadowTypes = sorted.filter(t => t.shadow === true);
+    // NBA is still shadow ($0 stake) but is the market under active evaluation, so its
+    // rows stay in the main table (they keep the SHADOW badge + hypothetical numbers)
+    // instead of hiding in the collapsed section with the other shadow markets.
+    const _pinnedShadow = t => t.shadow === true && /^NBA (Points|Rebounds|Assists|Threes|PRA)/.test(t.label);
+    const liveTypes   = sorted.filter(t => t.shadow !== true || _pinnedShadow(t));
+    const shadowTypes = sorted.filter(t => t.shadow === true && !_pinnedShadow(t));
     const theadHtml = `<thead><tr>
           <th>Market Type</th><th class="num">Won</th><th class="num">Lost</th>
           <th class="num">Win Rate</th>

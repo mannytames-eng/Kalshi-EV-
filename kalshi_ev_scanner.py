@@ -27,6 +27,7 @@ import os
 import re
 import time
 import unicodedata
+from functools import lru_cache
 from datetime import datetime, timezone, timedelta
 from typing import Dict, List, Optional, Tuple
 
@@ -2322,7 +2323,82 @@ def fit_neg_binom_two_point(
 COUNT_MODEL_R = {
     "player_total_saves": (20.0, 30.0, 45.0),   # (r_low, r_mid, r_high) -> wide/centre/narrow tails
 }
-COUNT_MODEL_MAX_RUNGS = 2          # refuse to price >2 rungs from the anchor
+COUNT_MODEL_MAX_RUNGS = 2          # default: refuse to price >2 counts from the anchor
+# Per-stat override of the distance limit, in COUNTS from the anchor. Stats with a
+# bigger scale (NBA points ~ sd 6) can be priced further away than saves/threes before
+# the model error matters; the band check below still rejects anything too wide.
+COUNT_MODEL_MAX_RUNGS_BY_TYPE: dict = {"player_total_saves": 2}
+
+# ── NBA player props (calibrated 2026-10-26) ─────────────────────────────────
+# Measured on 53,084 NBA player-games (every 2024-25 and 2025-26 regular-season game,
+# ESPN box scores), anchored exactly as the scanner does it (distribution pinned to the
+# line's own probability, other rungs read off it), fitted on one season and scored on
+# the other. A Poisson model is badly wrong for points/PRA (7-10pp mean rung error; the
+# variance is 3-6x the mean) and mildly wrong for REB/AST/3PM (1-2pp); the Negative
+# Binomial brings every stat to 0.2-2.2pp out of sample. Relative dispersion depends on
+# player size (a 25-point scorer is far less dispersed, relatively, than a 6-point role
+# player), so r is looked up by the line. Each tuple is (r_low, r_mid, r_high) =
+# (mid/1.5, mid, mid*1.5), the same wide/centre/narrow bracket used for NHL saves.
+# Bucket edges are on the anchor line (~ the player's mean).
+_NBA_R_BY_LINE = {
+    "player_points":                  ([9, 14, 20],   [(1.5, 2.5, 3.5), (3.5, 5, 7.5), (7, 10, 15), (13, 19, 29)]),
+    "player_rebounds":                ([3, 5, 7.5],   [(4, 5.5, 8), (7, 10, 15), (9, 13, 20), (15, 22, 33)]),
+    "player_assists":                 ([2, 3.5, 5.5], [(4, 6, 9), (4.5, 7, 10), (9, 13, 20), (15, 23, 34)]),
+    "player_threes":                  ([1, 1.8, 2.6], [(1.5, 2.5, 3.5), (4, 5.5, 8), (9, 13, 20), (18, 28, 41)]),
+    "player_points_rebounds_assists": ([15, 22, 30],  [(2.7, 4, 6), (4.5, 7, 10), (10, 15, 22), (20, 30, 45)]),
+}
+
+
+def _nba_r_for_line(prop_type: str):
+    edges, table = _NBA_R_BY_LINE[prop_type]
+    def pick(anchor_line: float):
+        for i, e in enumerate(edges):
+            if anchor_line < e:
+                return table[i]
+        return table[-1]
+    return pick
+
+
+for _pt in _NBA_R_BY_LINE:
+    COUNT_MODEL_R[_pt] = _nba_r_for_line(_pt)
+# Distance limits in counts from the line: Kalshi spaces points/PRA ladders ~5 apart and
+# REB/AST/3PM 1-2 apart. The band check (6pp) still rejects anything too uncertain.
+COUNT_MODEL_MAX_RUNGS_BY_TYPE.update({
+    "player_points": 4, "player_rebounds": 2, "player_assists": 2,
+    "player_threes": 2, "player_points_rebounds_assists": 5,
+})
+
+
+def count_model_r(prop_type: str, anchor_line: float):
+    """(r_low, r_mid, r_high) for a stat. A spec may be a fixed tuple or a function of
+    the anchor line (a proxy for the player's mean), because relative dispersion
+    differs between small and large scorers/rebounders."""
+    spec = COUNT_MODEL_R.get(prop_type)
+    return spec(anchor_line) if callable(spec) else spec
+
+
+def count_model_max_rungs(prop_type: str) -> int:
+    return COUNT_MODEL_MAX_RUNGS_BY_TYPE.get(prop_type, COUNT_MODEL_MAX_RUNGS)
+
+
+# Measured directional bias of the anchored NB, in percentage points (model minus realized),
+# averaged over both NBA seasons (each season alone shows the same sign): it OVERSTATES the
+# probability of rungs EASIER than the line (e.g. threes: +2.2pp) and slightly UNDERSTATES
+# rungs HARDER than it (-0.4pp), i.e. real counts are a bit more concentrated around the
+# line than a Negative Binomial. The easier-rung overstatement inflates YES edges, the
+# direction that matters, so it is corrected out of point/lo/hi. (easier_pp, harder_pp).
+COUNT_MODEL_BIAS_PP: dict = {
+    "player_points":                  (1.1, 0.4),
+    "player_rebounds":                (0.6, 0.2),
+    "player_assists":                 (0.9, 0.4),
+    "player_threes":                  (2.2, 0.4),
+    "player_points_rebounds_assists": (0.85, 0.0),
+}
+
+
+def count_model_bias(prop_type: str):
+    e, h = COUNT_MODEL_BIAS_PP.get(prop_type, (0.0, 0.0))
+    return (e / 100.0, h / 100.0)
 COUNT_MODEL_MAX_BAND  = 0.06       # refuse if (hi - lo) fair band exceeds 6pp
 # Extra model-error margin applied to lo/hi on any EXTRAPOLATED rung. The r/de-vig
 # band alone missed 3 of 8 held-out cells (by 0.2-1.2pp) because realized rates
@@ -2343,6 +2419,7 @@ def _nb_prob_over_line(mu: float, r: float, line: float) -> float:
     return sf_k                                          # half-line: P(X >= k+1)
 
 
+@lru_cache(maxsize=8192)
 def _nb_mu_for_anchor(line: float, over_prob: float, r: float) -> Optional[float]:
     """mu such that NB(mu, r) reproduces P(over `line`) = over_prob."""
     if not (0.03 < over_prob < 0.97):
@@ -2360,8 +2437,9 @@ def _nb_mu_for_anchor(line: float, over_prob: float, r: float) -> Optional[float
 
 
 def count_model_fair_band(anchor_line: float, over_probs: Dict[str, float],
-                          kalshi_thresh: float, r_values: Tuple[float, float, float]
-                          ) -> Optional[Dict[str, float]]:
+                          kalshi_thresh: float, r_values: Tuple[float, float, float],
+                          max_rungs: Optional[int] = None,
+                          bias: Tuple[float, float] = (0.0, 0.0)) -> Optional[Dict[str, float]]:
     """P(stat >= Kalshi rung) from a calibrated NB anchored at the book's line.
 
     over_probs: {devig_name: no-vig P(over anchor_line)} -- one entry per
@@ -2373,7 +2451,7 @@ def count_model_fair_band(anchor_line: float, over_probs: Dict[str, float],
     anchor_k = int(math.floor(anchor_line)) + 1        # smallest count that is "over"
     rung_k   = int(math.floor(kalshi_thresh)) + 1      # Kalshi "k+" = P(X >= k)
     rungs    = abs(rung_k - anchor_k)
-    if rungs > COUNT_MODEL_MAX_RUNGS:
+    if rungs > (COUNT_MODEL_MAX_RUNGS if max_rungs is None else max_rungs):
         return None
     vals_all, vals_mid = [], []
     for p in over_probs.values():
@@ -2388,9 +2466,17 @@ def count_model_fair_band(anchor_line: float, over_probs: Dict[str, float],
     lo, hi = min(vals_all), max(vals_all)
     if hi - lo > COUNT_MODEL_MAX_BAND:
         return None
+    point = sum(vals_mid) / len(vals_mid)
+    # Directional bias correction (see COUNT_MODEL_BIAS_PP): easier rungs shifted down,
+    # harder rungs shifted up, by the measured average model error.
+    if rung_k < anchor_k:
+        point, lo, hi = point - bias[0], lo - bias[0], hi - bias[0]
+    elif rung_k > anchor_k:
+        point, lo, hi = point + bias[1], lo + bias[1], hi + bias[1]
     if rungs > 0:
-        lo, hi = max(0.0, lo - COUNT_MODEL_MARGIN), min(1.0, hi + COUNT_MODEL_MARGIN)
-    return {"point": sum(vals_mid) / len(vals_mid), "lo": lo, "hi": hi, "rungs": rungs}
+        lo, hi = lo - COUNT_MODEL_MARGIN, hi + COUNT_MODEL_MARGIN
+    lo, hi, point = max(0.0, lo), min(1.0, hi), min(1.0, max(0.0, point))
+    return {"point": point, "lo": lo, "hi": hi, "rungs": rungs}
 
 
 def fair_spread_prob(threshold: float, mean_margin: float, std: float) -> float:
@@ -4059,7 +4145,7 @@ def scan_player_props(
         # NHL saves: priced by the calibrated NB count model, which extrapolates a
         # bounded number of rungs off the anchor (COUNT_MODEL_MAX_RUNGS) with an
         # explicit uncertainty band -- see count_model_fair_band.
-        _count_model = (mkt_type_label == "nhl_prop" and prop_type in COUNT_MODEL_R)
+        _count_model = (mkt_type_label in ("nhl_prop", "nba_prop") and prop_type in COUNT_MODEL_R)
         if int(pin_line) != int(kalshi_thresh) and not _wnba_extrap and not _count_model:
             print(
                 f"  ✗ prop  {matched.get('player','?'):<25} REJECTED — line mismatch  "
@@ -4113,17 +4199,20 @@ def scan_player_props(
                     and matched.get("fair_source", "exact") == "exact":
                 _corners = {"proportional": no_vig_prob(_ro["over"], _ro["under"])[0],
                             "power":        power_devig_prob(_ro["over"], _ro["under"])[0]}
-            _count_band = count_model_fair_band(pin_line, _corners, threshold, COUNT_MODEL_R[prop_type])
+            _count_band = count_model_fair_band(pin_line, _corners, threshold,
+                                                 count_model_r(prop_type, pin_line),
+                                                 count_model_max_rungs(prop_type),
+                                                 count_model_bias(prop_type))
             if _count_band is None:
                 print(f"  ✗ prop  {matched.get('player','?'):<25} REJECTED — count model cannot price rung "
-                      f"pin={pin_line} → kalshi={threshold} (>{COUNT_MODEL_MAX_RUNGS} rungs, unfittable, or band >{COUNT_MODEL_MAX_BAND:.0%})")
+                      f"pin={pin_line} → kalshi={threshold} (>{count_model_max_rungs(prop_type)} from the line, unfittable, or band >{COUNT_MODEL_MAX_BAND:.0%})")
                 continue
             fair_over    = _count_band["point"]
             fair_under   = 1.0 - fair_over
             fair_over_y  = _count_band["lo"]
             fair_under_n = 1.0 - _count_band["hi"]
             if _count_band["rungs"] > 0:
-                print(f"  ↝ NHL count-model  {matched.get('player','?'):<25} pin={pin_line} → kalshi={threshold} "
+                print(f"  ↝ {sport_label} count-model  {matched.get('player','?'):<25} pin={pin_line} → kalshi={threshold} "
                       f"({_count_band['rungs']} rung(s))  fair={fair_over:.1%}  band=[{_count_band['lo']:.1%}, {_count_band['hi']:.1%}]")
 
         # ── TB-only: parallel Negative Binomial fair value (diagnostic) ─────
@@ -4155,7 +4244,10 @@ def scan_player_props(
             for _bk, _bp in (matched.get("books_detail") or {}).items():
                 if _bk == "pinnacle":
                     continue
-                _rb = count_model_fair_band(pin_line, {"b": _bp}, threshold, COUNT_MODEL_R[prop_type])
+                _rb = count_model_fair_band(pin_line, {"b": _bp}, threshold,
+                                            count_model_r(prop_type, pin_line),
+                                            count_model_max_rungs(prop_type),
+                                            count_model_bias(prop_type))
                 if _rb is not None:
                     _nhl_retail.append(_rb["point"])
             if "pinnacle" in _per_book_lams and _nhl_retail:
@@ -4279,7 +4371,10 @@ def scan_player_props(
         if _count_model and _count_band and _count_band["rungs"] > 0:
             _bd_rung = {}
             for _bk, _bp in books_detail.items():
-                _rb = count_model_fair_band(pin_line, {"b": _bp}, threshold, COUNT_MODEL_R[prop_type])
+                _rb = count_model_fair_band(pin_line, {"b": _bp}, threshold,
+                                            count_model_r(prop_type, pin_line),
+                                            count_model_max_rungs(prop_type),
+                                            count_model_bias(prop_type))
                 if _rb is not None:
                     _bd_rung[_bk] = _rb["point"]
             if _bd_rung:

@@ -2372,6 +2372,7 @@ def _add_new_bets(edges: list) -> list:
                 "consensus_reason":   e.get("consensus_reason", ""),
                 "books_used":         e.get("books_used", []),
                 "consensus_prob":     e.get("consensus_prob"),
+                "fair_band":          e.get("fair_band"),   # count-model band {point,lo,hi,rungs}; rungs>0 = extrapolated off the line
                 "fair_source":        e.get("fair_source", "exact"),   # "retail_consensus" for
                                        # the NFL retail-fallback signal (2026-09-11) -- lets
                                        # _perf_label track it as its own row, separate from
@@ -4598,8 +4599,15 @@ def _get_performance(since: Optional[str] = None) -> dict:
             return "NHL Saves (Retail)" if b.get("fair_source") == "retail_consensus" else "NHL Saves"
         if mtype == "nba_prop":
             _retail = b.get("fair_source") == "retail_consensus"
+            # Bets priced by the count model OFF Pinnacle's posted line (fair_band.rungs > 0)
+            # get their own row so their record can't hide inside (or be flattered by) the
+            # exact-line bets -- the whole point of the shadow period is to test them.
+            _fb = b.get("fair_band") or {}
+            _offline = (_fb.get("rungs") or 0) > 0
             for prefix, label in _PROP_SERIES_LABELS.items():
                 if ticker.startswith(prefix):
+                    if _offline:
+                        return f"{label} (Off-Line)"
                     return f"{label} (Retail)" if _retail else label
             return "NBA Props"
         # Tennis: mkt_type is "atp_moneyline"/"wta_moneyline" (binary match-winner).
@@ -8958,8 +8966,8 @@ function renderPerformance(d) {
     </p>`;
 
   // By-type breakdown table
-  const PROP_LABELS = new Set(['Strikeouts (K)', 'Hits', 'Total Bases', 'RBIs', 'MLB Props', 'NBA Points', 'NBA Rebounds', 'NBA Assists', 'NBA Threes', 'NBA PRA', 'NHL Saves', 'NHL Saves (Retail)', 'NFL Pass Yards', 'NFL Rush Yards', 'NFL Reception Yards', 'NFL Receptions', 'NFL Pass TDs', 'NFL Pass Yards (Retail)', 'NFL Rush Yards (Retail)', 'NFL Reception Yards (Retail)', 'NFL Receptions (Retail)', 'NFL Pass TDs (Retail)']);
-  const TYPE_ORDER  = ['MLB Total', 'MLB Spread', 'Strikeouts (K)', 'Pitcher Outs (Whole-Inning)', 'Pitcher Outs (Other Lines)', 'Hits', 'Total Bases', 'RBIs', 'MLB Props', 'NBA Points', 'NBA Rebounds', 'NBA Assists', 'NBA Threes', 'NBA PRA', 'NHL Saves', 'NHL Saves (Retail)', 'WNBA Total', 'WNBA Spread', 'NFL Moneyline', 'NFL Spread', 'NFL Total', 'NFL Pass Yards', 'NFL Rush Yards', 'NFL Reception Yards', 'NFL Receptions', 'NFL Pass TDs', 'NCAAF Moneyline', 'NCAAF Spread', 'NCAAF Total', 'La Liga Moneyline', 'La Liga Total', 'La Liga BTTS', 'La Liga Corners', 'EPL Moneyline', 'EPL Total', 'EPL BTTS', 'EPL Corners', 'MLS Moneyline', 'MLS Total', 'MLS BTTS', 'Argentina Moneyline', 'Argentina Total', 'Argentina BTTS', 'Brazil Moneyline', 'Brazil Total', 'Brazil BTTS', 'Liga MX Moneyline', 'Liga MX Total', 'Liga MX BTTS', 'Brazil B Moneyline', 'Brazil B Total', 'Brazil B BTTS', 'Sudamericana Moneyline', 'Sudamericana Total', 'Sudamericana BTTS', 'Chile Moneyline', 'Chile Total', 'Chile BTTS', 'ATP Moneyline', 'WTA Moneyline', 'NFL Pass Yards (Retail)', 'NFL Rush Yards (Retail)', 'NFL Reception Yards (Retail)', 'NFL Receptions (Retail)', 'NFL Pass TDs (Retail)'];
+  const PROP_LABELS = new Set(['Strikeouts (K)', 'Hits', 'Total Bases', 'RBIs', 'MLB Props', 'NBA Points', 'NBA Rebounds', 'NBA Assists', 'NBA Threes', 'NBA PRA', 'NBA Points (Off-Line)', 'NBA Rebounds (Off-Line)', 'NBA Assists (Off-Line)', 'NBA Threes (Off-Line)', 'NBA PRA (Off-Line)', 'NHL Saves', 'NHL Saves (Retail)', 'NFL Pass Yards', 'NFL Rush Yards', 'NFL Reception Yards', 'NFL Receptions', 'NFL Pass TDs', 'NFL Pass Yards (Retail)', 'NFL Rush Yards (Retail)', 'NFL Reception Yards (Retail)', 'NFL Receptions (Retail)', 'NFL Pass TDs (Retail)']);
+  const TYPE_ORDER  = ['MLB Total', 'MLB Spread', 'Strikeouts (K)', 'Pitcher Outs (Whole-Inning)', 'Pitcher Outs (Other Lines)', 'Hits', 'Total Bases', 'RBIs', 'MLB Props', 'NBA Points', 'NBA Rebounds', 'NBA Assists', 'NBA Threes', 'NBA PRA', 'NBA Points (Off-Line)', 'NBA Rebounds (Off-Line)', 'NBA Assists (Off-Line)', 'NBA Threes (Off-Line)', 'NBA PRA (Off-Line)', 'NHL Saves', 'NHL Saves (Retail)', 'WNBA Total', 'WNBA Spread', 'NFL Moneyline', 'NFL Spread', 'NFL Total', 'NFL Pass Yards', 'NFL Rush Yards', 'NFL Reception Yards', 'NFL Receptions', 'NFL Pass TDs', 'NCAAF Moneyline', 'NCAAF Spread', 'NCAAF Total', 'La Liga Moneyline', 'La Liga Total', 'La Liga BTTS', 'La Liga Corners', 'EPL Moneyline', 'EPL Total', 'EPL BTTS', 'EPL Corners', 'MLS Moneyline', 'MLS Total', 'MLS BTTS', 'Argentina Moneyline', 'Argentina Total', 'Argentina BTTS', 'Brazil Moneyline', 'Brazil Total', 'Brazil BTTS', 'Liga MX Moneyline', 'Liga MX Total', 'Liga MX BTTS', 'Brazil B Moneyline', 'Brazil B Total', 'Brazil B BTTS', 'Sudamericana Moneyline', 'Sudamericana Total', 'Sudamericana BTTS', 'Chile Moneyline', 'Chile Total', 'Chile BTTS', 'ATP Moneyline', 'WTA Moneyline', 'NFL Pass Yards (Retail)', 'NFL Rush Yards (Retail)', 'NFL Reception Yards (Retail)', 'NFL Receptions (Retail)', 'NFL Pass TDs (Retail)'];
   // Markets no longer scanned — settled record frozen & still shown, but tagged
   // so it's clear no new bets are being placed. Total Bases terminated 2026-07-23.
   const TERMINATED_LABELS = new Set(['Total Bases']);

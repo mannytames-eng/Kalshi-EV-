@@ -4489,6 +4489,13 @@ def _get_performance(since: Optional[str] = None) -> dict:
     total_kelly_dollars = round(sum(kelly_pnls) * PERF_BANKROLL, 2) if kelly_pnls else None
     avg_kelly_units     = round(sum(kelly_pnls) / len(kelly_pnls), 4) if kelly_pnls else None
 
+    # Actual paper-account P&L (dollars on the stakes really placed) -- replaces the
+    # hypothetical "Kelly P&L" as the headline dollar figure. Over the same bets as
+    # the other headline stats, so it reconciles to the paper account.
+    _paper_pnls     = [b["paper_pnl"] for b in all_settled if b.get("paper_pnl") is not None]
+    total_paper_pnl = round(sum(_paper_pnls), 2) if _paper_pnls else None
+    paper_roi_pct   = round(total_paper_pnl / PAPER_START_BALANCE * 100, 2) if total_paper_pnl is not None else None
+
     # Model accuracy — all market types
     if all_settled:
         avg_kalshi_implied = round(
@@ -4675,12 +4682,16 @@ def _get_performance(since: Optional[str] = None) -> dict:
         if label not in by_type:
             by_type[label] = {"won": 0, "lost": 0,
                                "units": [], "kelly": [], "clv": [], "pin_drifts": [],
-                               "kalshi_implied": [], "shadow": is_shad}
+                               "kalshi_implied": [], "shadow": is_shad, "pnl_dollars": 0.0}
         # pin drift per bet = closing_pin_pct - pin_prob_at_flag (true CLV)
         _pin_at_flag  = b.get("pin_prob_at_flag")
         _closing_pin  = b.get("closing_pin_pct")
         _pin_drift_v  = round(_closing_pin - _pin_at_flag, 1) if (_pin_at_flag is not None and _closing_pin is not None) else None
         kp = _kelly_pnl(b)   # hypothetical for shadow, real for live
+        # Actual dollar P&L on the stakes really placed (the paper account's number);
+        # shadow bets stake $0, so shadow rows carry no dollar P&L.
+        if not is_shad and b.get("paper_pnl") is not None:
+            by_type[label]["pnl_dollars"] += b["paper_pnl"]
         if b["status"] == "won":
             by_type[label]["won"] += 1
             k = b["kalshi_price"]
@@ -4735,6 +4746,7 @@ def _get_performance(since: Optional[str] = None) -> dict:
             "insufficient_data": total_t < MIN_SAMPLE,
             "sample_size":       total_t,
             "shadow":            d.get("shadow", False),
+            "pnl_dollars":       None if d.get("shadow") else round(d["pnl_dollars"], 2),
         })
     type_breakdown.sort(key=lambda x: -(x["won"] + x["lost"]))
     # Always list every NBA market in the Market Type section, even before it has a
@@ -4748,6 +4760,7 @@ def _get_performance(since: Optional[str] = None) -> dict:
                 "expected_win_rate": None, "kelly_pct": None, "kelly_dollars": None,
                 "avg_clv": None, "avg_pin_drift": None, "total_units": None,
                 "insufficient_data": True, "sample_size": 0, "shadow": True,
+                "pnl_dollars": None,
             })
 
     # Total Kelly P&L as % of bankroll
@@ -4990,6 +5003,8 @@ def _get_performance(since: Optional[str] = None) -> dict:
         "avg_units":            avg_units,
         "total_kelly_units":    total_kelly_units,
         "total_kelly_dollars":  total_kelly_dollars,
+        "total_paper_pnl":      total_paper_pnl,     # actual $ P&L on real stakes
+        "paper_roi_pct":        paper_roi_pct,       # ...as % of the paper start bank
         "total_kelly_pct":      total_kelly_pct,    # total P&L as % of bankroll
         "avg_kelly_units":      avg_kelly_units,
         "avg_kalshi_implied":   avg_kalshi_implied,
@@ -7382,7 +7397,7 @@ HTML = """<!DOCTYPE html>
 
 
 <div id="history-card" class="card">
-  <div class="card-header" onclick="toggleCard('history-body')">Portfolio ROI — Kelly % <span style="font-size:10px;font-weight:400;color:var(--muted);margin-left:6px;">cumulative Kelly-sized return, % of bank (¼-Kelly · ½ on strikeouts)</span> <span class="card-toggle" id="history-body-toggle">▾</span></div>
+  <div class="card-header" onclick="toggleCard('history-body')">Portfolio ROI — paper account % <span style="font-size:10px;font-weight:400;color:var(--muted);margin-left:6px;">cumulative actual return on the stakes placed, % of the start bank</span> <span class="card-toggle" id="history-body-toggle">▾</span></div>
   <div id="history-body" class="card-body" style="padding:16px 12px 12px;">
     <div class="chart-empty">Loading units chart…</div>
   </div>
@@ -7674,7 +7689,7 @@ function renderRoiChart(points) {
   const cW = W - PAD.left - PAD.right;
   const cH = H - PAD.top - PAD.bottom;
 
-  const rois   = points.map(p => p.kelly_roi);   // y-axis = cumulative Kelly ROI % (matches sizing-model diagnostic)
+  const rois   = points.map(p => p.roi);   // y-axis = cumulative ACTUAL paper-account ROI %
   const minR   = Math.min(...rois, 0);
   const maxR   = Math.max(...rois, 0);
   const span   = maxR - minR || 1;
@@ -7691,12 +7706,12 @@ function renderRoiChart(points) {
   const fillId = 'roi-fill';
 
   // polyline points
-  const pts = points.map((p, i) => toX(i).toFixed(1) + ',' + toY(p.kelly_roi).toFixed(1)).join(' ');
+  const pts = points.map((p, i) => toX(i).toFixed(1) + ',' + toY(p.roi).toFixed(1)).join(' ');
 
   // closed area polygon (go to baseline then back)
   const baseY = toY(0).toFixed(1);
   const areaPath = 'M ' + toX(0).toFixed(1) + ',' + baseY
-    + ' ' + points.map((p, i) => 'L ' + toX(i).toFixed(1) + ',' + toY(p.kelly_roi).toFixed(1)).join(' ')
+    + ' ' + points.map((p, i) => 'L ' + toX(i).toFixed(1) + ',' + toY(p.roi).toFixed(1)).join(' ')
     + ' L ' + toX(points.length - 1).toFixed(1) + ',' + baseY + ' Z';
 
   // Y-axis ticks (5 ticks)
@@ -7733,7 +7748,7 @@ function renderRoiChart(points) {
   ${zeroLine}
   <path d="${areaPath}" fill="url(#${fillId})"/>
   <polyline points="${pts}" fill="none" stroke="${stroke}" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>
-  ${points.map((p, i) => `<circle cx="${toX(i).toFixed(1)}" cy="${toY(p.kelly_roi).toFixed(1)}" r="3" fill="${stroke}" class="roi-dot" data-idx="${i}" style="cursor:pointer"/>`).join('')}
+  ${points.map((p, i) => `<circle cx="${toX(i).toFixed(1)}" cy="${toY(p.roi).toFixed(1)}" r="3" fill="${stroke}" class="roi-dot" data-idx="${i}" style="cursor:pointer"/>`).join('')}
   ${yTicks.map(t => `<text x="${PAD.left - 6}" y="${(t.y + 4).toFixed(1)}" text-anchor="end" fill="#8b949e" font-size="10">${t.v >= 0 ? '+' : ''}${t.v.toFixed(1)}%</text>`).join('')}
   ${xLabels.map(l => `<text x="${l.x.toFixed(1)}" y="${H - 6}" text-anchor="middle" fill="#8b949e" font-size="10">${l.label}</text>`).join('')}
 </svg>
@@ -7750,13 +7765,12 @@ function renderRoiChart(points) {
       const tip = document.getElementById('roi-tooltip');
       let html = '';
       if (!p.result) {
-        html = '<b>Start</b><br>Cumulative Kelly ROI: +0.00%';
+        html = '<b>Start</b><br>Account ROI: +0.00%';
       } else {
         const icon = p.result === 'won' ? '✓' : '✗';
-        const ks   = p.kelly_pnl_pct >= 0 ? '+' : '';
         html = `<b>${p.matchup || p.title || ''}</b><br>`
-          + `${icon} ${p.result.toUpperCase()}  ${ks}${p.kelly_pnl_pct.toFixed(3)}% (Kelly)<br>`
-          + `Cumulative Kelly ROI: ${p.kelly_roi >= 0 ? '+' : ''}${p.kelly_roi.toFixed(2)}%`;
+          + `${icon} ${p.result.toUpperCase()}  ${p.pnl >= 0 ? '+$' : '-$'}${Math.abs(p.pnl).toFixed(2)}<br>`
+          + `Account: $${p.balance.toFixed(2)} (${p.roi >= 0 ? '+' : ''}${p.roi.toFixed(2)}%)`;
       }
       tip.innerHTML = html;
       const rect = el.getBoundingClientRect();
@@ -8820,7 +8834,6 @@ function renderPerformance(d) {
             ${row('CLV 95% CI', s=>ciTxt(s,'clv_ci95','c'))}
             ${row('Total units', s=>s.total_units!=null?`${s.total_units>0?'+':''}${s.total_units}u`:'—', s=>uClr(s.total_units))}
             ${row('Avg unit P&amp;L', s=>s.avg_units!=null?`${s.avg_units>0?'+':''}${s.avg_units}u`:'—', s=>uClr(s.avg_units))}
-            ${row('Kelly P&amp;L', s=>s.total_kelly_dollars!=null?`${s.total_kelly_dollars>=0?'+$':'-$'}${Math.abs(s.total_kelly_dollars).toFixed(2)}`:'—', s=>uClr(s.total_kelly_dollars))}
             ${row('ROI (of bank)', s=>s.roi_pct!=null?`${s.roi_pct>0?'+':''}${s.roi_pct}%`:'—', s=>uClr(s.roi_pct))}
             ${row('Unit t-stat', s=>s.unit_tstat!=null?s.unit_tstat:'—')}
             ${row('↳ chance real', confTxt, confClr)}
@@ -8841,7 +8854,7 @@ function renderPerformance(d) {
   function sign(v)   { return v >= 0 ? '+' : ''; }
   function fmt$(v)   { return (v >= 0 ? '+$' : '-$') + Math.abs(v).toFixed(2); }
 
-  const kellyPctClass = uClass(d.total_kelly_pct);
+  const paperPnlClass = uClass(d.total_paper_pnl);
 
   // Win rate vs Kalshi-implied tells you if the model is beating the market
   let modelCallout = '—';
@@ -8933,14 +8946,14 @@ function renderPerformance(d) {
       ${pill('True Alpha', d.avg_true_alpha != null ? `<span class="${d.avg_true_alpha >= 0 ? 'pnl-pos' : 'pnl-neg'}" title="Avg Kalshi close vs. entry price (side-aware), n=${d.true_alpha_n}. This is the confirmed alpha — did Kalshi's own line move toward us after we bet? Entry Discount (below) is only the predicted mispricing vs. Pinnacle at bet time, never confirmed.">${d.avg_true_alpha > 0 ? '+' : ''}${d.avg_true_alpha}pp</span>` : '—', '', 'realized Kalshi-only price move, entry to close — the confirmed alpha')}
       ${pill('Entry Discount', d.avg_entry_discount != null ? `<span class="${d.avg_entry_discount >= 0 ? 'pnl-pos' : 'pnl-neg'}" title="Avg (Pinnacle fair value − Kalshi entry) at time of bet. This is the PREDICTED mispricing vs. the sharp line — not confirmed by what happened after. See True Alpha for the realized number.">${d.avg_entry_discount > 0 ? '+' : ''}${d.avg_entry_discount}pp</span>` : '—', '', 'how underpriced our bets looked vs. the sharp line at entry (predicted, not confirmed)')}
       ${pill('Last Bet', lastBetVal)}
-      ${pill('Kelly P&amp;L (% bank)', d.total_kelly_pct != null ? `<span class="${kellyPctClass}">${sign(d.total_kelly_pct)}${d.total_kelly_pct.toFixed(2)}%</span>` : '—', '', 'secondary — noisy at this sample')}
+      ${pill('Paper P&amp;L', d.total_paper_pnl != null ? `<span class="${paperPnlClass}">${fmt$(d.total_paper_pnl)}</span>` : '—', '', d.paper_roi_pct != null ? `${sign(d.paper_roi_pct)}${d.paper_roi_pct.toFixed(2)}% of start bank` : '')}
     </div>
     ${clvBreakdown}
     ${penaltyNote}
     <p style="font-size:11px;color:var(--muted);padding-bottom:10px;">
-      P&amp;L sized by <strong>0.25 Fractional Kelly</strong>, capped at 3% per bet.
+      Dollar P&amp;L is on the <strong>stakes actually placed</strong> (quarter-Kelly sizing, capped at 3% per bet) — the paper account's real result.
       CLV-penalised types run at 0.5× until their closing-line value stabilises.
-      Reported as <strong>% of bankroll</strong> — a 5¢ longshot loss shows −0.15%, not −1 unit.
+      Sizing barely moves returns here (same bets staked flat earn about the same); judge the edge by Flat Units and CLV.
       ${d.corrupted_excluded ? `<br><span style="color:#8b949e;">⚠ ${d.corrupted_excluded} bets excluded from all stats (wrong Pinnacle reference — UTC/ET date collision, fixed May 2026). Shown as <strong>BAD REF</strong> in the history table.</span>` : ''}
     </p>`;
 
@@ -8963,8 +8976,6 @@ function renderPerformance(d) {
       const isProp = PROP_LABELS.has(t.label);
       const isShadowRow = t.shadow === true;
       const wrCls  = insuf || t.win_rate == null ? '' : 'pnl-pos';
-      const kpct   = t.kelly_pct;
-      const kcls   = kpct == null ? '' : kpct > 0 ? 'pnl-pos' : 'pnl-neg';
       const wrCell = insuf
         ? `<span class="insufficient-data" title="Need 20+ settled bets for reliable stats">Insufficient data (${t.sample_size})</span>`
         : t.win_rate != null ? `<span class="${wrCls}">${t.win_rate}%</span>` : '—';
@@ -8973,6 +8984,12 @@ function renderPerformance(d) {
       const expCell = ewr != null
         ? `<span style="color:var(--muted);" title="Average Kalshi-implied win probability — the price paid, i.e. break-even.">${ewr}%</span>`
         : '—';
+      // Average true CLV per market (Kalshi closing price - Kalshi entry price, side-aware,
+      // cents). Computed server-side from _true_clv (never the Pinnacle-mixed field).
+      const clvV = t.avg_clv;
+      const clvCell = clvV != null
+        ? `<span class="${clvV > 0 ? 'pnl-pos' : clvV < 0 ? 'pnl-neg' : ''}" style="${insuf ? 'opacity:0.65;' : ''}" title="Average closing-line value over ${t.sample_size} settled bets: Kalshi closing price minus our entry price, in cents (side-aware). Positive = the market moved toward our side after we bet.${insuf ? ' Small sample - treat as noise.' : ''}">${clvV > 0 ? '+' : ''}${clvV.toFixed(2)}&cent;</span>`
+        : '—';
       const shadowRowBadge = isShadowRow
         ? ` <span style="font-size:9px;font-weight:700;color:#58a6ff;background:rgba(88,166,255,0.10);border:1px solid rgba(88,166,255,0.3);border-radius:3px;padding:1px 4px;vertical-align:middle;" title="Hypothetical — $0 real stake, excluded from headline stats">SHADOW</span>`
         : '';
@@ -8980,11 +8997,15 @@ function renderPerformance(d) {
         ? ` <span style="font-size:9px;font-weight:700;color:#f85149;background:rgba(248,81,73,0.10);border:1px solid rgba(248,81,73,0.35);border-radius:3px;padding:1px 4px;vertical-align:middle;" title="Terminated 2026-07-23 — no longer scanned or bet. Settled record frozen for reference.">⛔ TERMINATED</span>`
         : '';
       const labelCell = `<span style="font-weight:600;${TERMINATED_LABELS.has(t.label) ? 'opacity:0.65;' : ''}">${t.label}</span>${shadowRowBadge}${terminatedBadge}`;
-      // Kelly P&L + units — HYPOTHETICAL for shadow rows, real for live. Both shown.
+      // Actual dollar P&L on the stakes really placed. Shadow rows stake $0, so they show
+      // a dash (their hypothetical result is in Total Units).
       const hypPre = isShadowRow ? 'HYPOTHETICAL — ' : '';
-      const kellyCell = kpct != null
-        ? `<span class="${kcls}" title="${hypPre}$${t.kelly_dollars != null ? Math.abs(t.kelly_dollars).toFixed(0) : '?'} on $${bankroll} bank">${sign(kpct)}${kpct.toFixed(2)}%</span>`
-        : '—';
+      const pnlD = t.pnl_dollars;
+      const kellyCell = isShadowRow
+        ? '<span style="color:var(--muted);" title="Shadow market: $0 real stake, so no dollar P&amp;L. See Total Units for the hypothetical result.">—</span>'
+        : pnlD != null
+          ? `<span class="${pnlD > 0 ? 'pnl-pos' : pnlD < 0 ? 'pnl-neg' : ''}" title="Actual dollar P&amp;L on the stakes really placed (paper account).">${pnlD >= 0 ? '+$' : '-$'}${Math.abs(pnlD).toFixed(2)}</span>`
+          : '—';
       const tu     = t.total_units != null ? t.total_units : null;
       const tuCls  = tu == null ? '' : tu > 0 ? 'pnl-pos' : tu < 0 ? 'pnl-neg' : '';
       const unitsCell = tu != null
@@ -8996,6 +9017,7 @@ function renderPerformance(d) {
         <td class="num pnl-neg">${t.lost}</td>
         <td class="num">${wrCell}</td>
         <td class="num">${expCell}</td>
+        <td class="num">${clvCell}</td>
         <td class="num">${kellyCell}</td>
         <td class="num">${unitsCell}</td>
       </tr>`;
@@ -9015,7 +9037,8 @@ function renderPerformance(d) {
           <th>Market Type</th><th class="num">Won</th><th class="num">Lost</th>
           <th class="num">Win Rate</th>
           <th class="num" title="Average Kalshi-implied win probability for this market type — the price you paid, i.e. the break-even win rate. Win Rate ABOVE this = beating the market price you paid (what drives flat units); below = losing to the price.">Expected</th>
-          <th class="num" title="Kelly P&amp;L as % of bankroll (hover for dollar amount)">Kelly P&amp;L (% bank)</th>
+          <th class="num" title="Average closing-line value for this market type: Kalshi closing price minus our entry price, in cents (side-aware). Positive = the market moved toward us after we bet. The honest CLV (Kalshi vs Kalshi), not the Pinnacle comparison.">Avg CLV</th>
+          <th class="num" title="Actual dollar P&amp;L per market on the stakes really placed (paper account). Shadow markets stake $0 and show a dash.">P&amp;L ($)</th>
           <th class="num" title="Total flat units — net profit per market type if you'd staked $1 on every bet. Bet-size-agnostic pick quality.">Total Units</th>
         </tr></thead>`;
     perfBodyHtml += `
@@ -9117,18 +9140,23 @@ function renderPerformance(d) {
       : isLive ? '<span style="color:#ff4444;font-weight:600;animation:pulse 1.5s infinite;">● LIVE</span>'
       : '…';
     // Kelly bet size as % of bankroll (dollar amount in tooltip)
-    const kBet   = (b.shadow && !b.hypo_shadow)
-      ? `<span style="color:var(--muted);font-size:11px;" title="Shadow market — no real stake">$0</span>`
-      : b.kelly_bet_pct != null
-        ? `<span class="kelly-val" title="${b.hypo_shadow ? 'HYPOTHETICAL (WNBA shadow — $0 real stake): ' : ''}$${b.kelly_bet_dollars != null ? b.kelly_bet_dollars.toFixed(0) : '?'} on $${bankroll} bank${b.clv_mult_applied < 1 ? ' — calibration penalty 0.5×' : ''}">${b.kelly_bet_pct.toFixed(2)}%${b.hypo_shadow ? '<span style="color:#58a6ff;font-size:9px;" title="hypothetical — not staked">&nbsp;hyp</span>' : ''}${b.clv_mult_applied < 1 ? ' <span style="color:#e3a53a;font-size:9px;">½</span>' : ''}</span>`
-        : '<span class="kelly-na">—</span>';
-    // P&L as % of bankroll; for WNBA hypo bets also show units added/subtracted.
+    // Actual stake and dollar P&L (paper account). Shadow bets stake $0; their
+    // hypothetical flat-unit result is shown muted so the outcome is still visible.
     const unitTxt = b.unit_pnl != null ? `${sign(b.unit_pnl)}${b.unit_pnl.toFixed(2)}u` : null;
-    const kPnl   = b.kelly_pnl_pct != null
-      ? `<span class="${uClass(b.kelly_pnl_pct)}" title="${b.hypo_shadow ? 'HYPOTHETICAL — ' : ''}${fmt$(b.kelly_pnl_dollars || 0)} on $${bankroll} bank${unitTxt ? ' · ' + unitTxt + ' (flat units)' : ''}">${sign(b.kelly_pnl_pct)}${b.kelly_pnl_pct.toFixed(2)}%${b.hypo_shadow && unitTxt ? `<span style="color:var(--muted);font-size:9px;">&nbsp;${unitTxt}</span>` : ''}</span>`
-      : b.status === 'open' && b.kelly_bet_pct != null
-        ? `<span class="pnl-neu">open</span>`
-        : '<span class="pnl-neu">—</span>';
+    const kBet   = b.shadow
+      ? `<span style="color:var(--muted);font-size:11px;" title="Shadow market — no real stake">$0</span>`
+      : b.paper_stake != null && b.paper_stake > 0
+        ? `<span class="kelly-val" title="Stake placed${b.clv_mult_applied < 1 ? ' — calibration penalty 0.5×' : ''}">$${b.paper_stake.toFixed(2)}</span>`
+        : '<span class="kelly-na">—</span>';
+    const kPnl   = b.shadow
+      ? (unitTxt && b.status !== 'open'
+          ? `<span style="color:var(--muted);font-size:11px;" title="HYPOTHETICAL flat-unit result (shadow market, $0 real stake)">${unitTxt}</span>`
+          : '<span class="pnl-neu">—</span>')
+      : b.paper_pnl != null
+        ? `<span class="${uClass(b.paper_pnl)}" title="Actual dollar P&amp;L on the stake placed${unitTxt ? ' · ' + unitTxt + ' (flat units)' : ''}">${fmt$(b.paper_pnl)}</span>`
+        : b.status === 'open' && b.paper_stake > 0
+          ? `<span class="pnl-neu">open</span>`
+          : '<span class="pnl-neu">—</span>';
     const ts = fmtDate(b.flagged_at);
     // Game time — parse ticker start time if stored, otherwise derive from ticker
     const gameTimeIso = b.game_time || null;
@@ -9215,8 +9243,8 @@ function renderPerformance(d) {
       <th class="num" title="Adjusted EV after 25% haircut (raw shown in tooltip)">Adj. EV</th>
       <th class="num" title="Kalshi entry → Pinnacle closing price. Green = Pinnacle moved in your favor. Sub-line = Pinnacle fair value at entry.">Line Move</th>
       <th class="num">Result</th>
-      <th class="num" title="0.25 Kelly stake as % of bankroll (hover for $ amount). ½ = calibration penalty active.">Kelly Bet %</th>
-      <th class="num" title="P&amp;L as % of bankroll at Kelly stake (hover for $ amount)">Kelly P&amp;L %</th>
+      <th class="num" title="Dollar stake actually placed (quarter-Kelly sized, capped at 3% of bank).">Stake</th>
+      <th class="num" title="Actual dollar P&amp;L on the stake placed. Shadow bets show their hypothetical flat units, muted.">P&amp;L</th>
     </tr></thead>
     <tbody>${rows}</tbody>
   </table>`;
@@ -9247,7 +9275,7 @@ function renderPerformance(d) {
           <thead><tr>
             <th>Flagged</th><th>Game Time</th><th>Matchup</th><th>Prop</th><th>Side</th>
             <th class="num">Adj. EV</th><th class="num">Line Move</th>
-            <th class="num">Result</th><th class="num">Kelly Bet %</th><th class="num">Kelly P&L %</th>
+            <th class="num">Result</th><th class="num">Stake</th><th class="num">P&L</th>
           </tr></thead>
           <tbody>${corruptRows}</tbody>
         </table>
@@ -9302,15 +9330,12 @@ async function fetchPaper() {
     const clvColor  = pinData ? (pinData.avg_clv >= 0 ? 'var(--green)' : 'var(--red)') : 'var(--muted)';
     const clvLabel  = pinData ? `Avg CLV — PIN (${pinData.count} bets)` : 'Avg CLV — PIN';
 
-    // Kelly P&L (% bank) — the sizing-model diagnostic, kept as a SECONDARY tile.
-    // Uses perf.total_kelly_pct (sum of per-bet Kelly fractions). The old
-    // compounding-bankroll "ROI" tile (balance-vs-start) was removed 2026-07-14:
-    // it compounded on an imaginary bankroll with too many degrees of freedom to
-    // mean anything at this sample. Flat Units is the primary metric now, and the
-    // Portfolio ROI chart plots cumulative Kelly-sized $ P&L (user call 2026-07-31).
-    const kellyBankPct   = perf.total_kelly_pct;
-    const kellyBankColor = kellyBankPct == null ? 'var(--muted)' : kellyBankPct >= 0 ? 'var(--green)' : 'var(--red)';
-    const kellyBankTxt   = kellyBankPct == null ? '—' : `${kellyBankPct >= 0 ? '+' : ''}${kellyBankPct.toFixed(2)}%`;
+    // Paper account P&L: actual dollars on the stakes really placed (replaces the old
+    // hypothetical "Kelly P&L %" diagnostic tile, 2026-10-26). Flat Units stays the primary metric.
+    const paperPnl      = perf.total_paper_pnl;
+    const paperPnlColor = paperPnl == null ? 'var(--muted)' : paperPnl >= 0 ? 'var(--green)' : 'var(--red)';
+    const paperPnlTxt   = paperPnl == null ? '—' : `${paperPnl >= 0 ? '+$' : '-$'}${Math.abs(paperPnl).toFixed(2)}`;
+    const paperRoiTxt   = perf.paper_roi_pct == null ? '' : `${perf.paper_roi_pct >= 0 ? '+' : ''}${perf.paper_roi_pct.toFixed(2)}% of start bank`;
 
     // ── Primary KPI bar ────────────────────────────────────────────────────
     let html = `
@@ -9367,15 +9392,15 @@ async function fetchPaper() {
         <div style="font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:0.06em;margin-top:2px;">Record</div>
       </div>
     </div>
-    <div style="padding:5px 12px;background:#0d1117;border-bottom:1px solid var(--border);font-size:9px;color:var(--muted);text-transform:uppercase;letter-spacing:0.08em;font-weight:600;">Sizing-model diagnostic — not an edge metric</div>
+    <div style="padding:5px 12px;background:#0d1117;border-bottom:1px solid var(--border);font-size:9px;color:var(--muted);text-transform:uppercase;letter-spacing:0.08em;font-weight:600;">Paper account — stakes actually placed</div>
     <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:1px;background:var(--border);border-bottom:1px solid var(--border);opacity:0.82;">
       <!-- Kelly P&L (% bank) — SECONDARY sizing diagnostic (kept 2026-07-14).
            The old compounding-bankroll "ROI" tile (+4.81%) was removed. -->
       <div style="background:var(--surface);padding:14px 16px;text-align:center;">
-        <div style="font-size:22px;font-weight:700;color:${kellyBankColor};">${kellyBankTxt}</div>
-        <div style="font-size:11px;color:var(--muted);margin-top:1px;">simulated, quarter-Kelly</div>
-        <div style="font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:0.06em;margin-top:3px;" title="Total Kelly P&amp;L as % of bankroll (sum of per-bet Kelly fractions). A sizing-model diagnostic, not an edge metric — noise at this sample. Judge the edge by Flat Units and CLV above.">Kelly P&amp;L (% bank)</div>
-        <div style="font-size:9px;color:var(--muted);opacity:0.75;margin-top:2px;line-height:1.2;">secondary — noisy at this sample</div>
+        <div style="font-size:22px;font-weight:700;color:${paperPnlColor};">${paperPnlTxt}</div>
+        <div style="font-size:11px;color:var(--muted);margin-top:1px;">${paperRoiTxt}</div>
+        <div style="font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:0.06em;margin-top:3px;" title="Actual dollar P&amp;L on the stakes really placed — the paper account's result. Judge the edge by Flat Units and CLV above.">Paper P&amp;L</div>
+        <div style="font-size:9px;color:var(--muted);opacity:0.75;margin-top:2px;line-height:1.2;">real stakes · quarter-Kelly sized</div>
       </div>
     </div>
     <div style="padding:6px 12px;border-bottom:1px solid var(--border);background:#0d1117;">
@@ -9434,7 +9459,7 @@ async function fetchPaper() {
           <th>Date</th><th>Matchup</th><th>Bet</th><th>Side</th>
           <th class="num">Adj. EV</th>
           <th class="num" title="Value locked at entry = Pinnacle probability at flag − Kalshi price. Always positive when the edge was real. This is the value you captured when you placed the bet.">Value @ Entry</th>
-          <th class="num">Kelly Stake</th><th class="num">P&amp;L</th><th>Result</th>
+          <th class="num">Stake</th><th class="num">P&amp;L</th><th>Result</th>
         </tr></thead>`;
 
       html += tableHead + `<tbody>${visibleBets.map(renderPaperRow).join('')}</tbody></table>`;

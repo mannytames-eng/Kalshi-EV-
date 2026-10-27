@@ -4207,10 +4207,14 @@ def scan_player_props(
                 print(f"  ✗ prop  {matched.get('player','?'):<25} REJECTED — count model cannot price rung "
                       f"pin={pin_line} → kalshi={threshold} (>{count_model_max_rungs(prop_type)} from the line, unfittable, or band >{COUNT_MODEL_MAX_BAND:.0%})")
                 continue
-            fair_over    = _count_band["point"]
-            fair_under   = 1.0 - fair_over
-            fair_over_y  = _count_band["lo"]
-            fair_under_n = 1.0 - _count_band["hi"]
+            # NBA exact rung (Pinnacle's own line): no extrapolation, so no model
+            # error to guard against -- keep the plain de-vigged point estimate
+            # computed above instead of shaving it to the proportional/power corner.
+            if _count_band["rungs"] > 0 or mkt_type_label != "nba_prop":
+                fair_over    = _count_band["point"]
+                fair_under   = 1.0 - fair_over
+                fair_over_y  = _count_band["lo"]
+                fair_under_n = 1.0 - _count_band["hi"]
             if _count_band["rungs"] > 0:
                 print(f"  ↝ {sport_label} count-model  {matched.get('player','?'):<25} pin={pin_line} → kalshi={threshold} "
                       f"({_count_band['rungs']} rung(s))  fair={fair_over:.1%}  band=[{_count_band['lo']:.1%}, {_count_band['hi']:.1%}]")

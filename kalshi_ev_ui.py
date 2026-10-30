@@ -59,6 +59,7 @@ from kalshi_ev_scanner import (
     SOCCER_SCAN_CHECKPOINTS,
     SOCCER_CHECKPOINT_TOL_M,
     kalshi_get,
+    EV_HAIRCUT, KALSHI_FEE_RATE,
     fetch_orderbook_snapshot,
     scan_nba_player_props,
     scan_nhl_player_props,
@@ -5139,6 +5140,46 @@ _last_market_snapshot: dict = {}    # persists per-ticker|side across ALL sports
                                      # props cycle then reappeared the next). Merged with .update()
                                      # (not replaced) so one sport's/cycle's miss never erases
                                      # another entry's last-known-good comparison.
+def _stamp_snapshot(snap: dict) -> dict:
+    """Tag each snapshot row with the epoch second it was computed, so the
+    tracker can show how old a row's fair value is (rows persist via .update()
+    until their own sport's next sweep refreshes them)."""
+    ts = time.time()
+    return {k: {**v, "ts": ts} for k, v in snap.items()}
+
+def _tracker_live_overlay(b: dict, srow: Optional[dict], now_ts: float) -> dict:
+    """Fresh bet-side Kalshi price + re-derived edge for an open-position row.
+
+    The market snapshot only refreshes on each sport's paid Odds API sweep (NFL
+    props: 30min-2h, none overnight), but the free CLV-capture loop polls Kalshi
+    for every open bet each ~60s. Pair that live price with the fair value
+    implied by the last sweep: the fair is backed out of the snapshot's own
+    adj_edge (so any per-side band/conservative fair is preserved) and re-run
+    through the same fee/haircut formula the scanner uses."""
+    out: dict = {}
+    if srow and srow.get("ts"):
+        out["fair_age_s"] = int(now_ts - srow["ts"])
+    cy, cts = b.get("closing_yes_pct"), b.get("closing_ts")
+    if cy is None or not cts or b.get("clv_frozen"):
+        return out
+    try:
+        age = now_ts - datetime.fromisoformat(cts).timestamp()
+    except (TypeError, ValueError):
+        return out
+    if age > 900:
+        return out
+    price = cy / 100 if b.get("side", "YES") == "YES" else 1 - cy / 100
+    out["live_kalshi"] = round(price, 4)
+    out["live_kalshi_age_s"] = int(age)
+    if srow and srow.get("adj_edge") is not None and srow.get("kalshi") is not None:
+        p0 = srow["kalshi"]
+        denom = 1 - KALSHI_FEE_RATE * (1 - p0)
+        if denom > 0:
+            fair = (srow["adj_edge"] / (1 - EV_HAIRCUT) + p0) / denom
+            adj = ((fair - price) - KALSHI_FEE_RATE * fair * (1 - price)) * (1 - EV_HAIRCUT)
+            out["live_edge_pct"] = round(adj * 100, 1)
+    return out
+
 _last_soccer_scan: float = 0.0      # epoch seconds of last soccer sweep (all leagues)
 _last_tennis_scan: float = 0.0      # epoch seconds of last tennis sweep (ATP + WTA)
 _last_freshness_scan: float = 0.0   # epoch seconds of last market-freshness watch run
@@ -6370,19 +6411,19 @@ def _run_scan():
             # that prompted this).
             global _last_market_snapshot
             if _fresh_prop_snap:
-                _last_market_snapshot.update(_fresh_prop_snap)
+                _last_market_snapshot.update(_stamp_snapshot(_fresh_prop_snap))
             if _nfl_snapshot:
-                _last_market_snapshot.update(_nfl_snapshot)
+                _last_market_snapshot.update(_stamp_snapshot(_nfl_snapshot))
             if _fresh_nfl_prop_snap:
-                _last_market_snapshot.update(_fresh_nfl_prop_snap)
+                _last_market_snapshot.update(_stamp_snapshot(_fresh_nfl_prop_snap))
             if _fresh_nba_prop_snap:
-                _last_market_snapshot.update(_fresh_nba_prop_snap)
+                _last_market_snapshot.update(_stamp_snapshot(_fresh_nba_prop_snap))
             if _fresh_nhl_prop_snap:
-                _last_market_snapshot.update(_fresh_nhl_prop_snap)
+                _last_market_snapshot.update(_stamp_snapshot(_fresh_nhl_prop_snap))
             if _ncaaf_snapshot:
-                _last_market_snapshot.update(_ncaaf_snapshot)
+                _last_market_snapshot.update(_stamp_snapshot(_ncaaf_snapshot))
 
-            _state["market_snapshot"] = {**_last_market_snapshot, **mlb_snapshot}
+            _state["market_snapshot"] = {**_last_market_snapshot, **_stamp_snapshot(mlb_snapshot)}
 
         # Log new bets and capture what was just added for the alert
         newly_logged = _add_new_bets(edges)
@@ -6991,6 +7032,7 @@ def _capture_clv_prices():
                 for b in _bets:
                     if b["id"] == bet["id"]:
                         b["closing_yes_pct"] = yes_close_pct
+                        b["closing_ts"]      = datetime.now(timezone.utc).isoformat()   # live-price age for the tracker
                         b["closing_pin_pct"] = closing_pin   # persist for resolution time
 
                         entry_k = b.get("kalshi_price", 0) * 100   # effective bet-side entry price
@@ -8340,12 +8382,18 @@ function renderTodayEdges() {
 
     // ── Resolve current edge from best available source ───────────────────
     // Priority: live (full edge obj) > snapshot (all scanned) > nothing (PASS)
-    const curEdgePct = live != null
+    // b.live_* come from /api/today_edges: the free ~60s Kalshi poll of open bets,
+    // re-run through the scanner's fee/haircut formula against the last sweep's fair.
+    // They beat the snapshot/scan values, which only refresh when the sport's paid
+    // Odds API sweep runs (NFL props: every 30min-2h, none overnight).
+    const curEdgePct = b.live_edge_pct != null ? b.live_edge_pct
+      : live != null
       ? (live.edge_pct != null ? live.edge_pct : 0)
       : (snap != null ? snap.edge_pct : null);
     const curFair    = live != null ? live.fair
                      : snap != null ? snap.fair : null;
-    const curKalshi  = live != null ? live.kalshi
+    const curKalshi  = b.live_kalshi != null ? b.live_kalshi
+                     : live != null ? live.kalshi
                      : snap != null ? snap.kalshi : null;
     const inSnapshot = snap != null || live != null;
 
@@ -8419,7 +8467,7 @@ function renderTodayEdges() {
       recLabel = cutoffLabel ? `BET if ${cutoffLabel}` : `BET +${curEdgePct.toFixed(1)}%`;
       recColor = '#3fb950';
       recTip   = cutoffLabel
-        ? `Current edge +${curEdgePct.toFixed(1)}%. Scan prices up to 2 min old — edge holds while ${cutoffLabel}.`
+        ? `Current edge +${curEdgePct.toFixed(1)}%. Kalshi price is live (~1 min old); fair is from the last scan — edge holds while ${cutoffLabel}.`
         : `Current edge +${curEdgePct.toFixed(1)}%. Always verify live price on Kalshi before placing.`;
     }
     const recBadge = `<span style="font-weight:700;font-size:12px;color:${recColor};" title="${recTip}">${recLabel}</span>`;
@@ -8440,12 +8488,19 @@ function renderTodayEdges() {
     // Use live (full edge obj) if available, else fall back to snapshot
     const curKalshiAmer = curKalshi != null ? kalshiToAmerican(curKalshi) : null;
     const curFairAmer   = curFair   != null ? probToAmerican(curFair)     : null;
+    const fmtAge = s => s == null ? null : s < 90 ? `${Math.round(s)}s` : s < 5400 ? `${Math.round(s / 60)}m` : `${(s / 3600).toFixed(1)}h`;
+    const fairAge = b.fair_age_s;
+    const priceAgeTxt = b.live_kalshi != null ? `live ${fmtAge(b.live_kalshi_age_s)} ago`
+                      : fairAge != null ? `scan ${fmtAge(fairAge)} ago` : 'scan age unknown';
+    const fairAgeTxt  = fairAge != null ? ` · fair ${fmtAge(fairAge)} old` : '';
+    const fairAgeCol  = fairAge != null && fairAge > 3 * 3600 ? '#e3a53a' : 'var(--muted)';
     const lastScanEdge = inSnapshot && curEdgePct != null
       ? `<span style="color:${edgeColor(curEdgePct)};font-weight:700;">${curEdgePct > 0 ? '+' : ''}${pct(curEdgePct)}</span>
          <span style="font-size:10px;color:var(--muted);display:block;margin-top:2px;">
            Kalshi <span style="color:var(--text);">${curKalshiAmer || '—'}</span>
            &nbsp;·&nbsp; Fair <span style="color:var(--text);">${curFairAmer || '—'}</span>
-         </span>`
+         </span>
+         <span style="font-size:9px;color:${fairAgeCol};display:block;margin-top:1px;" title="Kalshi price: free poll of your open bets (~60s). Fair: from the sport's last paid Odds API sweep — NFL props refresh every 30min-2h and not overnight.">${priceAgeTxt}${fairAgeTxt}</span>`
       : `<span style="color:var(--muted);">—</span>`;
 
     // ── Kalshi direct link ──────────────────────────────────────────────────
@@ -8510,7 +8565,7 @@ function renderTodayEdges() {
       <th>Flagged</th><th>Matchup</th><th>Bet</th><th>Side</th>
       <th class="num">Edge @ Flag</th>
       <th class="num">Live</th>
-      <th class="num">Last Scan <span style="font-size:9px;font-weight:400;color:var(--muted);">(≤2 min)</span></th>
+      <th class="num">Current <span style="font-size:9px;font-weight:400;color:var(--muted);">(price ~1 min · fair per scan)</span></th>
       <th class="num">Status</th>
       <th class="num">Stake</th>
     </tr></thead>
@@ -9813,6 +9868,9 @@ class Handler(BaseHTTPRequestHandler):
             # Attach live in-game stat (from the background cache) for IN PLAY bets
             with _live_stats_lock:
                 _ls = dict(_live_stats)
+            with _lock:
+                _snap_now = _state.get("market_snapshot") or {}
+            _now_ts = time.time()
             _feed = []
             for b in open_bets:
                 cache = _ls.get(b["id"]) or {}
@@ -9834,6 +9892,7 @@ class Handler(BaseHTTPRequestHandler):
                     if _ttk_feed is not None and _ttk_feed <= 0:
                         continue
                 row = {**b,
+                       **_tracker_live_overlay(b, _snap_now.get(f"{b['ticker']}|{b.get('side', 'YES')}"), _now_ts),
                        "live_stat":   cache.get("stat"),
                        "live_inning": cache.get("inning"),
                        "home_logo":   cache.get("home_logo"),

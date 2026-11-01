@@ -43,6 +43,7 @@ load_dotenv(os.path.join(_SCRIPT_DIR, ".env"))   # .env lives next to the script
 
 # ── Import scanner logic ──────────────────────────────────────────────────────
 sys.path.insert(0, BASE_DIR)
+from kalshi_clv_mid import restate_bet as _restate_bet_mid, mid_clv as _mid_clv
 from kalshi_ev_scanner import (
     scan_sport,
     scan_player_props,
@@ -3939,20 +3940,16 @@ def _clv_pct(clv_pp: float, entry_k: float) -> Optional[float]:
     return round((clv_pp / entry_k) * 100, 2)
 
 
-def _true_clv(b: dict) -> Optional[float]:
-    """The one honest definition of CLV: Kalshi's OWN tradeable price, entry vs
-    close, side-aware (for NO bets close_side = 100 - closing_yes_pct). Positive
-    = the market you actually traded moved toward you after you bet.
+def _true_clv_incl_spread(b: dict) -> Optional[float]:
+    """The PRE-2026-11-01 CLV definition, kept as a secondary "incl. spread" figure:
+    Kalshi's own tradeable price, entry vs close, side-aware (for NO bets
+    close_side = 100 - closing_yes_pct), compared on the price we PAID (ask) at
+    entry vs the same-side ask at the last poll before start.
 
-    This is deliberately independent of clv_source/the persisted `clv` field —
-    that field means different things per source ("pin" = Pinnacle close minus
-    Kalshi entry, a cross-market comparison; "kalshi" = this same formula). Two
-    audits this session (candlestick recompute + the prop clv_source="pin"
-    mislabel bug fix) found the cross-market version runs ~4-5x higher than
-    this and does not predict profitability (Total Bases had strong "pin" CLV
-    while losing money) — so every aggregate CLV figure should use this, not
-    the persisted field. "Value vs Pin" stays a separate, intentionally
-    cross-market metric and is unaffected."""
+    Flaw: the closing-side quote widens in the final minutes (market makers pull
+    liquidity), which pushes the ask up / bid down on every bet and reads as CLV
+    even when the market never moved -- on 43 NBA bets +3.3c of ask/bid CLV was
+    -1.9c real movement + 5.2c spread widening. See kalshi_clv_mid.py."""
     cy  = b.get("closing_yes_pct")
     kpx = b.get("kalshi_price")
     if cy is None or kpx is None:
@@ -3960,6 +3957,26 @@ def _true_clv(b: dict) -> Optional[float]:
     entry_side = kpx * 100
     close_side = (100 - cy) if b.get("side") == "NO" else cy
     return close_side - entry_side
+
+
+def _true_clv(b: dict) -> Optional[float]:
+    """The one honest definition of CLV (restated 2026-11-01): how far KALSHI's
+    own quote MIDPOINT moved from the moment we bet to the last tight quote before
+    game start, side-aware (YES: close_mid - entry_mid; NO: entry_mid - close_mid).
+    Positive = the market moved toward us after we bet.
+
+    Midpoints, not the price paid: comparing entry ask to closing ask counts
+    closing-spread widening as CLV (see _true_clv_incl_spread). Closing quotes
+    wider than kalshi_clv_mid.MAX_CLOSE_SPREAD_C are skipped (a pulled quote's
+    midpoint means nothing). entry_mid_pct / close_mid_pct come from Kalshi 1-minute
+    candlesticks (_backfill_clv_mid); bets without them return None and are left out
+    of every CLV average rather than mixed in under the old definition.
+
+    Independent of clv_source / the persisted `clv` field -- that field means
+    different things per source ("pin" = Pinnacle close minus Kalshi entry, a
+    cross-market comparison, runs ~4-5x higher and does not predict profit).
+    "Value vs Pin" stays a separate, intentionally cross-market metric."""
+    return _mid_clv(b.get("entry_mid_pct"), b.get("close_mid_pct"), b.get("side", "YES"))
 
 
 def _check_resolutions():
@@ -4415,6 +4432,11 @@ def _get_performance(since: Optional[str] = None) -> dict:
     ]
     avg_clv = (round(sum(_true_clv(b) for b in _true_clv_bets) / len(_true_clv_bets), 1)
                if _true_clv_bets else None)
+    _ask_clv_vals = [_true_clv_incl_spread(b) for b in all_clean
+                     if b.get("status") in ("won", "lost") and _true_clv_incl_spread(b) is not None]
+    avg_clv_incl_spread = round(sum(_ask_clv_vals) / len(_ask_clv_vals), 1) if _ask_clv_vals else None
+    clv_mid_n = len(_true_clv_bets)
+    clv_mid_of = sum(1 for b in all_clean if b.get("status") in ("won", "lost"))
 
     # ── CLV source breakdown — exposes how much of avg_clv is real vs proxy ──
     # "pin"       = true closing line: pre-close Pinnacle fetch fired and got a fresh
@@ -4690,7 +4712,7 @@ def _get_performance(since: Optional[str] = None) -> dict:
         label = _perf_label(b) + (" (shadow)" if is_shad else "")
         if label not in by_type:
             by_type[label] = {"won": 0, "lost": 0,
-                               "units": [], "kelly": [], "clv": [], "pin_drifts": [],
+                               "units": [], "kelly": [], "clv": [], "clv_ask": [], "pin_drifts": [],
                                "kalshi_implied": [], "shadow": is_shad, "pnl_dollars": 0.0}
         # pin drift per bet = closing_pin_pct - pin_prob_at_flag (true CLV)
         _pin_at_flag  = b.get("pin_prob_at_flag")
@@ -4723,6 +4745,9 @@ def _get_performance(since: Optional[str] = None) -> dict:
         clv_val = _true_clv(b)   # honest Kalshi entry-vs-close, not the persisted (source-mixed) field
         if clv_val is not None:
             by_type[label]["clv"].append(clv_val)
+        _clv_ask_v = _true_clv_incl_spread(b)
+        if _clv_ask_v is not None:
+            by_type[label]["clv_ask"].append(_clv_ask_v)
 
     MIN_SAMPLE = 20   # need at least 20 settled bets before win rate is meaningful
 
@@ -4736,6 +4761,7 @@ def _get_performance(since: Optional[str] = None) -> dict:
         kelly_t    = round(sum(d["kelly"]) * PERF_BANKROLL, 2) if d["kelly"] else None
         # Average CLV across all settled bets in this market type
         avg_clv_t       = round(sum(d["clv"]) / len(d["clv"]), 2) if d["clv"] else None
+        avg_clv_ask_t   = round(sum(d["clv_ask"]) / len(d["clv_ask"]), 2) if d["clv_ask"] else None
         avg_pin_drift_t = round(sum(d["pin_drifts"]) / len(d["pin_drifts"]), 2) if d["pin_drifts"] else None
         # Total flat units ($1 on every bet) for this market type
         total_units_t   = round(sum(d["units"]), 2) if d["units"] else None
@@ -4750,6 +4776,8 @@ def _get_performance(since: Optional[str] = None) -> dict:
             "kelly_pct":         kelly_pct_t,
             "kelly_dollars":     kelly_t,
             "avg_clv":           avg_clv_t,
+            "avg_clv_incl_spread": avg_clv_ask_t,   # old ask/bid definition, for comparison
+            "clv_n":             len(d["clv"]),     # settled bets with a restated mid-to-mid CLV
             "avg_pin_drift":     avg_pin_drift_t,
             "total_units":       total_units_t,
             "insufficient_data": total_t < MIN_SAMPLE,
@@ -5018,6 +5046,9 @@ def _get_performance(since: Optional[str] = None) -> dict:
         "avg_kelly_units":      avg_kelly_units,
         "avg_kalshi_implied":   avg_kalshi_implied,
         "avg_clv":              avg_clv,
+        "avg_clv_incl_spread":  avg_clv_incl_spread,   # old ask/bid definition (inflated by closing-spread widening)
+        "clv_mid_n":            clv_mid_n,             # settled bets with a restated mid-to-mid CLV...
+        "clv_mid_of":           clv_mid_of,            # ...out of all settled bets
         "avg_line_move":        avg_line_move,
         "kelly_bankroll":       PERF_BANKROLL,
         "bets":                 table_bets,
@@ -7079,6 +7110,98 @@ def _background_clv_capture_loop():
         time.sleep(CLV_CAPTURE_SECONDS)
 
 
+# ── Mid-to-mid CLV restatement / capture (2026-11-01) ────────────────────────
+# Fills entry_mid_pct / close_mid_pct on every bet from Kalshi 1-minute candles
+# (see kalshi_clv_mid.py for why). One code path for history AND new bets: a bet
+# is picked up ~20 min after its game starts. The old fields (closing_yes_pct,
+# clv, ...) are left untouched -- this only ADDS fields, so the audit trail of
+# what was previously reported stays intact.
+CLV_MID_FINAL        = ("ok", "no_tight_close", "in_play_entry")   # answers that won't change
+CLV_MID_MIN_AGE_S    = 20 * 60    # wait this long after game start before closing out a bet
+CLV_MID_MAX_ATTEMPTS = 5          # no_data / no_entry_quote / error retry this many times
+CLV_MID_BATCH        = 80         # bets per pass; more than this -> run again in 30s
+
+
+def _clv_mid_game_start(b: dict) -> Optional[datetime]:
+    """Same anchor order the live CLV capture uses: ticker time, then stored game_time."""
+    gs = _parse_ticker_start_time(b.get("ticker", ""))
+    if gs is None and b.get("game_time"):
+        try:
+            gs = datetime.fromisoformat(b["game_time"].replace("Z", "+00:00"))
+        except (ValueError, AttributeError):
+            gs = None
+    if gs is not None and gs.tzinfo is None:
+        gs = gs.replace(tzinfo=timezone.utc)
+    return gs
+
+
+def _backfill_clv_mid(limit: int = CLV_MID_BATCH) -> int:
+    """One pass: compute entry/close midpoints for bets that don't have a final
+    answer yet. Returns how many bets were processed."""
+    now = datetime.now(timezone.utc)
+    todo = []
+    with _bets_lock:
+        for b in _bets:
+            if b.get("clv_mid_status") in CLV_MID_FINAL or b.get("clv_mid_attempts", 0) >= CLV_MID_MAX_ATTEMPTS:
+                continue
+            gs = _clv_mid_game_start(b)
+            if gs is None or (now - gs).total_seconds() < CLV_MID_MIN_AGE_S:
+                continue
+            try:
+                fl = datetime.fromisoformat(b["flagged_at"])
+            except (KeyError, ValueError):
+                continue
+            if fl.tzinfo is None:
+                fl = fl.replace(tzinfo=timezone.utc)
+            todo.append((b["id"], b["ticker"], fl.timestamp(), gs.timestamp()))
+            if len(todo) >= limit:
+                break
+    if not todo:
+        return 0
+    done = 0
+    counts: dict = {}
+    for bet_id, ticker, flag_ts, game_ts in todo:
+        if flag_ts >= game_ts:
+            res = {"status": "in_play_entry"}      # flagged after start: no pre-game entry quote exists
+        else:
+            try:
+                res = _restate_bet_mid(kalshi_get, ticker, flag_ts, game_ts)
+            except Exception as exc:
+                res = {"status": "error"}
+                print(f"  CLV-mid: {ticker} error: {exc}")
+            time.sleep(0.3)                        # gentle rate-limit (1-2 calls per bet)
+        counts[res["status"]] = counts.get(res["status"], 0) + 1
+        with _bets_lock:
+            for b in _bets:
+                if b["id"] == bet_id:
+                    b["clv_mid_status"]   = res["status"]
+                    b["clv_mid_attempts"] = b.get("clv_mid_attempts", 0) + 1
+                    for k in ("entry_mid_pct", "entry_spread_c", "close_mid_pct", "close_spread_c", "close_quote_ts"):
+                        if res.get(k) is not None or res["status"] != "error":
+                            b[k] = res.get(k)
+                    break
+            done += 1
+            if done % 20 == 0:
+                _save_bets(_bets)
+    with _bets_lock:
+        _save_bets(_bets)
+    print(f"  CLV-mid: processed {done} bet(s) {counts}")
+    return done
+
+
+def _background_clv_mid_loop():
+    """Restate/capture mid-to-mid CLV. Batches back-to-back while work remains
+    (first boot after the 2026-11-01 deploy restates all history), then idles."""
+    time.sleep(150)    # let the scan + open-bet capture settle first
+    while True:
+        n = 0
+        try:
+            n = _backfill_clv_mid()
+        except Exception as exc:
+            print(f"  CLV-mid loop error: {exc}")
+        time.sleep(30 if n >= CLV_MID_BATCH else 20 * 60)
+
+
 def _background_resolution_loop():
     """
     Dedicated fast-resolution thread.
@@ -9051,7 +9174,7 @@ function renderPerformance(d) {
       // cents). Computed server-side from _true_clv (never the Pinnacle-mixed field).
       const clvV = t.avg_clv;
       const clvCell = clvV != null
-        ? `<span class="${clvV > 0 ? 'pnl-pos' : clvV < 0 ? 'pnl-neg' : ''}" style="${insuf ? 'opacity:0.65;' : ''}" title="Average closing-line value over ${t.sample_size} settled bets: Kalshi closing price minus our entry price, in cents (side-aware). Positive = the market moved toward our side after we bet.${insuf ? ' Small sample - treat as noise.' : ''}">${clvV > 0 ? '+' : ''}${clvV.toFixed(2)}&cent;</span>`
+        ? `<span class="${clvV > 0 ? 'pnl-pos' : clvV < 0 ? 'pnl-neg' : ''}" style="${insuf ? 'opacity:0.65;' : ''}" title="Average closing-line value over ${t.clv_n != null ? t.clv_n : t.sample_size} of ${t.sample_size} settled bets: how far the quote MIDPOINT moved from our entry to the last tight quote before game start, in cents (side-aware). Positive = the market moved toward our side after we bet. Old ask-vs-ask figure (inflated by closing-spread widening): ${t.avg_clv_incl_spread != null ? (t.avg_clv_incl_spread > 0 ? '+' : '') + t.avg_clv_incl_spread + 'c' : 'n/a'}.${insuf ? ' Small sample - treat as noise.' : ''}">${clvV > 0 ? '+' : ''}${clvV.toFixed(2)}&cent;</span>`
         : '—';
       const shadowRowBadge = isShadowRow
         ? ` <span style="font-size:9px;font-weight:700;color:#58a6ff;background:rgba(88,166,255,0.10);border:1px solid rgba(88,166,255,0.3);border-radius:3px;padding:1px 4px;vertical-align:middle;" title="Hypothetical — $0 real stake, excluded from headline stats">SHADOW</span>`
@@ -9100,7 +9223,7 @@ function renderPerformance(d) {
           <th>Market Type</th><th class="num">Won</th><th class="num">Lost</th>
           <th class="num">Win Rate</th>
           <th class="num" title="Average Kalshi-implied win probability for this market type — the price you paid, i.e. the break-even win rate. Win Rate ABOVE this = beating the market price you paid (what drives flat units); below = losing to the price.">Expected</th>
-          <th class="num" title="Average closing-line value for this market type: Kalshi closing price minus our entry price, in cents (side-aware). Positive = the market moved toward us after we bet. The honest CLV (Kalshi vs Kalshi), not the Pinnacle comparison.">Avg CLV</th>
+          <th class="num" title="Average closing-line value for this market type: how far Kalshi's quote MIDPOINT moved from our entry to the last tight quote before game start, in cents (side-aware). Positive = the market moved toward us after we bet. Mid-to-mid so a widening closing spread doesn't count as movement (restated 2026-11-01; hover a value for the old ask-vs-ask figure). Kalshi vs Kalshi, not the Pinnacle comparison.">Avg CLV</th>
           <th class="num" title="Actual dollar P&amp;L per market on the stakes really placed (paper account). Shadow markets stake $0 and show a dash.">P&amp;L ($)</th>
           <th class="num" title="Total flat units — net profit per market type if you'd staked $1 on every bet. Bet-size-agnostic pick quality.">Total Units</th>
         </tr></thead>`;
@@ -9425,7 +9548,7 @@ async function fetchPaper() {
         return `<div style="background:var(--surface);padding:14px 16px;text-align:center;">
         <div style="font-size:24px;font-weight:800;color:${mvColor};letter-spacing:-0.5px;">${mv > 0 ? '+' : ''}${mv.toFixed(2)}¢</div>
         <div style="font-size:11px;color:var(--muted);margin-top:1px;">${favTxt}</div>
-        <div style="font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:0.06em;margin-top:3px;" title="True Closing Line Value: average bet-side movement of KALSHI's own price from your entry to the close. Positive = the market you traded repriced toward you after you bet — the cleanest proof you were early to the right price. Bet-side: for NO bets the close is 100 − YES.">Avg CLV</div>
+        <div style="font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:0.06em;margin-top:3px;" title="True Closing Line Value: average bet-side movement of the MIDPOINT of KALSHI's own quote from your entry to the last tight quote before game start. Positive = the market you traded repriced toward you after you bet. Mid-to-mid, so closing-spread widening is not counted as movement (restated 2026-11-01).">Avg CLV</div>
         <div style="font-size:9px;color:var(--muted);opacity:0.75;margin-top:2px;line-height:1.2;">how far Kalshi's line moved toward us by close</div>
       </div>`;
       })()}
@@ -9991,14 +10114,12 @@ class Handler(BaseHTTPRequestHandler):
             # after entry? entry and close are both taken on the bet side (for NO
             # bets the close is 100 − closing_yes_pct). Positive = our contract got
             # more expensive = market moved our way = positive Kalshi-side CLV.
+            # Since 2026-11-01 this is mid-to-mid (_true_clv), not ask-vs-ask.
             _kmoves = []
             for b in settled:
-                cy = b.get("closing_yes_pct"); kpx = b.get("kalshi_price")
-                if cy is None or kpx is None:
-                    continue
-                entry_side = kpx * 100
-                close_side = (100 - cy) if b.get("side") == "NO" else cy
-                _kmoves.append(close_side - entry_side)
+                _mv = _true_clv(b)
+                if _mv is not None:
+                    _kmoves.append(_mv)
             avg_kalshi_move    = round(sum(_kmoves) / len(_kmoves), 2) if _kmoves else None
             kalshi_move_n      = len(_kmoves)
             kalshi_move_favor  = len([m for m in _kmoves if m > 0.5])
@@ -10298,6 +10419,7 @@ if __name__ == "__main__":
             ("wnba-odds",   _background_wnba_odds_loop),
             ("resolution",  _background_resolution_loop),
             ("clv-capture", _background_clv_capture_loop),
+            ("clv-mid",     _background_clv_mid_loop),
             # wc-watcher REMOVED 2026-07-29: was spamming Discord (its keyword
             # search hit the generic /events feed and matched any "soccer"/
             # "football" title). Obsolete anyway — it existed to prompt building

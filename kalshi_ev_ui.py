@@ -4448,10 +4448,17 @@ def _get_performance(since: Optional[str] = None) -> dict:
     for src in ("pin", "pin_entry", "kalshi"):
         src_bets = [b for b in clv_bets if b.get("clv_source") == src]
         if src_bets:
-            clv_by_source[src] = {
-                "count":   len(src_bets),
-                "avg_clv": round(sum(b["clv"] for b in src_bets) / len(src_bets), 1),
-            }
+            # "kalshi"-sourced bets report mid-to-mid (_true_clv) so this group matches
+            # the headline; pin / pin_entry stay Pinnacle-referenced (their own definition).
+            if src == "kalshi":
+                src_vals = [v for v in (_true_clv(b) for b in src_bets) if v is not None]
+            else:
+                src_vals = [b["clv"] for b in src_bets]
+            if src_vals:
+                clv_by_source[src] = {
+                    "count":   len(src_vals),
+                    "avg_clv": round(sum(src_vals) / len(src_vals), 1),
+                }
 
     # Average line movement — all settled bets (open bets have no real closing line yet)
     line_moves = []
@@ -9357,12 +9364,14 @@ function renderPerformance(d) {
     const entryK      = b.kalshi_price    != null ? (b.kalshi_price * 100).toFixed(0) : null;
     const pinAtEntry  = b.pin_prob_at_flag != null ? b.pin_prob_at_flag.toFixed(1)    : null;
     const pinAtClose  = b.closing_pin_pct  != null && b.status !== 'open' ? b.closing_pin_pct.toFixed(1) : null;
-    // closing_yes_pct is always the YES-side price; entryK is the bet-side price.
-    // For NO bets, convert the close to the NO side (100 − YES) so the K: move
-    // compares like with like (was showing a bogus swing on every NO bet).
-    const kalshiClose = b.closing_yes_pct  != null && b.status !== 'open'
-      ? (b.side === 'NO' ? (100 - b.closing_yes_pct) : b.closing_yes_pct).toFixed(0)
-      : null;
+    // Kalshi repricing is measured MID-TO-MID (restated 2026-11-01): the quote
+    // midpoint at entry vs the last tight quote before game start, on the bet side
+    // (NO = 100 − YES mid). The old ask-vs-ask line counted the closing spread
+    // widening as movement. Null until the bet has been restated.
+    const _bsMid = (m) => m == null ? null : (b.side === 'NO' ? 100 - m : m);
+    const _c1 = (x) => x.toFixed(1).replace(/[.]0$/, '');
+    const kEntryMid = b.status !== 'open' ? _bsMid(b.entry_mid_pct) : null;
+    const kCloseMid = b.status !== 'open' ? _bsMid(b.close_mid_pct) : null;
 
     let lineMoveCell = '—';
     if (entryK != null) {
@@ -9381,12 +9390,12 @@ function renderPerformance(d) {
 
       // Row 2 — Kalshi repricing: did the market rerate our contract?
       let kalshiLine = '';
-      if (kalshiClose != null) {
-        const kDelta = parseFloat(kalshiClose) - parseFloat(entryK);
-        const kColor = kDelta > 0 ? 'var(--green)' : kDelta < 0 ? 'var(--red)' : 'var(--fg)';
-        const kSign  = kDelta > 0 ? '+' : '';
-        kalshiLine = `<div style="font-size:10px;margin-top:2px;color:var(--muted);" title="Kalshi repricing: market moved from ${entryK}¢ to ${kalshiClose}¢ by game start">
-          K: ${entryK}¢ <span style="color:${kColor};">→ ${kalshiClose}¢ (${kSign}${kDelta.toFixed(0)}¢)</span>
+      if (kEntryMid != null && kCloseMid != null) {
+        const kDelta = kCloseMid - kEntryMid;
+        const kColor = kDelta > 0.05 ? 'var(--green)' : kDelta < -0.05 ? 'var(--red)' : 'var(--fg)';
+        const kSign  = kDelta > 0.05 ? '+' : '';
+        kalshiLine = `<div style="font-size:10px;margin-top:2px;color:var(--muted);" title="Kalshi repricing, mid-to-mid: the quote midpoint moved from ${_c1(kEntryMid)}¢ at entry to ${_c1(kCloseMid)}¢ at the last tight quote before game start (bet side). Midpoints, so a widening closing spread is not counted as movement.">
+          K mid: ${_c1(kEntryMid)}¢ <span style="color:${kColor};">→ ${_c1(kCloseMid)}¢ (${kSign}${_c1(kDelta)}¢)</span>
         </div>`;
       }
 
@@ -9610,7 +9619,9 @@ async function fetchPaper() {
           pnlCell = `<span style="color:${c};font-weight:600;">${s}$${b.paper_pnl.toFixed(2)}</span>`;
         }
         const statusColor = b.status === 'won' ? 'var(--green)' : b.status === 'lost' ? 'var(--red)' : 'var(--muted)';
-        const statusLabel = b.status === 'won' ? '✓ WON' : b.status === 'lost' ? '✗ LOST' : '…';
+        const statusLabel = b.status === 'won' ? '✓ WON' : b.status === 'lost' ? '✗ LOST'
+          : b.status === 'void' ? '<span title="Kalshi voided this market (e.g. the player did not play) — settled at a fair price, no win/loss and no P&amp;L booked" style="font-weight:600;">↩ VOID</span>'
+          : '…';
         const flagDate = b.flagged_at ? fmtDate(b.flagged_at) : '';
         const capBadge = b.daily_capped
           ? ` <span title="Skipped by the daily exposure cap — logged at $0 stake, excluded from balance." style="font-size:9px;font-weight:700;color:#e3a53a;background:rgba(227,165,58,0.12);border:1px solid rgba(227,165,58,0.3);border-radius:3px;padding:1px 4px;vertical-align:middle;">CAP</span>`

@@ -2477,6 +2477,88 @@ def _add_new_bets(edges: list) -> list:
     return newly_added
 
 
+# ── Per-scan best-edge history (2026-10-18) ──────────────────────────────────
+# _state["market_snapshot"] only keeps each market's LAST-seen edge, so a week
+# with zero flagged bets can't be diagnosed: an edge that appeared and closed
+# between sweeps (or only during a coarse off-day sweep) leaves no trace. This
+# appends one compact record per fresh sweep per component -- best edge per
+# game plus how many markets sat within reach of the 2.0% threshold -- so
+# "edges vanished" can be told apart from "edges never reached 2%". Free
+# (disk only), observability only, read back via /api/best_edge_log.
+BEST_EDGE_LOG_FILE       = os.path.join(DATA_DIR, "ev_best_edge_log.jsonl")
+_BEST_EDGE_LOG_MIN_INTERVAL = 10 * 60          # per component; MLB totals scans every 30-60s
+_BEST_EDGE_LOG_MAX_BYTES    = 25 * 1024 * 1024  # rotate to .1 past this (one generation kept)
+_best_edge_log_last: dict = {}
+_best_edge_log_lock = threading.Lock()
+
+
+def _log_best_edges(component: str, snapshot: dict) -> None:
+    """Append one record for this sweep's FRESH snapshot (not the merged
+    last-known-good dict). Never raises -- a logging failure must not break a scan."""
+    if not snapshot:
+        return
+    try:
+        now = time.time()
+        with _best_edge_log_lock:
+            if now - _best_edge_log_last.get(component, 0.0) < _BEST_EDGE_LOG_MIN_INTERVAL:
+                return
+            _best_edge_log_last[component] = now
+        games: dict = {}
+        for key, v in snapshot.items():
+            e = v.get("edge_pct")
+            if e is None:
+                continue
+            parts = key.split("|")[0].split("-")
+            game = parts[1] if len(parts) > 1 else parts[0]
+            g = games.get(game)
+            if g is None:
+                g = games[game] = [e, key, 0, 0, 0, v.get("kalshi"), v.get("fair")]
+            elif e > g[0]:
+                g[0], g[1], g[5], g[6] = e, key, v.get("kalshi"), v.get("fair")
+            g[2] += 1
+            if e >= 1.5:
+                g[3] += 1
+            if e >= EDGE_THRESHOLD * 100:
+                g[4] += 1
+        rec = {
+            "ts":        datetime.now(timezone.utc).isoformat(),
+            "component": component,
+            "n_markets": len(snapshot),
+            "games":     games,   # game -> [best_edge_pct, best_key, n_markets, n>=1.5, n>=2.0, kalshi, fair]
+        }
+        with _best_edge_log_lock:
+            try:
+                if os.path.getsize(BEST_EDGE_LOG_FILE) > _BEST_EDGE_LOG_MAX_BYTES:
+                    os.replace(BEST_EDGE_LOG_FILE, BEST_EDGE_LOG_FILE + ".1")
+            except OSError:
+                pass
+            with open(BEST_EDGE_LOG_FILE, "a") as f:
+                f.write(json.dumps(rec, separators=(",", ":")) + "\n")
+    except Exception as exc:
+        print(f"  best-edge log error ({component}): {exc}")
+
+
+def _read_best_edge_log(hours: int, component: str = "", max_records: int = 5000) -> list:
+    cutoff = (datetime.now(timezone.utc) - __import__("datetime").timedelta(hours=hours)).isoformat()
+    out: list = []
+    for path in (BEST_EDGE_LOG_FILE + ".1", BEST_EDGE_LOG_FILE):
+        try:
+            with open(path) as f:
+                for line in f:
+                    try:
+                        r = json.loads(line)
+                    except ValueError:
+                        continue
+                    if r.get("ts", "") < cutoff:
+                        continue
+                    if component and component not in r.get("component", "").lower():
+                        continue
+                    out.append(r)
+        except OSError:
+            continue
+    return out[-max_records:]
+
+
 def _capture_orderbook_latency_snapshot(bet_id: str) -> None:
     """Delayed second order-book capture for one bet, fired by a one-shot
     timer ORDERBOOK_LATENCY_CAPTURE_SECONDS after _capture_orderbook_for_new_bets
@@ -6463,6 +6545,18 @@ def _run_scan():
 
             _state["market_snapshot"] = {**_last_market_snapshot, **_stamp_snapshot(mlb_snapshot)}
 
+        # Per-scan best-edge history -- THIS cycle's fresh results only (see
+        # _log_best_edges); each component is throttled to one record per 10 min.
+        for _be_label, _be_snap in (
+            ("MLB Totals",       mlb_snapshot),
+            ("MLB Props",        _fresh_prop_snap),
+            ("NFL Game Lines",   _nfl_snapshot),
+            ("NFL Props",        _fresh_nfl_prop_snap),
+            ("NBA Props",        _fresh_nba_prop_snap),
+            ("NCAAF Game Lines", _ncaaf_snapshot),
+        ):
+            _log_best_edges(_be_label, _be_snap)
+
         # Log new bets and capture what was just added for the alert
         newly_logged = _add_new_bets(edges)
 
@@ -9220,12 +9314,15 @@ function renderPerformance(d) {
     // La Liga/EPL Corners, etc.) and crowding out the live breakdown that
     // actually matters. Collapsed by default; count shown in the summary so
     // it's still obvious how many are tucked away.
-    // NBA is still shadow ($0 stake) but is the market under active evaluation, so its
-    // rows stay in the main table (they keep the SHADOW badge + hypothetical numbers)
-    // instead of hiding in the collapsed section with the other shadow markets.
-    const _pinnedShadow = t => t.shadow === true && /^NBA (Points|Rebounds|Assists|Threes|PRA)/.test(t.label);
-    const liveTypes   = sorted.filter(t => t.shadow !== true || _pinnedShadow(t));
-    const shadowTypes = sorted.filter(t => t.shadow === true && !_pinnedShadow(t));
+    // NBA is the main priority, so it gets its own section — every NBA row
+    // (live AND shadow) together, never tucked into the collapsed shadow
+    // block. Everything else (MLB, NFL, WNBA, soccer, ...) goes in "Other
+    // Markets", with that section's shadow rows still collapsed.
+    const isNbaType   = t => t.label.startsWith('NBA ');
+    const nbaTypes    = sorted.filter(isNbaType);
+    const otherTypes  = sorted.filter(t => !isNbaType(t));
+    const liveTypes   = otherTypes.filter(t => t.shadow !== true);
+    const shadowTypes = otherTypes.filter(t => t.shadow === true);
     const theadHtml = `<thead><tr>
           <th>Market Type</th><th class="num">Won</th><th class="num">Lost</th>
           <th class="num">Win Rate</th>
@@ -9234,11 +9331,26 @@ function renderPerformance(d) {
           <th class="num" title="Actual dollar P&amp;L per market on the stakes really placed (paper account). Shadow markets stake $0 and show a dash.">P&amp;L ($)</th>
           <th class="num" title="Total flat units — net profit per market type if you'd staked $1 on every bet. Bet-size-agnostic pick quality.">Total Units</th>
         </tr></thead>`;
-    perfBodyHtml += `
+    const NBA_ICON = `<img src="https://a.espncdn.com/i/teamlogos/leagues/500/nba.png" alt="NBA" onerror="this.replaceWith(document.createTextNode('🏀'))" style="width:20px;height:20px;object-fit:contain;vertical-align:middle;">`;
+    const sectionTitle = (inner) => `<div style="display:flex;align-items:center;gap:8px;font-size:13px;font-weight:700;color:var(--text);margin:6px 0 6px;">${inner}</div>`;
+    if (nbaTypes.length) {
+      perfBodyHtml += `
+      ${sectionTitle(`${NBA_ICON}<span>NBA Markets</span>`)}
+      <table style="margin-bottom:14px;">
+        ${theadHtml}
+        <tbody>${nbaTypes.map(rowHtml).join('')}</tbody>
+      </table>`;
+    }
+    if (liveTypes.length || shadowTypes.length) {
+      perfBodyHtml += sectionTitle('<span>Other Markets</span>');
+    }
+    if (liveTypes.length) {
+      perfBodyHtml += `
       <table style="margin-bottom:8px;">
         ${theadHtml}
         <tbody>${liveTypes.map(rowHtml).join('')}</tbody>
       </table>`;
+    }
     if (shadowTypes.length) {
       perfBodyHtml += `
       <details style="margin-bottom:12px;">
@@ -10045,6 +10157,18 @@ class Handler(BaseHTTPRequestHandler):
                 print(f"  /api/today_edges JSON error: {_je}")
                 payload = b"[]"
             self._send(200, "application/json", payload)
+
+        elif path == "/api/best_edge_log":
+            # ?hours=48 (max 720) &component=nfl props  -> per-sweep best-edge records
+            from urllib.parse import urlparse, parse_qs
+            _q = parse_qs(urlparse(self.path).query)
+            try:
+                _hrs = max(1, min(int(_q.get("hours", ["48"])[0]), 24 * 30))
+            except ValueError:
+                _hrs = 48
+            _comp = (_q.get("component", [""])[0] or "").lower()
+            self._send(200, "application/json",
+                       json.dumps(_read_best_edge_log(_hrs, _comp)).encode())
 
         elif path == "/api/scanner_history":
             # Return all bets flagged in the past 24 hours, newest first.

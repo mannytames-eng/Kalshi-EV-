@@ -9097,11 +9097,13 @@ function renderPerformance(d) {
     };
     const confClr = (s, confKey='unit_tstat_conf') => (!s || s[confKey] == null) ? '' :
       s[confKey] >= 95 ? 'pnl-pos' : s[confKey] < 70 ? 'pnl-neg' : '';
-    const row = (label, get, cls) => `<tr>
+    // liveOnly rows (bank ROI) are blank for Shadowed AND Combined: shadow bets stake $0,
+    // so a bank-% figure is only meaningful for real stakes (Combined mixes in the hypo).
+    const row = (label, get, cls, liveOnly=false) => `<tr>
       <td style="color:var(--muted);">${label}</td>
       <td class="num ${cls?cls(L):''}">${L&&L.n?get(L):'—'}</td>
-      <td class="num ${cls?cls(S):''}" style="border-left:2px solid #58a6ff33;">${S&&S.n?get(S):'—'}</td>
-      <td class="num ${cls?cls(C):''}">${C&&C.n?get(C):'—'}</td></tr>`;
+      <td class="num ${!liveOnly&&cls?cls(S):''}" style="border-left:2px solid #58a6ff33;">${!liveOnly&&S&&S.n?get(S):'—'}</td>
+      <td class="num ${!liveOnly&&cls?cls(C):''}">${!liveOnly&&C&&C.n?get(C):'—'}</td></tr>`;
     perfBodyHtml += `
       <details open style="margin-bottom:12px;">
         <summary style="cursor:pointer;font-size:12px;color:var(--muted);user-select:none;font-weight:600;">
@@ -9121,7 +9123,7 @@ function renderPerformance(d) {
             ${row('CLV 95% CI', s=>ciTxt(s,'clv_ci95','c'))}
             ${row('Total units', s=>s.total_units!=null?`${s.total_units>0?'+':''}${s.total_units}u`:'—', s=>uClr(s.total_units))}
             ${row('Avg unit P&amp;L', s=>s.avg_units!=null?`${s.avg_units>0?'+':''}${s.avg_units}u`:'—', s=>uClr(s.avg_units))}
-            ${row('ROI (of bank)', s=>s.roi_pct!=null?`${s.roi_pct>0?'+':''}${s.roi_pct}%`:'—', s=>uClr(s.roi_pct))}
+            ${row('ROI (of bank)', s=>s.roi_pct!=null?`${s.roi_pct>0?'+':''}${s.roi_pct}%`:'—', s=>uClr(s.roi_pct), true)}
             ${row('Unit t-stat', s=>s.unit_tstat!=null?s.unit_tstat:'—')}
             ${row('↳ chance real', confTxt, confClr)}
             ${row('Unit 95% CI', s=>ciTxt(s))}

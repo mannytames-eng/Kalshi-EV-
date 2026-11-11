@@ -4802,7 +4802,9 @@ def _get_performance(since: Optional[str] = None) -> dict:
         if label not in by_type:
             by_type[label] = {"won": 0, "lost": 0,
                                "units": [], "kelly": [], "clv": [], "clv_ask": [], "pin_drifts": [],
-                               "kalshi_implied": [], "shadow": is_shad, "pnl_dollars": 0.0}
+                               "kalshi_implied": [], "shadow": is_shad, "pnl_dollars": 0.0,
+                               "bets": []}
+        by_type[label]["bets"].append(b)
         # pin drift per bet = closing_pin_pct - pin_prob_at_flag (true CLV)
         _pin_at_flag  = b.get("pin_prob_at_flag")
         _closing_pin  = b.get("closing_pin_pct")
@@ -5117,7 +5119,149 @@ def _get_performance(since: Optional[str] = None) -> dict:
         "combined": _slice_stats(_live_pop + _shadowed_pop),
     }
 
+    # ── Per-row significance + calibration for the by-type table ─────────────
+    # Same game-clustered math as the Live vs Shadowed table, applied to every
+    # market-type row so a small-sample CLV/units figure can't be misread as a
+    # finding. Calibration gap = realized win rate - the win prob the model
+    # CLAIMED at entry (stored `fair` is already bet-side); it's the metric that
+    # caught Total Bases (CLV looked fine, calibration did not).
+    def _unit_of(b):
+        if b.get("unit_pnl") is not None:
+            return b["unit_pnl"]
+        k = b.get("kalshi_price")
+        if b.get("status") == "won" and k:
+            return (1 - k) / k
+        return -1.0 if b.get("status") == "lost" else None
+
+    def _calib_pairs(bs):
+        return [((1.0 if b["status"] == "won" else 0.0) - b["fair"], _game_key(b))
+                for b in bs if b.get("fair") is not None]
+
+    def _sig_fields(bs):
+        _, ct, cc, cci = _clustered_significance(
+            [(_true_clv(b), _game_key(b)) for b in bs if _true_clv(b) is not None])
+        _, ut, uc, uci = _clustered_significance(
+            [(_unit_of(b), _game_key(b)) for b in bs if _unit_of(b) is not None])
+        cal = _calib_pairs(bs)
+        gap, gt, gc, gci = _clustered_significance(cal)
+        fairs = [b["fair"] for b in bs if b.get("fair") is not None]
+        return {
+            "n_games":          len({_game_key(b) for b in bs}),
+            "clv_tstat":        ct, "clv_conf": cc, "clv_ci95": cci,
+            "unit_tstat":       ut, "unit_conf": uc, "unit_ci95": uci,
+            "claimed_win_rate": round(100 * sum(fairs) / len(fairs), 1) if fairs else None,
+            "calib_gap_pp":     round(gap * 100, 1) if gap is not None else None,
+            "calib_tstat":      gt,
+            "calib_n":          len(cal),
+        }
+
+    _tb_by_label = {t["label"]: t for t in type_breakdown}
+    for _lab, _d in by_type.items():
+        if _lab in _tb_by_label:
+            _tb_by_label[_lab].update(_sig_fields(_d["bets"]))
+
+    # ── NBA props: exact-line vs off-line comparison ─────────────────────────
+    # Off-line = priced by the count model OFF Pinnacle's posted line
+    # (fair_band.rungs > 0), same definition as the "(Off-Line)" rows. Both groups
+    # pool every settled non-correlated NBA prop bet (shadow + live). The spread
+    # split exists because off-line bets sit in thinner books: a CLV edge that only
+    # shows up where we pay a wide spread is not the same as one we can capture.
+    NBA_SPREAD_CUT_C = 1.0
+    def _nba_offline(b):
+        return ((b.get("fair_band") or {}).get("rungs") or 0) > 0
+
+    def _entry_half_spread_c(b):
+        # cents between the price we paid and the side-adjusted quote midpoint
+        em, k = b.get("entry_mid_pct"), b.get("kalshi_price")
+        if em is None or k is None:
+            return None
+        mid_side = (100 - em) if b.get("side") == "NO" else em
+        return round(k * 100 - mid_side, 2)
+
+    def _nba_grp(bs):
+        n = len(bs)
+        if not n:
+            return {"n": 0}
+        clvs = [_true_clv(b) for b in bs if _true_clv(b) is not None]
+        units = [_unit_of(b) for b in bs if _unit_of(b) is not None]
+        spreads = [x for x in (_entry_half_spread_c(b) for b in bs) if x is not None]
+        out = {
+            "n":           n,
+            "win_rate":    round(100 * sum(1 for b in bs if b["status"] == "won") / n, 1),
+            "kalshi_implied": round(100 * sum(b["kalshi_price"] for b in bs) / n, 1),
+            "avg_clv":     round(sum(clvs) / len(clvs), 2) if clvs else None,
+            "clv_n":       len(clvs),
+            "total_units": round(sum(units), 2) if units else None,
+            "avg_units":   round(sum(units) / len(units), 3) if units else None,
+            "median_spread_c": _median(spreads),
+        }
+        out.update(_sig_fields(bs))
+        return out
+
+    def _group_diff(a_bets, b_bets, fn, B=2000):
+        """off-line (b) minus exact (a) on fn(bet); cluster bootstrap over games.
+        p_better = % of resamples where off-line beat exact."""
+        ga, gb = {}, {}
+        for bs, g in ((a_bets, ga), (b_bets, gb)):
+            for b in bs:
+                v = fn(b)
+                if v is not None:
+                    g.setdefault(_game_key(b), []).append(v)
+        keys = list(set(ga) | set(gb))
+        if not ga or not gb or len(keys) < 2:
+            return None
+        mean = lambda xs: sum(xs) / len(xs)
+        obs = mean([v for vs in gb.values() for v in vs]) - mean([v for vs in ga.values() for v in vs])
+        rng = _rand.Random(23)
+        diffs = []
+        for _ in range(B):
+            smp = [keys[rng.randrange(len(keys))] for _ in keys]
+            xa = [v for k in smp for v in ga.get(k, [])]
+            xb = [v for k in smp for v in gb.get(k, [])]
+            if xa and xb:
+                diffs.append(mean(xb) - mean(xa))
+        if not diffs:
+            return None
+        diffs.sort()
+        return {"diff": round(obs, 3),
+                "ci95": [round(diffs[int(0.025 * len(diffs))], 3), round(diffs[int(0.975 * len(diffs))], 3)],
+                "p_better": round(100 * sum(1 for x in diffs if x > 0) / len(diffs), 1)}
+
+    _nba_pop = [b for b in clean_settled
+                if not _is_correlated(b) and _infer_mkt_type(b) == "nba_prop"]
+    nba_compare = None
+    if _nba_pop:
+        _ex = [b for b in _nba_pop if not _nba_offline(b)]
+        _of = [b for b in _nba_pop if _nba_offline(b)]
+        def _tight(bs, tight):
+            out = []
+            for b in bs:
+                sp = _entry_half_spread_c(b)
+                if sp is not None and ((sp <= NBA_SPREAD_CUT_C) == tight):
+                    out.append(b)
+            return out
+        _win = lambda b: 1.0 if b["status"] == "won" else 0.0
+        nba_compare = {
+            "exact":   _nba_grp(_ex),
+            "offline": _nba_grp(_of),
+            "diff": {
+                "clv":   _group_diff(_ex, _of, _true_clv),
+                "units": _group_diff(_ex, _of, _unit_of),
+                "win":   _group_diff(_ex, _of, _win),
+            },
+            "spread_cut_c": NBA_SPREAD_CUT_C,
+            "spread_split": {
+                "exact":   {"tight": _nba_grp(_tight(_ex, True)), "wide": _nba_grp(_tight(_ex, False))},
+                "offline": {"tight": _nba_grp(_tight(_of, True)), "wide": _nba_grp(_tight(_of, False))},
+            },
+            "tight_diff": {
+                "clv":   _group_diff(_tight(_ex, True), _tight(_of, True), _true_clv),
+                "units": _group_diff(_tight(_ex, True), _tight(_of, True), _unit_of),
+            },
+        }
+
     return {
+        "nba_compare":          nba_compare,
         "slice_stats":          slice_stats,   # {live, shadowed, combined} — see _slice_stats
         "total_bets":           len(all_clean),
         "won":                  len(all_won),
@@ -9273,11 +9417,30 @@ function renderPerformance(d) {
       const expCell = ewr != null
         ? `<span style="color:var(--muted);" title="Average Kalshi-implied win probability — the price paid, i.e. break-even.">${ewr}%</span>`
         : '—';
-      // Average true CLV per market (Kalshi closing price - Kalshi entry price, side-aware,
-      // cents). Computed server-side from _true_clv (never the Pinnacle-mixed field).
+      // Significance sub-line under a value: game-clustered t-stat turned into plain words.
+      // Under 20 bets nothing is called anything ("too early"), however good the number looks.
+      const sigSub = (conf, tstat, n, ci, unit) => {
+        if (conf == null || n == null) return '';
+        const ciTxt = ci ? ' 95% CI [' + ci[0] + unit + ', ' + ci[1] + unit + '].' : '';
+        if (n < 20) return `<div style="font-size:9px;color:var(--muted);" title="Only ${n} bets — too few to call signal or noise.${ciTxt}">too early (n=${n})</div>`;
+        const word = conf >= 97.5 ? 'very likely real' : conf >= 95 ? 'likely real' : conf >= 84 ? 'leaning +' : conf <= 2.5 ? 'very likely negative' : conf <= 5 ? 'likely negative' : conf <= 16 ? 'leaning \u2212' : 'unproven';
+        const clr = conf >= 95 ? 'var(--green, #3fb950)' : conf <= 5 ? 'var(--red, #f85149)' : 'var(--muted)';
+        return `<div style="font-size:9px;color:${clr};white-space:nowrap;" title="Game-clustered t=${tstat}; ${conf}% chance the true value is above zero.${ciTxt}">${word}</div>`;
+      };
+      // Average true CLV per market (Kalshi quote-midpoint move, entry -> last tight quote
+      // before game start, side-aware, cents). Computed server-side from _true_clv
+      // (never the Pinnacle-mixed field).
       const clvV = t.avg_clv;
       const clvCell = clvV != null
-        ? `<span class="${clvV > 0 ? 'pnl-pos' : clvV < 0 ? 'pnl-neg' : ''}" style="${insuf ? 'opacity:0.65;' : ''}" title="Average closing-line value over ${t.clv_n != null ? t.clv_n : t.sample_size} of ${t.sample_size} settled bets: how far the quote MIDPOINT moved from our entry to the last tight quote before game start, in cents (side-aware). Positive = the market moved toward our side after we bet. Old ask-vs-ask figure (inflated by closing-spread widening): ${t.avg_clv_incl_spread != null ? (t.avg_clv_incl_spread > 0 ? '+' : '') + t.avg_clv_incl_spread + 'c' : 'n/a'}.${insuf ? ' Small sample - treat as noise.' : ''}">${clvV > 0 ? '+' : ''}${clvV.toFixed(2)}&cent;</span>`
+        ? `<span class="${clvV > 0 ? 'pnl-pos' : clvV < 0 ? 'pnl-neg' : ''}" style="${insuf ? 'opacity:0.65;' : ''}" title="Average closing-line value over ${t.clv_n != null ? t.clv_n : t.sample_size} of ${t.sample_size} settled bets: how far the quote MIDPOINT moved from our entry to the last tight quote before game start, in cents (side-aware). Positive = the market moved toward our side after we bet. Old ask-vs-ask figure (inflated by closing-spread widening): ${t.avg_clv_incl_spread != null ? (t.avg_clv_incl_spread > 0 ? '+' : '') + t.avg_clv_incl_spread + 'c' : 'n/a'}.${insuf ? ' Small sample - treat as noise.' : ''}">${clvV > 0 ? '+' : ''}${clvV.toFixed(2)}&cent;</span>${sigSub(t.clv_conf, t.clv_tstat, t.clv_n, t.clv_ci95, 'c')}`
+        : '—';
+      // Calibration: realized win rate minus the win prob the model CLAIMED at entry.
+      // Negative = overconfident (the Total Bases failure mode). Colored only once the
+      // gap is itself statistically distinguishable from zero (|t| >= 2, n >= 20).
+      const calG = t.calib_gap_pp, calN = t.calib_n || 0;
+      const calSig = calG != null && calN >= 20 && t.calib_tstat != null && Math.abs(t.calib_tstat) >= 2;
+      const calCell = calG != null
+        ? `<span class="${calSig ? (calG > 0 ? 'pnl-pos' : 'pnl-neg') : ''}" style="${calN < 20 ? 'opacity:0.65;' : ''}" title="Realized win rate minus the win probability the model claimed at entry (avg claimed ${t.claimed_win_rate}%), over ${calN} bets. Negative = the model was overconfident. Game-clustered t=${t.calib_tstat != null ? t.calib_tstat : 'n/a'}; colored only when |t| is at least 2.">${calG > 0 ? '+' : ''}${calG.toFixed(1)}pp</span><div style="font-size:9px;color:var(--muted);">${calN < 20 ? 'too early (n=' + calN + ')' : 'claimed ' + t.claimed_win_rate + '%'}</div>`
         : '—';
       const shadowRowBadge = isShadowRow
         ? ` <span style="font-size:9px;font-weight:700;color:#58a6ff;background:rgba(88,166,255,0.10);border:1px solid rgba(88,166,255,0.3);border-radius:3px;padding:1px 4px;vertical-align:middle;" title="Hypothetical — $0 real stake, excluded from headline stats">SHADOW</span>`
@@ -9298,7 +9461,7 @@ function renderPerformance(d) {
       const tu     = t.total_units != null ? t.total_units : null;
       const tuCls  = tu == null ? '' : tu > 0 ? 'pnl-pos' : tu < 0 ? 'pnl-neg' : '';
       const unitsCell = tu != null
-        ? `<span class="${tuCls}" title="${hypPre}Total flat units — net profit if you'd staked $1 on every bet.">${sign(tu)}${tu.toFixed(2)}u</span>`
+        ? `<span class="${tuCls}" title="${hypPre}Total flat units — net profit if you'd staked $1 on every bet.">${sign(tu)}${tu.toFixed(2)}u</span>${sigSub(t.unit_conf, t.unit_tstat, t.sample_size, t.unit_ci95, 'u')}`
         : '—';
       return `<tr style="${isShadowRow ? 'opacity:0.8;' : ''}">
         <td>${labelCell}</td>
@@ -9307,6 +9470,7 @@ function renderPerformance(d) {
         <td class="num">${wrCell}</td>
         <td class="num">${expCell}</td>
         <td class="num">${clvCell}</td>
+        <td class="num">${calCell}</td>
         <td class="num">${kellyCell}</td>
         <td class="num">${unitsCell}</td>
       </tr>`;
@@ -9330,9 +9494,69 @@ function renderPerformance(d) {
           <th class="num">Win Rate</th>
           <th class="num" title="Average Kalshi-implied win probability for this market type — the price you paid, i.e. the break-even win rate. Win Rate ABOVE this = beating the market price you paid (what drives flat units); below = losing to the price.">Expected</th>
           <th class="num" title="Average closing-line value for this market type: how far Kalshi's quote MIDPOINT moved from our entry to the last tight quote before game start, in cents (side-aware). Positive = the market moved toward us after we bet. Mid-to-mid so a widening closing spread doesn't count as movement (restated 2026-11-01; hover a value for the old ask-vs-ask figure). Kalshi vs Kalshi, not the Pinnacle comparison.">Avg CLV</th>
+          <th class="num" title="Calibration: realized win rate minus the win probability the model claimed at entry. Negative = overconfident. Colored only when the gap is statistically distinguishable from zero (game-clustered |t| at least 2, 20+ bets). This is the check that exposed Total Bases, whose CLV looked fine.">Calib</th>
           <th class="num" title="Actual dollar P&amp;L per market on the stakes really placed (paper account). Shadow markets stake $0 and show a dash.">P&amp;L ($)</th>
           <th class="num" title="Total flat units — net profit per market type if you'd staked $1 on every bet. Bet-size-agnostic pick quality.">Total Units</th>
         </tr></thead>`;
+    // Exact-line vs off-line NBA props. Off-line = priced by the count model off Pinnacle's
+    // posted line (fair_band.rungs > 0). Differences are cluster-bootstrapped over games.
+    const nbaCompareHtml = (nc) => {
+      if (!nc || !nc.exact || !nc.offline || !nc.exact.n || !nc.offline.n) return '';
+      const E = nc.exact, O = nc.offline;
+      const sg = (v, dp = 2, u = '') => v == null ? '—' : (v > 0 ? '+' : '') + v.toFixed(dp) + u;
+      const cls = v => v == null ? '' : v > 0 ? 'pnl-pos' : v < 0 ? 'pnl-neg' : '';
+      const diffCell = (df, dp, u, scale = 1) => {
+        if (!df) return '<span style="color:var(--muted);">—</span>';
+        const lo = df.ci95[0] * scale, hi = df.ci95[1] * scale, v = df.diff * scale;
+        const excl0 = (lo > 0 && hi > 0) || (lo < 0 && hi < 0);
+        return `<span class="${excl0 ? cls(v) : ''}" title="Off-line minus exact. Cluster bootstrap over games: ${df.p_better}% of resamples had off-line ahead. Colored only when the 95% interval excludes zero.">${sg(v, dp, u)}</span><div style="font-size:9px;color:var(--muted);white-space:nowrap;">[${sg(lo, dp, u)}, ${sg(hi, dp, u)}] · ${df.p_better}% off-line ahead</div>`;
+      };
+      const sub = (conf, tstat, n) => {
+        if (conf == null) return '';
+        if (n < 20) return `<div style="font-size:9px;color:var(--muted);">too early (n=${n})</div>`;
+        const w = conf >= 97.5 ? 'very likely real' : conf >= 95 ? 'likely real' : conf >= 84 ? 'leaning +' : conf <= 5 ? 'likely negative' : 'unproven';
+        return `<div style="font-size:9px;color:${conf >= 95 ? 'var(--green)' : conf <= 5 ? 'var(--red)' : 'var(--muted)'};" title="Game-clustered t=${tstat}">${w}</div>`;
+      };
+      const tr = (label, e, o, d, tip) => `<tr><td style="color:var(--muted);" ${tip ? `title="${tip}"` : ''}>${label}</td><td class="num">${e}</td><td class="num">${o}</td><td class="num">${d}</td></tr>`;
+      const calTxt = g => g.calib_gap_pp == null ? '—' : `<span class="${Math.abs(g.calib_tstat || 0) >= 2 && g.calib_n >= 20 ? cls(g.calib_gap_pp) : ''}">${sg(g.calib_gap_pp, 1, 'pp')}</span><div style="font-size:9px;color:var(--muted);">claimed ${g.claimed_win_rate}%</div>`;
+      const ssRow = (lab, key) => {
+        const e = nc.spread_split.exact[key], o = nc.spread_split.offline[key];
+        const cell = g => !g || !g.n ? '<td class="num" colspan="3" style="color:var(--muted);">—</td>'
+          : `<td class="num">${g.n}</td><td class="num"><span class="${cls(g.avg_clv)}">${sg(g.avg_clv, 2, 'c')}</span>${sub(g.clv_conf, g.clv_tstat, g.clv_n)}</td><td class="num"><span class="${cls(g.total_units)}">${sg(g.total_units, 1, 'u')}</span><div style="font-size:9px;color:var(--muted);">${sg(g.avg_units, 2)}/bet</div></td>`;
+        return `<tr><td style="color:var(--muted);">${lab}</td>${cell(e)}<td style="border-left:2px solid #58a6ff33;"></td>${cell(o)}</tr>`;
+      };
+      const td = nc.tight_diff || {};
+      return `
+      <details open style="margin:0 0 14px;">
+        <summary style="cursor:pointer;font-size:12px;color:var(--muted);user-select:none;font-weight:600;">
+          Exact line vs Off-line <span style="font-weight:400;">— does pricing off Pinnacle's posted line add or cost edge? (game-clustered; all NBA props, shadow + live)</span>
+        </summary>
+        <table style="margin-top:6px;font-size:11px;width:100%;">
+          <thead><tr><th></th><th class="num">Exact line</th><th class="num" style="border-left:2px solid #58a6ff33;color:#58a6ff;">Off-line</th><th class="num">Off-line − Exact</th></tr></thead>
+          <tbody>
+            ${tr('Bets (games)', `${E.n} (${E.n_games})`, `${O.n} (${O.n_games})`, '')}
+            ${tr('Win rate', `${E.win_rate}%<div style="font-size:9px;color:var(--muted);">paid ${E.kalshi_implied}%</div>`, `${O.win_rate}%<div style="font-size:9px;color:var(--muted);">paid ${O.kalshi_implied}%</div>`, diffCell(nc.diff.win, 1, 'pp', 100), 'Realized win rate; the small line is the break-even rate implied by the prices paid.')}
+            ${tr('Calibration gap', calTxt(E), calTxt(O), '', 'Realized win rate minus the win probability the model claimed at entry. Negative = overconfident.')}
+            ${tr('Avg CLV', `<span class="${cls(E.avg_clv)}">${sg(E.avg_clv, 2, 'c')}</span>${sub(E.clv_conf, E.clv_tstat, E.clv_n)}`, `<span class="${cls(O.avg_clv)}">${sg(O.avg_clv, 2, 'c')}</span>${sub(O.clv_conf, O.clv_tstat, O.clv_n)}`, diffCell(nc.diff.clv, 2, 'c'), 'Mid-to-mid Kalshi quote move, entry to last tight quote before game start.')}
+            ${tr('Total units', `<span class="${cls(E.total_units)}">${sg(E.total_units, 1, 'u')}</span>`, `<span class="${cls(O.total_units)}">${sg(O.total_units, 1, 'u')}</span>`, '')}
+            ${tr('Avg unit P&amp;L', `<span class="${cls(E.avg_units)}">${sg(E.avg_units, 3)}</span>${sub(E.unit_conf, E.unit_tstat, E.n)}`, `<span class="${cls(O.avg_units)}">${sg(O.avg_units, 3)}</span>${sub(O.unit_conf, O.unit_tstat, O.n)}`, diffCell(nc.diff.units, 3, ''))}
+            ${tr('Median entry spread', E.median_spread_c != null ? E.median_spread_c + 'c' : '—', O.median_spread_c != null ? O.median_spread_c + 'c' : '—', '', 'Cents between the price we paid and the side-adjusted quote midpoint at entry.')}
+          </tbody>
+        </table>
+        <div style="margin:10px 0 2px;font-size:11px;color:var(--muted);font-weight:600;">Same comparison split by entry spread (${nc.spread_cut_c}c cut) — is the off-line CLV only showing up where we pay a wide spread?</div>
+        <table style="font-size:11px;width:100%;">
+          <thead><tr><th></th><th class="num" colspan="3">Exact line (n · CLV · units)</th><th style="border-left:2px solid #58a6ff33;"></th><th class="num" colspan="3" style="color:#58a6ff;">Off-line (n · CLV · units)</th></tr></thead>
+          <tbody>
+            ${ssRow('Tight (≤ ' + nc.spread_cut_c + 'c)', 'tight')}
+            ${ssRow('Wide (> ' + nc.spread_cut_c + 'c)', 'wide')}
+          </tbody>
+        </table>
+        ${td.clv ? `<div style="margin-top:8px;font-size:11px;display:flex;gap:28px;flex-wrap:wrap;align-items:flex-start;"><div style="color:var(--muted);font-weight:600;">Tight spreads only,<br>off-line minus exact</div><div>CLV<br>${diffCell(td.clv, 2, 'c')}</div><div>Units per bet<br>${diffCell(td.units, 3, '')}</div></div>` : ''}
+        <p style="font-size:10px;color:var(--muted);margin:6px 0 0;line-height:1.3;">
+          Off-line = priced by the count model off Pinnacle's posted line. The exact/off-line split and the spread cut are post-hoc cuts of one small sample: trust the CLV rows before the units rows, and read nothing into a cell under ~20 bets. Units are noisy because off-line bets skew to lower probabilities.
+        </p>
+      </details>`;
+    };
     const NBA_ICON = `<img src="https://a.espncdn.com/i/teamlogos/leagues/500/nba.png" alt="NBA" onerror="this.replaceWith(document.createTextNode('🏀'))" style="width:20px;height:20px;object-fit:contain;vertical-align:middle;">`;
     const sectionTitle = (inner) => `<div style="display:flex;align-items:center;gap:8px;font-size:13px;font-weight:700;color:var(--text);margin:6px 0 6px;">${inner}</div>`;
     if (nbaTypes.length) {
@@ -9342,6 +9566,7 @@ function renderPerformance(d) {
         ${theadHtml}
         <tbody>${nbaTypes.map(rowHtml).join('')}</tbody>
       </table>`;
+      perfBodyHtml += nbaCompareHtml(d.nba_compare);
     }
     if (liveTypes.length || shadowTypes.length) {
       perfBodyHtml += sectionTitle('<span>Other Markets</span>');

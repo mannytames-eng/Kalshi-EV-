@@ -8821,7 +8821,7 @@ function renderTodayEdges() {
     return;
   }
 
-  // Build live lookup: ticker|side -> live edge object (≥3% only)
+  // Build live lookup: ticker|side -> live edge object (flagged edges only, ≥2%)
   const liveMap = {};
   for (const e of lastEdges) {
     liveMap[e.ticker + '|' + e.side] = e;
@@ -8829,7 +8829,7 @@ function renderTodayEdges() {
 
   const rows = [...todayEdgesList].reverse().map(b => {
     const key  = b.ticker + '|' + b.side;
-    const live = liveMap[key];           // present only if ≥3% in last scan
+    const live = liveMap[key];           // present only if flagged (≥2%) in last scan
     const snap = marketSnapshot[key];    // present for ANY market scanned this cycle
 
     // ── Resolve current edge from best available source ───────────────────
@@ -8849,30 +8849,32 @@ function renderTodayEdges() {
                      : snap != null ? snap.kalshi : null;
     const inSnapshot = snap != null || live != null;
 
-    // ── Cutoff price: max Kalshi price that preserves ≥3% edge ───────────
-    // curFair is already expressed from the perspective of the bet side:
-    //   YES bet → curFair = fair_yes     → max YES price = fair_yes - 0.03
-    //   NO  bet → curFair = 1-fair_yes   → max NO  price = (1-fair_yes) - 0.03
-    // Using the same formula (curFair - MIN_EDGE) is correct for both sides.
-    // Bug: the old code used (1 - curFair - MIN_EDGE) for NO, which substituted
-    // fair_yes back in — causing aboveCutoff to fire even on strong NO edges.
-    const MIN_EDGE = 0.03;
+    // ── Cutoff price: max Kalshi price (bet side) that still clears the flag threshold ──
+    // The scanner flags on adj = (fair - p - FEE*fair*(1-p)) * (1-HAIRCUT) >= THRESHOLD,
+    // where fair and p are both from the bet side's perspective (NO: fair=1-fair_yes,
+    // p = NO price). Solving adj = THRESHOLD for p gives the exact cutoff:
+    //   p = (fair*(1-FEE) - THRESHOLD/(1-HAIRCUT)) / (1 - FEE*fair)
+    // The old shortcut (fair - 0.03) ignored the fee and haircut AND used a 3% bar,
+    // so its "BET if ≤ X¢" didn't match the scanner's real bar (~1¢ off at typical fairs).
+    // Constants mirror kalshi_ev_scanner.py (KALSHI_FEE_RATE, EV_HAIRCUT, EDGE_THRESHOLD).
+    const FEE_RATE = 0.07, HAIRCUT = 0.05, FLAG_EDGE = 0.02;
     let cutoffLabel = null;
     let cutoffCents = null;
     if (curFair != null) {
-      const maxPrice = curFair - MIN_EDGE;
+      const maxPrice = (curFair * (1 - FEE_RATE) - FLAG_EDGE / (1 - HAIRCUT)) / (1 - FEE_RATE * curFair);
       if (maxPrice > 0 && maxPrice < 1) {
         cutoffCents = maxPrice;
         // Max price to pay, in cents — exactly what you type into Kalshi's
         // limit-order field. Avoids American-odds sign confusion (+112 vs +122).
-        cutoffLabel = `${b.side} ≤ ${Math.round(maxPrice * 100)}¢`;
+        // floor, not round: rounding up would quote a price that is just below the bar
+        cutoffLabel = `${b.side} ≤ ${Math.floor(maxPrice * 100 + 1e-9)}¢`;
       }
     }
     const liveKalshiSide = curKalshi != null
       ? (b.side === 'YES' ? curKalshi : curKalshi)   // snapshot already stores the bet-side price
       : null;
     const aboveCutoff = cutoffCents != null && liveKalshiSide != null
-      && liveKalshiSide > cutoffCents + 0.005;
+      && liveKalshiSide > cutoffCents + 0.0001;
 
     let recLabel, recColor, recTip;
     const drift    = live != null && live.drift_pct != null ? live.drift_pct : 0;
@@ -8905,12 +8907,12 @@ function renderTodayEdges() {
       recLabel = 'PASS';
       recColor = '#f85149';
       recTip   = aboveCutoff && cutoffLabel
-        ? `Kalshi price above cutoff for 3% edge (${cutoffLabel}). Current edge: ${curEdgePct != null ? curEdgePct.toFixed(1) : '—'}%. Line has moved — do not bet.`
+        ? `Kalshi price above cutoff for the 2% flag threshold (${cutoffLabel}). Current edge: ${curEdgePct != null ? curEdgePct.toFixed(1) : '—'}%. Line has moved — do not bet.`
         : `Edge gone — current edge ${curEdgePct != null ? curEdgePct.toFixed(1) : '—'}% (was +${b.edge_pct}% at flag). Kalshi corrected.`;
-    } else if (curEdgePct < 3.0) {
+    } else if (curEdgePct < FLAG_EDGE * 100) {
       recLabel = `WEAK +${curEdgePct.toFixed(1)}%`;
       recColor = '#e3a53a';
-      recTip   = `Edge compressed to +${curEdgePct.toFixed(1)}% — below the 3% threshold. Was +${b.edge_pct}% at flag. Not worth the fee risk.`;
+      recTip   = `Edge compressed to +${curEdgePct.toFixed(1)}% — below the 2% flag threshold. Was +${b.edge_pct}% at flag. Not worth the fee risk.`;
     } else if (driftBad) {
       recLabel = cutoffLabel ? `BET if ${cutoffLabel}` : `BET +${curEdgePct.toFixed(1)}%`;
       recColor = '#e3a53a';

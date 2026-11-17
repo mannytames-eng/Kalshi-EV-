@@ -7789,6 +7789,8 @@ HTML = """<!DOCTYPE html>
   </div>
 </div>
 
+<div id="nba-tonight" style="display:flex;flex-wrap:wrap;align-items:center;gap:6px 18px;padding:8px 14px;margin:0 0 12px;border:1px solid var(--border);border-left:3px solid #58a6ff;border-radius:6px;background:var(--surface);font-size:12px;"><span style="color:var(--muted);">🏀 NBA — loading…</span></div>
+
 <div id="credit-breakdown-card" class="card">
   <div class="card-header" onclick="toggleCard('credit-breakdown-body')" style="border-left:3px solid #58a6ff;">💳 Credit Spend by Component &nbsp;<span style="font-size:10px;color:var(--muted);font-weight:400;">real per-call cost, tagged at the source — last 30 days</span> <span class="card-toggle" id="credit-breakdown-body-toggle">▸</span></div>
   <div id="credit-breakdown-body" class="card-body collapsed"><div class="empty">No component spend recorded yet — added 2026-09-21, data accumulates from here.</div></div>
@@ -7859,7 +7861,21 @@ function _setHTML(id, html) {
   const el = document.getElementById(id);
   if (!el) return;
   if (el.innerHTML === html) return;
+  // Keep <details> sections the user opened/closed across re-renders: the page
+  // rebuilds these panels every few refresh cycles, which would otherwise snap every
+  // collapsible back to its default. Restored by position, and only when the number
+  // of <details> is unchanged (so a layout change falls back to the defaults).
+  const wasOpen = [...el.querySelectorAll('details')].map(d => d.open);
   el.innerHTML = html;
+  if (wasOpen.length) {
+    const now = el.querySelectorAll('details');
+    if (now.length === wasOpen.length) now.forEach((d, i) => { d.open = wasOpen[i]; });
+  }
+}
+
+// Small collapsed "how to read this" block for the long explanatory footnotes.
+function howTo(html) {
+  return `<details style="margin:2px 0 10px;"><summary style="cursor:pointer;font-size:10px;color:var(--muted);user-select:none;list-style:none;">ⓘ How to read this</summary><p style="font-size:10px;color:var(--muted);margin:4px 0 0;line-height:1.35;">${html}</p></details>`;
 }
 
 function toggleCard(bodyId) {
@@ -8491,6 +8507,59 @@ function renderAll() {
   document.title = count > 0 ? `(${count}) Kalshi EV Scanner` : 'Kalshi EV Scanner';
 }
 
+// ── NBA tonight strip ───────────────────────────────────────────────────────
+// Built entirely from data the page already has: the market snapshot (every NBA prop
+// market the last scan priced), the open-bets list, and the 30-day credit report.
+let _creditRpt = null;
+const NBA_PROP_SERIES = {KXNBAPTS: 'PTS', KXNBAREB: 'REB', KXNBAAST: 'AST', KXNBA3PT: '3PT', KXNBAPRA: 'PRA'};
+const NBA_EDGE_THRESHOLD_PCT = 2.0;   // mirrors EDGE_THRESHOLD in the scanner
+function renderNbaTonight() {
+  const el = document.getElementById('nba-tonight');
+  if (!el) return;
+  const MON = {JAN:1, FEB:2, MAR:3, APR:4, MAY:5, JUN:6, JUL:7, AUG:8, SEP:9, OCT:10, NOV:11, DEC:12};
+  const parts = new Intl.DateTimeFormat('en-US', {timeZone: 'America/New_York', year: 'numeric', month: '2-digit', day: '2-digit'}).formatToParts(new Date());
+  const pv = t => parts.find(x => x.type === t).value;
+  const todayNum = Number(pv('year') + pv('month') + pv('day'));
+  const events = {}, tickers = new Set(), bySeries = {};
+  let best = null, nOver = 0, lastTs = 0;
+  for (const [k, v] of Object.entries(marketSnapshot || {})) {
+    const tk = k.split('|')[0], tp = tk.split('-');
+    if (!NBA_PROP_SERIES[tp[0]]) continue;
+    const ev = tp[1] || '';
+    const dn = (2000 + Number(ev.slice(0, 2))) * 10000 + (MON[ev.slice(2, 5)] || 0) * 100 + Number(ev.slice(5, 7));
+    if (!(dn >= todayNum)) continue;          // drop games already played
+    events[ev] = dn;
+    if (!tickers.has(tk)) { tickers.add(tk); bySeries[tp[0]] = (bySeries[tp[0]] || 0) + 1; }
+    if (v.edge_pct != null) {
+      if (best == null || v.edge_pct > best) best = v.edge_pct;
+      if (v.edge_pct >= NBA_EDGE_THRESHOLD_PCT) nOver++;
+    }
+    if (v.ts && v.ts > lastTs) lastTs = v.ts;
+  }
+  const evKeys = Object.keys(events);
+  const gToday = evKeys.filter(e => events[e] === todayNum).length;
+  const gLater = evKeys.length - gToday;
+  const openN = (todayEdgesList || []).filter(b => (b.ticker || '').startsWith('KXNBA')).length;
+  const nbaCr = _creditRpt && _creditRpt.by_component ? _creditRpt.by_component['NBA Props'] : null;
+  const kfmt = n => n >= 1000 ? (n / 1000).toFixed(1) + 'k' : String(n);
+  const item = (label, val, title) => `<span title="${title || ''}"><span style="color:var(--muted);">${label}</span> <span style="font-weight:600;">${val}</span></span>`;
+  const bits = [`<span style="font-weight:700;">🏀 NBA</span>`];
+  if (tickers.size) {
+    const ageMin = lastTs ? Math.round((Date.now() / 1000 - lastTs) / 60) : null;
+    const ageCls = ageMin == null ? 'var(--muted)' : ageMin <= 45 ? 'var(--green)' : ageMin <= 120 ? 'var(--yellow)' : 'var(--red)';
+    bits.push(item('Games', `${gToday} today${gLater ? ' · ' + gLater + ' later' : ''}`, 'Distinct NBA games with a priced prop market in the last scan (ET date)'));
+    bits.push(item('Markets', `${tickers.size} <span style="font-weight:400;color:var(--muted);">(${Object.keys(NBA_PROP_SERIES).filter(sr => bySeries[sr]).map(sr => NBA_PROP_SERIES[sr] + ' ' + bySeries[sr]).join(' · ')})</span>`, 'Prop markets priced in the last scan, by stat'));
+    const bestCls = best == null ? '' : best >= NBA_EDGE_THRESHOLD_PCT ? 'var(--green)' : best >= NBA_EDGE_THRESHOLD_PCT - 1 ? 'var(--yellow)' : 'var(--muted)';
+    bits.push(item('Best edge', best == null ? '—' : `<span style="color:${bestCls};">${best >= 0 ? '+' : ''}${best.toFixed(1)}%</span> <span style="font-weight:400;color:var(--muted);">· ${nOver} at/above ${NBA_EDGE_THRESHOLD_PCT}%</span>`, 'Best adjusted edge among priced NBA markets (either side), and how many sit at or above the flag threshold'));
+    bits.push(item('Scanned', ageMin == null ? '—' : `<span style="color:${ageCls};">${ageMin}m ago</span>`, 'Age of the newest NBA prop pricing. NBA props rescan about every 30 minutes inside the 9am-10pm PT window.'));
+  } else {
+    bits.push(`<span style="color:var(--muted);">No NBA markets in the current snapshot — props scan runs ~9am–10pm PT on game days.</span>`);
+  }
+  bits.push(item('Open bets', openN, 'Open NBA prop bets (shadow, $0 stake)'));
+  if (nbaCr != null) bits.push(item('Credits 30d', kfmt(nbaCr), 'Odds API credits spent on NBA props over the last 30 days'));
+  el.innerHTML = bits.join('');
+}
+
 let autoRefreshTimer = null;
 
 // ── Status strip + temperature gauge ─────────────────────────────────────────
@@ -8674,6 +8743,7 @@ async function fetchData() {
     // ── Status strip + temperature gauge ─────────────────────────────────────
     updateStatusStrip(d);
     renderCreditBreakdown(d.credit_by_component);
+    _creditRpt = d.credit_by_component || null;
 
     // While scanning: show spinner only if we have no data yet
     if (d.scanning) {
@@ -8684,6 +8754,7 @@ async function fetchData() {
       lastEdges      = d.edges || [];
       marketSnapshot = d.market_snapshot || {};
       renderAll();
+      try { renderNbaTonight(); } catch(e) { console.error('renderNbaTonight threw', e); }
       try { renderTodayEdges(); } catch(e) { console.error('renderTodayEdges (poll) threw', e); }
 
       // History + perf + today edges: first load always, then every 3 cycles
@@ -8734,6 +8805,7 @@ async function fetchTodayEdges() {
     if (!r.ok) throw new Error(`today_edges HTTP ${r.status}`);
     todayEdgesList = await r.json();
   } catch(e) { console.error('today_edges fetch failed', e); }
+  try { renderNbaTonight(); } catch(e) { console.error('renderNbaTonight threw', e); }
   try {
     renderTodayEdges();
   } catch(e) { console.error('renderTodayEdges threw', e); }
@@ -9253,15 +9325,18 @@ function renderPerformance(d) {
       s[confKey] >= 95 ? 'pnl-pos' : s[confKey] < 70 ? 'pnl-neg' : '';
     // liveOnly rows (bank ROI) are blank for Shadowed AND Combined: shadow bets stake $0,
     // so a bank-% figure is only meaningful for real stakes (Combined mixes in the hypo).
+    // One-line collapsed summary: CLV + units for each ledger.
+    const _fmtS = (x, u, dp) => x == null ? '—' : (x > 0 ? '+' : '') + x + u;
+    const lvsSummary = `Live ${_fmtS(L && L.avg_clv, 'c', 2)} CLV · ${_fmtS(L && L.total_units, 'u', 1)} | Shadowed ${_fmtS(S && S.avg_clv, 'c', 2)} CLV · ${_fmtS(S && S.total_units, 'u', 1)}`;
     const row = (label, get, cls, liveOnly=false) => `<tr>
       <td style="color:var(--muted);">${label}</td>
       <td class="num ${cls?cls(L):''}">${L&&L.n?get(L):'—'}</td>
       <td class="num ${!liveOnly&&cls?cls(S):''}" style="border-left:2px solid #58a6ff33;">${!liveOnly&&S&&S.n?get(S):'—'}</td>
       <td class="num ${!liveOnly&&cls?cls(C):''}">${!liveOnly&&C&&C.n?get(C):'—'}</td></tr>`;
     perfBodyHtml += `
-      <details open style="margin-bottom:12px;">
+      <details style="margin-bottom:12px;">
         <summary style="cursor:pointer;font-size:12px;color:var(--muted);user-select:none;font-weight:600;">
-          Live vs Shadowed ledger <span style="font-weight:400;">— is the shadow band protecting or costing edge? (game-clustered)</span>
+          Live vs Shadowed ledger <span style="font-weight:400;">— ${lvsSummary}</span>
         </summary>
         <table style="margin-top:6px;font-size:11px;width:100%;">
           <thead><tr><th></th><th class="num">Live</th>
@@ -9283,9 +9358,7 @@ function renderPerformance(d) {
             ${row('Unit 95% CI', s=>ciTxt(s))}
           </tbody>
         </table>
-        <p style="font-size:10px;color:var(--muted);margin:4px 0 0;line-height:1.3;">
-          Shadowed = parallel HYPOTHETICAL ledger: $0 real stake, excluded from every headline stat, but sized/tracked exactly like live (¼-Kelly, 3% per-bet + 15%/day caps). Unit t-stat &amp; 95% CI are game-clustered on flat-unit P&amp;L; CLV t-stat &amp; 95% CI run the identical test on Avg CLV instead (same-game bets share an outcome either way, so both cluster on it). "Chance it's real" = the t-stat translated to plain terms — the probability the true value is positive, not luck (95%+ = strong, under 70% = still basically noise); it rises only as the sample grows. Median CLV sits next to the average so one outsized line move (e.g. a late injury scratch) doesn't get mistaken for the typical bet's experience. Note: even a statistically real CLV is supporting evidence, not proof of a tradeable edge on its own — Total Bases had significant positive CLV and still lost money. If Shadowed's units/CLV beat Live, the band is costing edge; if worse, it's protecting you.
-        </p>
+        ${howTo(`Shadowed = parallel HYPOTHETICAL ledger: $0 real stake, excluded from every headline stat, but sized/tracked exactly like live (¼-Kelly, 3% per-bet + 15%/day caps). Unit t-stat &amp; 95% CI are game-clustered on flat-unit P&amp;L; CLV t-stat &amp; 95% CI run the identical test on Avg CLV instead (same-game bets share an outcome either way, so both cluster on it). "Chance it's real" = the t-stat translated to plain terms — the probability the true value is positive, not luck (95%+ = strong, under 70% = still basically noise); it rises only as the sample grows. Median CLV sits next to the average so one outsized line move (e.g. a late injury scratch) doesn't get mistaken for the typical bet's experience. Note: even a statistically real CLV is supporting evidence, not proof of a tradeable edge on its own — Total Bases had significant positive CLV and still lost money. If Shadowed's units/CLV beat Live, the band is costing edge; if worse, it's protecting you.`)}
       </details>`;
   }
   function pill(label, value, cls, sub) {
@@ -9341,10 +9414,10 @@ function renderPerformance(d) {
     </tr>`;
   }).join('');
   const clvBreakdown = clvSrcRows ? `
-    <div style="margin:0 0 10px;border:1px solid var(--border);border-radius:6px;overflow:hidden;">
-      <div style="padding:6px 10px;background:#161b22;font-size:10px;font-weight:600;color:var(--muted);text-transform:uppercase;letter-spacing:.05em;border-bottom:1px solid var(--border);">
-        Value vs Pinnacle Close — by data source (distinct from true CLV)
-      </div>
+    <details style="margin:0 0 10px;border:1px solid var(--border);border-radius:6px;overflow:hidden;">
+      <summary style="cursor:pointer;padding:6px 10px;background:#161b22;font-size:10px;font-weight:600;color:var(--muted);text-transform:uppercase;letter-spacing:.05em;user-select:none;">
+        Diagnostic: Value vs Pinnacle Close — cross-market, NOT true CLV (click to expand)
+      </summary>
       <table style="width:100%;border-collapse:collapse;">
         <thead><tr>
           <th style="font-size:10px;color:var(--muted);text-transform:uppercase;padding:4px 10px;text-align:left;">Source</th>
@@ -9353,7 +9426,7 @@ function renderPerformance(d) {
         </tr></thead>
         <tbody>${clvSrcRows}</tbody>
       </table>
-    </div>` : '';
+    </details>` : '';
 
   // Edge health: color based on absolute value vs the 3% betting threshold,
   // not relative to all-time avg. Red = genuinely bad (below threshold or no data).
@@ -9393,12 +9466,10 @@ function renderPerformance(d) {
     </div>
     ${clvBreakdown}
     ${penaltyNote}
-    <p style="font-size:11px;color:var(--muted);padding-bottom:10px;">
-      Dollar P&amp;L is on the <strong>stakes actually placed</strong> (quarter-Kelly sizing, capped at 3% per bet) — the paper account's real result.
+    ${howTo(`Dollar P&amp;L is on the <strong>stakes actually placed</strong> (quarter-Kelly sizing, capped at 3% per bet) — the paper account's real result.
       CLV-penalised types run at 0.5× until their closing-line value stabilises.
-      Sizing barely moves returns here (same bets staked flat earn about the same); judge the edge by Flat Units and CLV.
-      ${d.corrupted_excluded ? `<br><span style="color:#8b949e;">⚠ ${d.corrupted_excluded} bets excluded from all stats (wrong Pinnacle reference — UTC/ET date collision, fixed May 2026). Shown as <strong>BAD REF</strong> in the history table.</span>` : ''}
-    </p>`;
+      Sizing barely moves returns here (same bets staked flat earn about the same); judge the edge by Flat Units and CLV.`)}
+    ${d.corrupted_excluded ? `<p style="font-size:11px;color:var(--muted);padding-bottom:10px;"><span style="color:#8b949e;">⚠ ${d.corrupted_excluded} bets excluded from all stats (wrong Pinnacle reference — UTC/ET date collision, fixed May 2026). Shown as <strong>BAD REF</strong> in the history table.</span></p>` : ''}`;
 
   // By-type breakdown table
   const PROP_LABELS = new Set(['Strikeouts (K)', 'Hits', 'Total Bases', 'RBIs', 'MLB Props', 'NBA Points', 'NBA Rebounds', 'NBA Assists', 'NBA Threes', 'NBA PRA', 'NBA Points (Off-Line)', 'NBA Rebounds (Off-Line)', 'NBA Assists (Off-Line)', 'NBA Threes (Off-Line)', 'NBA PRA (Off-Line)', 'NHL Saves', 'NHL Saves (Retail)', 'NFL Pass Yards', 'NFL Rush Yards', 'NFL Reception Yards', 'NFL Receptions', 'NFL Pass TDs', 'NFL Pass Yards (Retail)', 'NFL Rush Yards (Retail)', 'NFL Reception Yards (Retail)', 'NFL Receptions (Retail)', 'NFL Pass TDs (Retail)']);
@@ -9562,9 +9633,7 @@ function renderPerformance(d) {
           </tbody>
         </table>
         ${td.clv ? `<div style="margin-top:8px;font-size:11px;display:flex;gap:28px;flex-wrap:wrap;align-items:flex-start;"><div style="color:var(--muted);font-weight:600;">Tight spreads only,<br>off-line minus exact</div><div>CLV<br>${diffCell(td.clv, 2, 'c')}</div><div>Units per bet<br>${diffCell(td.units, 3, '')}</div></div>` : ''}
-        <p style="font-size:10px;color:var(--muted);margin:6px 0 0;line-height:1.3;">
-          Off-line = priced by the count model off Pinnacle's posted line. The exact/off-line split and the spread cut are post-hoc cuts of one small sample: trust the CLV rows before the units rows, and read nothing into a cell under ~20 bets. Units are noisy because off-line bets skew to lower probabilities.
-        </p>
+        ${howTo(`Off-line = priced by the count model off Pinnacle's posted line. The exact/off-line split and the spread cut are post-hoc cuts of one small sample: trust the CLV rows before the units rows, and read nothing into a cell under ~20 bets. Units are noisy because off-line bets skew to lower probabilities.`)}
       </details>`;
     };
     const NBA_ICON = `<img src="https://a.espncdn.com/i/teamlogos/leagues/500/nba.png" alt="NBA" onerror="this.replaceWith(document.createTextNode('🏀'))" style="width:20px;height:20px;object-fit:contain;vertical-align:middle;">`;
@@ -9578,8 +9647,18 @@ function renderPerformance(d) {
       </table>`;
       perfBodyHtml += nbaCompareHtml(d.nba_compare);
     }
+    // Other Markets starts collapsed (NBA is the priority); the summary carries the
+    // live-book totals so it's still readable without opening it.
     if (liveTypes.length || shadowTypes.length) {
-      perfBodyHtml += sectionTitle('<span>Other Markets</span>');
+      const _lb  = liveTypes.reduce((n, t) => n + t.won + t.lost, 0);
+      const _lp  = liveTypes.reduce((n, t) => n + (t.pnl_dollars || 0), 0);
+      const _lu  = liveTypes.reduce((n, t) => n + (t.total_units || 0), 0);
+      const _pS  = (v, dp, pre, suf) => (v >= 0 ? '+' : '-') + pre + Math.abs(v).toFixed(dp) + suf;
+      perfBodyHtml += `<details style="margin-bottom:12px;">
+        <summary style="cursor:pointer;user-select:none;display:flex;align-items:baseline;gap:8px;flex-wrap:wrap;font-size:13px;font-weight:700;color:var(--text);margin:6px 0;">
+          <span>Other Markets</span>
+          <span style="font-size:11px;font-weight:400;color:var(--muted);">${liveTypes.length} live · ${shadowTypes.length} shadow markets · ${_lb} settled live bets · <span class="${_lp >= 0 ? 'pnl-pos' : 'pnl-neg'}">${_pS(_lp, 2, '$', '')}</span> · <span class="${_lu >= 0 ? 'pnl-pos' : 'pnl-neg'}">${_pS(_lu, 1, '', 'u')}</span></span>
+        </summary>`;
     }
     if (liveTypes.length) {
       perfBodyHtml += `
@@ -9601,6 +9680,7 @@ function renderPerformance(d) {
         </table>
       </details>`;
     }
+    if (liveTypes.length || shadowTypes.length) perfBodyHtml += `</details>`;
   }
 
   // ── Alpha section ────────────────────────────────────────────────────────

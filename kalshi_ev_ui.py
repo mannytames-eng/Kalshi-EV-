@@ -5012,7 +5012,7 @@ def _get_performance(since: Optional[str] = None) -> dict:
         _p = _tk.split("-")
         return _p[1] if len(_p) > 1 else _tk
 
-    def _clustered_significance(paired):
+    def _clustered_significance(paired, boot=True):
         """paired: list of (value, cluster_key). Game-clustered t-stat +
         bootstrap 95% CI on the mean, same math as the unit-P&L block below,
         generalized so CLV can get the identical treatment (added 2026-09-13
@@ -5043,6 +5043,16 @@ def _get_performance(since: Optional[str] = None) -> dict:
                 tstat_conf = round(100 * 0.5 * (1 + _m.erf(_t / (2 ** 0.5))), 1)
         ci = None
         gk = list(clusters.keys())
+        if not boot:
+            # Cheap normal-approximation interval from the same clustered SE as the
+            # t-stat (no resampling). Used for the per-row table, which calls this
+            # ~100x per /api/performance request; 2000-resample bootstraps there
+            # cost several seconds of pure-Python CPU on the server.
+            if len(vals) > 1 and len(gk) > 1:
+                _ss = sum((sum(v - xbar for v in vs)) ** 2 for vs in clusters.values())
+                _se = (_ss ** 0.5) / len(vals)
+                ci = [round(xbar - 1.96 * _se, 3), round(xbar + 1.96 * _se, 3)]
+            return round(xbar, 3), tstat, tstat_conf, ci
         if len(gk) >= 2:
             _rand.seed(17)
             ms = []
@@ -5139,11 +5149,11 @@ def _get_performance(since: Optional[str] = None) -> dict:
 
     def _sig_fields(bs):
         _, ct, cc, cci = _clustered_significance(
-            [(_true_clv(b), _game_key(b)) for b in bs if _true_clv(b) is not None])
+            [(_true_clv(b), _game_key(b)) for b in bs if _true_clv(b) is not None], boot=False)
         _, ut, uc, uci = _clustered_significance(
-            [(_unit_of(b), _game_key(b)) for b in bs if _unit_of(b) is not None])
+            [(_unit_of(b), _game_key(b)) for b in bs if _unit_of(b) is not None], boot=False)
         cal = _calib_pairs(bs)
-        gap, gt, gc, gci = _clustered_significance(cal)
+        gap, gt, gc, gci = _clustered_significance(cal, boot=False)
         fairs = [b["fair"] for b in bs if b.get("fair") is not None]
         return {
             "n_games":          len({_game_key(b) for b in bs}),
@@ -5198,7 +5208,7 @@ def _get_performance(since: Optional[str] = None) -> dict:
         out.update(_sig_fields(bs))
         return out
 
-    def _group_diff(a_bets, b_bets, fn, B=2000):
+    def _group_diff(a_bets, b_bets, fn, B=1000):
         """off-line (b) minus exact (a) on fn(bet); cluster bootstrap over games.
         p_better = % of resamples where off-line beat exact."""
         ga, gb = {}, {}

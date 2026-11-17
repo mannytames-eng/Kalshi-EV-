@@ -7746,7 +7746,7 @@ HTML = """<!DOCTYPE html>
 <body>
 <header>
   <div class="header-left">
-    <h1>Kalshi EV &nbsp;<span>MLB</span></h1>
+    <h1>Kalshi EV &nbsp;<span>Scanner</span></h1>
     <div class="meta" id="last-scan">Loading…</div>
   </div>
   <div class="header-right">
@@ -7773,7 +7773,7 @@ HTML = """<!DOCTYPE html>
   </div>
   <div class="ss-item">
     <span class="ss-dot ss-muted" id="ss-games-dot"></span>
-    <span id="ss-games-txt">— games</span>
+    <span id="ss-games-txt">— MLB games</span>
   </div>
   <div class="ss-item" title="Odds API credits — month-to-date usage vs plan cap">
     <span class="ss-dot ss-muted" id="ss-credits-dot"></span>
@@ -7804,7 +7804,7 @@ HTML = """<!DOCTYPE html>
 
 
 <div id="paper-card" class="card">
-  <div class="card-header" onclick="toggleCard('paper-body')" style="border-left:3px solid #3fb950;">📊 PAPER PORTFOLIO (V2.0 - POST-THROTTLE) — Quarter-Kelly · Props 2.5%+ · Games 3%+ · $1,000 Starting Balance <span class="card-toggle" id="paper-body-toggle">▾</span></div>
+  <div class="card-header" onclick="toggleCard('paper-body')" style="border-left:3px solid #3fb950;">📊 PAPER PORTFOLIO (V2.0 - POST-THROTTLE) — Quarter-Kelly · Edges 2%+ · $1,000 Starting Balance <span class="card-toggle" id="paper-body-toggle">▾</span></div>
   <div id="paper-body" class="card-body"><div class="empty"><span class="spinner"></span>Loading portfolio…</div></div>
 </div>
 
@@ -8599,12 +8599,14 @@ function updateStatusStrip(d) {
   const gamesTxt = document.getElementById('ss-games-txt');
   const gc = d.odds_game_count;
   if (gc != null) {
-    gamesTxt.textContent = `${gc} games`;
+    gamesTxt.textContent = `${gc} MLB games`;
+    gamesTxt.title = 'Pinnacle MLB matchups in the cached odds index (0 is normal in the off-season)';
     if      (gc >= 15) { gamesDot.className = 'ss-dot ss-green'; }
     else if (gc >= 5)  { gamesDot.className = 'ss-dot ss-yellow'; }
+    else if (gc === 0) { gamesDot.className = 'ss-dot ss-muted'; }
     else               { gamesDot.className = 'ss-dot ss-red'; }
   } else {
-    gamesTxt.textContent = '— games';
+    gamesTxt.textContent = '— MLB games';
     gamesDot.className = 'ss-dot ss-muted';
   }
 
@@ -8629,10 +8631,10 @@ function updateStatusStrip(d) {
 
   // ── Temperature gauge ─────────────────────────────────────────────────────
   // Range: -10% (cold) to +5% (well above threshold)
-  // Threshold marker sits at 3% = (3-(-10))/(5-(-10)) = 13/15 = 86.7% from left
+  // Threshold marker sits at 2% = (2-(-10))/(5-(-10)) = 12/15 = 80% from left
   const GAUGE_MIN  = -10;   // pp — leftmost (coldest)
   const GAUGE_MAX  =   5;   // pp — rightmost (hottest)
-  const THRESHOLD  =   3;   // pp — where the green marker sits
+  const THRESHOLD  =   2;   // pp — where the green marker sits (matches EDGE_THRESHOLD, 2.0%)
   const GAUGE_SPAN = GAUGE_MAX - GAUGE_MIN;
 
   const fill  = document.getElementById('temp-fill');
@@ -9105,7 +9107,7 @@ function renderTop10() {
     .sort((a, b) => _edgeSortScore(b) - _edgeSortScore(a));
 
   if (!combined.length) {
-    _setHTML('top10-body', '<div class="empty">No edges ≥3% right now. Scanning every 2 min.</div>');
+    _setHTML('top10-body', '<div class="empty">No edges ≥2% right now. Scanning every 2 min.</div>');
     return;
   }
   const bankroll = getBankroll();
@@ -10028,7 +10030,7 @@ async function fetchPaper() {
       </div>
     </div>
     <div style="padding:6px 12px;border-bottom:1px solid var(--border);background:#0d1117;">
-      <span style="font-size:11px;color:var(--muted);">📊 V2.0 reset Jun 8 2026 ·<strong style="color:var(--text);">props ≥2.5% · games ≥3%</strong> · Quarter-Kelly (½ on strikeouts) · 3% max stake · CLV captured every 2 min until game start</span>
+      <span style="font-size:11px;color:var(--muted);">📊 V2.0 reset Jun 8 2026 ·<strong style="color:var(--text);">edges ≥2%</strong> · Quarter-Kelly (½ on strikeouts) · 3% max stake · CLV captured every 2 min until game start</span>
     </div>`;
 
     // ── Bet table ──────────────────────────────────────────────────────────
@@ -10112,7 +10114,7 @@ async function fetchPaper() {
           </summary>` + tableHead + `<tbody>${corruptBets.map(renderPaperRow).join('')}</tbody></table></details>`;
       }
     } else {
-      html += '<div class="empty" style="padding:16px;">No paper trades yet. Every edge ≥3% flagged from ' + d.start_date + ' is automatically sized and tracked here.</div>';
+      html += '<div class="empty" style="padding:16px;">No paper trades yet. Every edge ≥2% flagged from ' + d.start_date + ' is automatically sized and tracked here.</div>';
     }
     _setHTML('paper-body', html);
   } catch(e) { console.error('paper fetch failed', e); }

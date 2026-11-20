@@ -635,6 +635,9 @@ SHADOW_MARKETS: list[str] = [
                       # unlike TB. Treated as a fresh, unvalidated market anyway:
                       # shadow-first until it earns its own CLV/calibration
                       # record, same bar every other market here had to clear.
+                      # UPDATE 2026-11-20: OFF-LINE props graduated to LIVE (see
+                      # _nba_offline_live); exact-line props + all pre-2026-11-20
+                      # bets stay shadow.
                       # Covers KXNBAPTS/REB/AST/3PT/PRA (series verified against
                       # Kalshi's public /series list 2026-10-06). Game lines
                       # (KXNBAGAME/SPREAD/TOTAL) are NOT scanned -- the KXNBA
@@ -680,6 +683,40 @@ SHADOW_MARKETS: list[str] = [
 
 def _is_shadow(ticker: str) -> bool:
     return any(ticker.upper().startswith(s) for s in SHADOW_MARKETS)
+
+
+# ── NBA off-line props: LIVE from 2026-11-20 (user call) ─────────────────────
+# KXNBA stays in SHADOW_MARKETS (so every historical NBA bet, incl. the April game
+# lines, keeps its classification — settled bets are frozen). New NBA PROP bets
+# priced by the count model OFF Pinnacle's posted line (fair_band.rungs > 0) are
+# carved out of that prefix rule and fund like any other market (quarter-Kelly,
+# 3% cap). Exact-line NBA props (rungs == 0) stay shadow: 57 bets, calibration gap
+# -11.5pp (t=-2.0), CLV ~0 — no edge shown. Evidence for off-line at go-live
+# (n=135 settled shadow): CLV +2.42c (t=5.4), flat units +43.4 (t=2.2), calibration
+# gap +3.6pp (model NOT overconfident). Forward-only: bets stamped before this
+# instant stay shadow (their stored shadow=True also wins in every check below).
+NBA_OFFLINE_LIVE_FROM = "2026-11-20T00:00:00+00:00"
+_NBA_PROP_PREFIXES = ("KXNBAPTS", "KXNBAREB", "KXNBAAST", "KXNBA3PT", "KXNBAPRA")
+
+
+def _is_nba_offline(b: dict) -> bool:
+    """NBA prop priced by the count model off Pinnacle's posted line. Works on edge
+    dicts and stored bets (both carry fair_band)."""
+    if not (b.get("ticker") or "").upper().startswith(_NBA_PROP_PREFIXES):
+        return False
+    try:
+        return float((b.get("fair_band") or {}).get("rungs") or 0) > 0
+    except (TypeError, ValueError):
+        return False
+
+
+def _nba_offline_live(b: dict, new: bool = False) -> bool:
+    """True if this off-line NBA prop is funded rather than shadow. `new=True` for a
+    fresh edge being logged now; for stored bets, only those flagged at/after the
+    go-live instant (earlier ones were shadow by construction)."""
+    if not _is_nba_offline(b):
+        return False
+    return new or (b.get("flagged_at") or "") >= NBA_OFFLINE_LIVE_FROM
 
 
 def _wnba_hypo(b: dict) -> bool:
@@ -2124,7 +2161,8 @@ def _add_new_bets(edges: list) -> list:
         open_slots = {
             _open_slot(b) for b in _bets
             if b["status"] == "open"
-            and not b.get("shadow") and not _is_shadow(b.get("ticker", ""))
+            and not b.get("shadow")
+            and (not _is_shadow(b.get("ticker", "")) or _nba_offline_live(b))
         }
         # One moneyline bet per GAME, across scan cycles — and INCLUDING shadow
         # bets (open_slots deliberately excludes shadow, but MLB moneyline is
@@ -2142,7 +2180,7 @@ def _add_new_bets(edges: list) -> list:
         _slot_holders: dict = {}
         for _ob in _bets:
             if (_ob["status"] == "open" and not _ob.get("shadow")
-                    and not _is_shadow(_ob.get("ticker", ""))):
+                    and (not _is_shadow(_ob.get("ticker", "")) or _nba_offline_live(_ob))):
                 _slot_holders.setdefault(_open_slot(_ob), []).append(_ob)
         # Among NEW qualifying prop edges for the same player+game in this batch,
         # the funded one is the MOST PROBABLE (highest Kalshi price) — nearer a
@@ -2328,7 +2366,8 @@ def _add_new_bets(edges: list) -> list:
             # than Pinnacle-anchored edges (retail books mirror each other and
             # move on parlay/public demand, not pure probability) -- needs its
             # own settled record before it's trusted with anything beyond $0.
-            shadow      = (_is_shadow(e.get("ticker", "")) or e.get("sanity_shadow", False)
+            shadow      = ((_is_shadow(e.get("ticker", "")) and not _nba_offline_live(e, new=True))
+                           or e.get("sanity_shadow", False)
                            or _tb_high_edge or _tb_overconfident or _tb_shadow_all
                            or _outs_high_edge or _wnba_hypo(e)
                            or e.get("fair_source") == "retail_consensus")
@@ -4300,7 +4339,14 @@ def _calib_bucket(b: dict) -> str:
     coarse market type for anything without a series ticker."""
     ticker = b.get("ticker", "")
     if ticker:
-        return ticker.split("-")[0].upper()
+        series = ticker.split("-")[0].upper()
+        if series in _NBA_PROP_PREFIXES:
+            # Off-line (count model) and exact-line NBA props are different pricing
+            # methods with opposite calibration (+3.6pp vs -11.5pp at go-live). A
+            # shared per-series bucket would let the overconfident exact bets
+            # halve the off-line stakes (or hide behind them), so split them.
+            return series + ("|OFFLINE" if _is_nba_offline(b) else "|EXACT")
+        return series
     return _infer_mkt_type(b) or "other"
 
 
@@ -4448,7 +4494,10 @@ def _get_performance(since: Optional[str] = None) -> dict:
         _tk = b.get("ticker", "").upper()
         if _tk.startswith(("KXWNBAPTS", "KXWNBAREB", "KXWNBAAST")):
             return _wnba_hypo(b)   # WNBA props: dynamic — extrapolated=shadow, exact=funded
-        return b.get("shadow", False) or any(_tk.startswith(s) for s in SHADOW_MARKETS)
+        if b.get("shadow", False):
+            return True
+        return (any(_tk.startswith(s) for s in SHADOW_MARKETS)
+                and not _nba_offline_live(b))
 
     gl_bets    = [b for b in bets  if not _is_prop(b) and not _is_corrupted(b)]
     gl_won     = [b for b in won   if not _is_prop(b) and not _is_correlated(b) and not _is_corrupted(b)]
@@ -10554,7 +10603,8 @@ class Handler(BaseHTTPRequestHandler):
             # funded ($0 stake). (Capped bets still count in the pick-quality
             # Performance panel, which measures the edge regardless of funding.)
             live_paper  = [b for b in paper_bets
-                           if not _is_shadow(b.get("ticker", ""))
+                           if (not _is_shadow(b.get("ticker", ""))
+                               or (_nba_offline_live(b) and not b.get("shadow")))
                            and not b.get("daily_capped")
                            and not b.get("correlated", False)]   # excluded from stats & balance
             balance     = _compute_paper_balance()

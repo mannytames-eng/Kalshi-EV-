@@ -4847,12 +4847,18 @@ def _get_performance(since: Optional[str] = None) -> dict:
         # and Kelly P&L exactly like live rows — so their results/P&L/units show up
         # in the breakdown instead of a bare "$0 stake". Still excluded from the
         # headline aggregates (all_settled) — parallel hypothetical ledger only.
-        label = _perf_label(b) + (" (shadow)" if is_shad else "")
+        # Off-line NBA props: the shadow history and the live bets (live from
+        # 2026-11-20) share ONE row per stat, so the Market Type table doesn't carry a
+        # "(shadow)" twin of every off-line row. Dollar P&L still comes from live bets
+        # only; units/CLV/calibration pool both (same population nba_compare uses).
+        _merged = _is_nba_offline(b)
+        label = _perf_label(b) + (" (shadow)" if is_shad and not _merged else "")
         if label not in by_type:
             by_type[label] = {"won": 0, "lost": 0,
                                "units": [], "kelly": [], "clv": [], "clv_ask": [], "pin_drifts": [],
                                "kalshi_implied": [], "shadow": is_shad, "pnl_dollars": 0.0,
-                               "bets": []}
+                               "bets": [], "merged": _merged, "n_live": 0, "n_shadow": 0}
+        by_type[label]["n_shadow" if is_shad else "n_live"] += 1
         by_type[label]["bets"].append(b)
         # pin drift per bet = closing_pin_pct - pin_prob_at_flag (true CLV)
         _pin_at_flag  = b.get("pin_prob_at_flag")
@@ -4922,8 +4928,11 @@ def _get_performance(since: Optional[str] = None) -> dict:
             "total_units":       total_units_t,
             "insufficient_data": total_t < MIN_SAMPLE,
             "sample_size":       total_t,
-            "shadow":            d.get("shadow", False),
-            "pnl_dollars":       None if d.get("shadow") else round(d["pnl_dollars"], 2),
+            # A merged off-line row is a shadow row only until its first live bet.
+            "shadow":            (d["n_live"] == 0) if d.get("merged") else d.get("shadow", False),
+            "n_live":            d["n_live"],
+            "n_shadow":          d["n_shadow"],
+            "pnl_dollars":       None if ((d["n_live"] == 0) if d.get("merged") else d.get("shadow")) else round(d["pnl_dollars"], 2),
         })
     type_breakdown.sort(key=lambda x: -(x["won"] + x["lost"]))
     # Always list every NBA market in the Market Type section, even before it has a
@@ -9582,7 +9591,10 @@ function renderPerformance(d) {
       const terminatedBadge = TERMINATED_LABELS.has(t.label)
         ? ` <span style="font-size:9px;font-weight:700;color:#f85149;background:rgba(248,81,73,0.10);border:1px solid rgba(248,81,73,0.35);border-radius:3px;padding:1px 4px;vertical-align:middle;" title="Terminated 2026-07-23 — no longer scanned or bet. Settled record frozen for reference.">⛔ TERMINATED</span>`
         : '';
-      const labelCell = `<span style="font-weight:600;${TERMINATED_LABELS.has(t.label) ? 'opacity:0.65;' : ''}">${t.label}</span>${shadowRowBadge}${terminatedBadge}`;
+      const mixNote = (t.n_live > 0 && t.n_shadow > 0)
+        ? `<div style="font-size:9px;color:var(--muted);font-weight:400;" title="Record, CLV, calibration and units pool all ${t.n_live + t.n_shadow} settled bets. The ${t.n_shadow} earlier ones were shadow ($0 stake); only the ${t.n_live} live ones carry dollar P&amp;L.">${t.n_live} live &middot; ${t.n_shadow} shadow</div>`
+        : '';
+      const labelCell = `<div><span style="font-weight:600;${TERMINATED_LABELS.has(t.label) ? 'opacity:0.65;' : ''}">${t.label}</span>${shadowRowBadge}${terminatedBadge}</div>${mixNote}`;
       // Actual dollar P&L on the stakes really placed. Shadow rows stake $0, so they show
       // a dash (their hypothetical result is in Total Units).
       const hypPre = isShadowRow ? 'HYPOTHETICAL — ' : '';

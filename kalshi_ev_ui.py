@@ -9612,7 +9612,10 @@ function renderPerformance(d) {
       // a dash (their hypothetical result is in Total Units).
       const hypPre = isShadowRow ? 'HYPOTHETICAL — ' : '';
       const pnlD = t.pnl_dollars;
-      const kellyCell = isShadowRow
+      const isMixed = t.n_live > 0 && t.n_shadow > 0;   // merged off-line row: live bets + shadow history
+      const kellyCell = isMixed && t.kelly_dollars != null
+        ? `<span class="${t.kelly_dollars > 0 ? 'pnl-pos' : t.kelly_dollars < 0 ? 'pnl-neg' : ''}" title="AS IF EVERY BET HAD BEEN LIVE from day one: quarter-Kelly (3% cap) on a fixed $1,000 bankroll, summed over all ${t.n_live + t.n_shadow} settled bets (shadow history included). Hypothetical: nothing in the settled record or the real paper balance was changed.">${t.kelly_dollars >= 0 ? '+$' : '-$'}${Math.abs(t.kelly_dollars).toFixed(2)}</span><div style="font-size:9px;color:var(--muted);white-space:nowrap;" title="Dollar P&amp;L on the ${t.n_live} bet(s) actually staked since going live (paper account).">real ${pnlD != null ? (pnlD >= 0 ? '+$' : '-$') + Math.abs(pnlD).toFixed(2) : '—'} (${t.n_live})</div>`
+        : isShadowRow
         ? '<span style="color:var(--muted);" title="Shadow market: $0 real stake, so no dollar P&amp;L. See Total Units for the hypothetical result.">—</span>'
         : pnlD != null
           ? `<span class="${pnlD > 0 ? 'pnl-pos' : pnlD < 0 ? 'pnl-neg' : ''}" title="Actual dollar P&amp;L on the stakes really placed (paper account).">${pnlD >= 0 ? '+$' : '-$'}${Math.abs(pnlD).toFixed(2)}</span>`
@@ -9719,6 +9722,15 @@ function renderPerformance(d) {
     if (nbaTypes.length) {
       perfBodyHtml += `
       ${sectionTitle(`${NBA_ICON}<span>NBA Markets</span>`)}
+      ${(() => {
+        const mx = nbaTypes.filter(t => t.n_live > 0 && t.n_shadow > 0);
+        if (!mx.length) return '';
+        const hyp = mx.reduce((a, t) => a + (t.kelly_dollars || 0), 0);
+        const real = mx.reduce((a, t) => a + (t.pnl_dollars || 0), 0);
+        const nl = mx.reduce((a, t) => a + t.n_live, 0), ns = mx.reduce((a, t) => a + t.n_shadow, 0);
+        const f = v => (v >= 0 ? '+$' : '-$') + Math.abs(v).toFixed(2);
+        return `<div style="font-size:11px;color:var(--muted);margin:-2px 0 6px;" title="Off-line rows only. 'As if live' = quarter-Kelly (3% cap) on a fixed $1,000 bankroll over every settled off-line bet, shadow history included; it is a what-if and changes nothing in the real record. 'Real' = dollars actually staked since off-line went live (2026-11-20).">Off-line, as if always live: <span class="${hyp >= 0 ? 'pnl-pos' : 'pnl-neg'}" style="font-weight:700;">${f(hyp)}</span> over ${nl + ns} bets &middot; real so far: <span class="${real >= 0 ? 'pnl-pos' : 'pnl-neg'}">${f(real)}</span> over ${nl} live (small sample)</div>`;
+      })()}
       <table style="margin-bottom:14px;">
         ${theadHtml}
         <tbody>${nbaTypes.map(rowHtml).join('')}</tbody>

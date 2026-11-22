@@ -697,6 +697,13 @@ def _is_shadow(ticker: str) -> bool:
 # instant stay shadow (their stored shadow=True also wins in every check below).
 NBA_OFFLINE_LIVE_FROM = "2026-11-20T00:00:00+00:00"
 _NBA_PROP_PREFIXES = ("KXNBAPTS", "KXNBAREB", "KXNBAAST", "KXNBA3PT", "KXNBAPRA")
+# 2026-11-22 (user call): off-line NBA bets with raw edge >= this many pp are shadowed
+# ($0, still tracked), same rule/threshold as OUTS_HIGH_EDGE_THRESHOLD. Trigger: the
+# first live off-line bet (Zion Williamson 4+ REB NO, +11.3% adj, 3%-cap $38.59) lost.
+# Of 140 settled off-line bets, the 10 with raw >= 7pp won 4 vs ~5.3 expected (units
+# -1.0) while the other 130 made +42.2u: big model-vs-market gaps weren't paying more.
+# Small sample, precautionary like the Outs gate. Forward-only, applied at creation.
+NBA_OFFLINE_HIGH_EDGE_THRESHOLD = 7.0   # pp, on raw_edge_pct
 
 
 def _is_nba_offline(b: dict) -> bool:
@@ -2357,6 +2364,12 @@ def _add_new_bets(edges: list) -> list:
                 e.get("ticker", "").upper().startswith("KXMLBOUTS")
                 and round(e.get("raw_edge", 0) * 100, 1) >= OUTS_HIGH_EDGE_THRESHOLD
             )
+            # High raw-edge off-line NBA props (>=7pp) — shadowed 2026-11-22, see
+            # NBA_OFFLINE_HIGH_EDGE_THRESHOLD. Excluded from live stats like any shadow bet.
+            _nba_high_edge = (
+                _is_nba_offline(e)
+                and round(e.get("raw_edge", 0) * 100, 1) >= NBA_OFFLINE_HIGH_EDGE_THRESHOLD
+            )
             # WNBA: only EXTRAPOLATED props run hypothetical shadow; exact-match
             # props + game lines fund normally (2026-07-22).
             # Retail-consensus NFL props (fair_source="retail_consensus", added
@@ -2369,7 +2382,7 @@ def _add_new_bets(edges: list) -> list:
             shadow      = ((_is_shadow(e.get("ticker", "")) and not _nba_offline_live(e, new=True))
                            or e.get("sanity_shadow", False)
                            or _tb_high_edge or _tb_overconfident or _tb_shadow_all
-                           or _outs_high_edge or _wnba_hypo(e)
+                           or _outs_high_edge or _nba_high_edge or _wnba_hypo(e)
                            or e.get("fair_source") == "retail_consensus")
             _cal_mult = _stake_mults.get(_calib_bucket(e), 1.0)
             paper_stake = 0.0 if shadow else round(_paper_kelly_stake(

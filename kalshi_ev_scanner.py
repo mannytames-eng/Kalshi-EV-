@@ -3625,10 +3625,37 @@ def _find_player_in_title(title: str, prop_lookup: Dict[str, dict]) -> Optional[
     for key, pp in prop_lookup.items():
         last = re.sub(r"[^a-z]", "", _ascii_fold(pp["player"].split()[-1]).lower())
         if len(last) > 3 and last in title_norm:
+            if _first_name_contradicts(title, pp["player"]):
+                continue
             surname_hits.append(pp)
     if len(surname_hits) == 1:
         return surname_hits[0]
     return None
+
+
+def _first_name_contradicts(title: str, pin_player: str) -> bool:
+    """True when the Kalshi title spells out a FIRST name that is plainly a different
+    person from Pinnacle's player sharing the surname.
+
+    Found 2026-11-22: Pinnacle's rebounds list had only Ajay Mitchell (OKC); Kalshi's
+    "Davion Mitchell: 4+ rebounds" (MIA, same game, so the game/team guard passes)
+    fell through to the surname fallback, which saw exactly one Mitchell and borrowed
+    Ajay's 4.5 line for Davion (real line ~2.5): a fake +13.2% edge.
+
+    Accept (return False) on any compatible form: one first name is a prefix of the
+    other (Cam/Cameron, Nic/Nicolas), the title carries an initial ("J. Rodriguez"),
+    or either side lacks a full first name. Only a clearly different given name
+    (Davion vs Ajay) contradicts. Nickname-only mismatches (Moe vs Moritz) are now
+    refused rather than guessed, the safe direction: no bet instead of a wrong one."""
+    t_tokens = re.sub(r"[:(].*$", "", _ascii_fold(title)).split()
+    p_tokens = _ascii_fold(pin_player).split()
+    if len(t_tokens) < 2 or len(p_tokens) < 2:
+        return False
+    t_first = re.sub(r"[^a-z]", "", t_tokens[0].lower())
+    p_first = re.sub(r"[^a-z]", "", p_tokens[0].lower())
+    if len(t_first) < 3 or len(p_first) < 3:
+        return False                      # initial or 1-2 letter given name: can't contradict
+    return not (t_first.startswith(p_first) or p_first.startswith(t_first))
 
 
 def build_all_player_props(

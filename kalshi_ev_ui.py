@@ -8964,7 +8964,11 @@ function renderTodayEdges() {
     const entryFairPct = b.fair != null ? b.fair * 100 : b.pin_prob_at_flag;
     const curFairPct   = curFair != null ? curFair * 100 : null;
     const fairMoved    = (entryFairPct != null && curFairPct != null) ? (curFairPct - entryFairPct) : null;
-    const staleEntry   = fairMoved != null && Math.abs(fairMoved) > 10;
+    // Only a fair move AGAINST the bet marks the entry suspect (Marte). A move in
+    // the bet's favour (e.g. lineup news lifting the whole market, Ajay Mitchell
+    // 2026-11-22: fair 53->70) is good news, shown as a green tag, not a warning.
+    const staleEntry   = fairMoved != null && fairMoved < -10;
+    const fairUp       = fairMoved != null && fairMoved > 10;
 
     if (!inSnapshot) {
       // Not in scan at all — Pinnacle offline or market closed
@@ -8996,7 +9000,7 @@ function renderTodayEdges() {
         ? `Current edge +${curEdgePct.toFixed(1)}%. Kalshi price is live (~1 min old); fair is from the last scan — edge holds while ${cutoffLabel}.`
         : `Current edge +${curEdgePct.toFixed(1)}%. Always verify live price on Kalshi before placing.`;
     }
-    const recBadge = `<span style="font-weight:700;font-size:12px;color:${recColor};" title="${recTip}">${recLabel}</span>`;
+    const recBadge = `<span style="font-weight:700;font-size:12px;color:${recColor};" title="${recTip}">${recLabel}</span>${fairUp ? ` <span style="font-size:10px;font-weight:700;color:#3fb950;display:block;" title="Fair value moved in this bet's favour since flag (${entryFairPct.toFixed(0)}% to ${curFairPct.toFixed(0)}%): the market repriced toward your entry.">FAIR +${fairMoved.toFixed(0)}pp in favour</span>` : ''}`;
 
     const driftTxt = live != null && live.drift_pct != null && live.drift_pct !== 0
       ? `<span class="badge-drift">(${live.drift_pct > 0 ? '+' : ''}${live.drift_pct}%)</span>` : '';

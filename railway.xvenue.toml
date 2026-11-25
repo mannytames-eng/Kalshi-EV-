@@ -1,0 +1,28 @@
+# ── Railway config for the CROSS-VENUE LOGGER (xvenue_logger.py) ───────────────
+# A SEPARATE, read-only service.  It only calls public endpoints on Polymarket US and
+# Kalshi, needs NO API keys / secrets, uses NO Odds API credits, and cannot place
+# orders.  It never reads or writes the scanner's bets.
+#
+# ⚠ CRITICAL: when you create this service in the Railway dashboard, set
+#   Settings → Config → "Railway config file" to  railway.xvenue.toml
+#   Otherwise it inherits railway.toml and starts a SECOND scanner (double credit burn).
+#
+# Optional env vars (all have sane defaults):
+#   DATA_DIR=/data            logs go to /data/xvenue/*.jsonl  (own volume, below)
+#   XV_INTERVAL=60            full sweep cadence, seconds
+#   XV_HOT_SEC=5              re-quote cadence for near-profitable pairs / open gaps
+#   XV_DISCOVER_SEC=900       how often to re-map Polymarket<->Kalshi pairs
+#   XV_PM_RPS=10 XV_K_RPS=8   request budgets (Polymarket's limit is 25/s per IP)
+#
+# Read the results:  railway run --service <this-service> python3 xvenue_logger.py --report 7
+
+[build]
+builder = "nixpacks"
+
+[deploy]
+startCommand = "python3 xvenue_logger.py"
+restartPolicyType = "always"
+# No healthcheckPath — background worker, not a web service.
+
+[[volumes]]
+mountPath = "/data"

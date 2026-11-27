@@ -16,3 +16,6 @@ __pycache__/
 *.pyo
 .venv/
 venv/
+
+# Cross-venue logger output (xvenue_logger.py)
+xvenue/

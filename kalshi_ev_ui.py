@@ -5486,6 +5486,50 @@ _last_market_snapshot: dict = {}    # persists per-ticker|side across ALL sports
                                      # props cycle then reappeared the next). Merged with .update()
                                      # (not replaced) so one sport's/cycle's miss never erases
                                      # another entry's last-known-good comparison.
+def _record_nba_prop_pin_close(snap: dict) -> int:
+    """Pinnacle CLOSING line for NBA props, at zero extra Odds API cost.
+
+    Why: closing_pin_pct was never captured for props (_maybe_fetch_pre_close_pinnacle
+    skips NBA, and _lookup_pin_prob_for_bet only supports totals), so there was no sharp
+    reference to test whether Kalshi's own close is efficient. Every NBA props scan already
+    re-prices every Kalshi rung off Pinnacle's CURRENT line, so each scan's snapshot row IS
+    Pinnacle's view of this bet right now. Overwrite it on every scan until tip; the last
+    value before the game starts is the closing line. Nothing is written once the game has
+    started (in-play lines are not a close). Forward-only: older bets have no Pinnacle history.
+
+    Fields written on the bet (all side-aware, i.e. for the side we hold):
+      pin_fair_close          model fair P(bet wins) off Pinnacle's latest line (band point for off-line)
+      pin_line_close/pin_over_close   Pinnacle's own line + de-vigged P(over), at that scan
+      pin_close_ts / pin_close_min_to_start   when captured, and minutes before tip (how stale)
+    Does NOT touch closing_pin_pct / clv / clv_source -- the CLV definition is unchanged."""
+    if not snap:
+        return 0
+    now = datetime.now(timezone.utc)
+    n = 0
+    with _bets_lock:
+        for b in _bets:
+            if b.get("status") != "open" or b.get("clv_frozen"):
+                continue
+            tk = (b.get("ticker") or "")
+            if not tk.upper().startswith(_NBA_PROP_PREFIXES):
+                continue
+            row = snap.get(f"{tk}|{b.get('side', 'YES')}")
+            if not row or row.get("fair") is None:
+                continue
+            gs = _clv_mid_game_start(b)
+            if gs is None or now >= gs:
+                continue                      # unknown start or already underway: never record
+            b["pin_fair_close"]   = row["fair"]
+            b["pin_line_close"]   = row.get("pin_line")
+            b["pin_over_close"]   = row.get("pin_over")
+            b["pin_close_ts"]     = now.isoformat()
+            b["pin_close_min_to_start"] = round((gs - now).total_seconds() / 60, 1)
+            n += 1
+        if n:
+            _save_bets(_bets)
+    return n
+
+
 def _stamp_snapshot(snap: dict) -> dict:
     """Tag each snapshot row with the epoch second it was computed, so the
     tracker can show how old a row's fair value is (rows persist via .update()
@@ -6782,6 +6826,12 @@ def _run_scan():
             ("NCAAF Game Lines", _ncaaf_snapshot),
         ):
             _log_best_edges(_be_label, _be_snap)
+
+        # Pinnacle closing line for open NBA-prop bets (free: reuses this scan's snapshot).
+        try:
+            _record_nba_prop_pin_close(_fresh_nba_prop_snap)
+        except Exception as _pc_exc:
+            print(f"  NBA prop pin-close capture error: {_pc_exc}")
 
         # Log new bets and capture what was just added for the alert
         newly_logged = _add_new_bets(edges)

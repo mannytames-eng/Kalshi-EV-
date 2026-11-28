@@ -73,6 +73,7 @@ XV_WINDOW_PAST_H = float(os.environ.get("XV_WINDOW_PAST_H", "8"))   # include li
 XV_WINDOW_FUTURE_H = float(os.environ.get("XV_WINDOW_FUTURE_H", "30"))
 XV_KEEP_DAYS = int(os.environ.get("XV_KEEP_DAYS", "14"))
 XV_WORKERS = int(os.environ.get("XV_WORKERS", "6"))
+XV_DEPTH_SUSPECT = float(os.environ.get("XV_DEPTH_SUSPECT", "5000"))   # contracts: depth above this is flagged, not trusted
 XV_FAR_EVERY = int(os.environ.get("XV_FAR_EVERY", "4"))   # far-from-tip pairs: every Nth sweep
 XV_NEAR_H = float(os.environ.get("XV_NEAR_H", "4"))       # "near" = within this many hours of start
 XV_MAX_CONFIRMS = 12            # fresh re-quotes per sweep (call budget)
@@ -448,7 +449,8 @@ def discover():
             km = kby.get(int(mm.group(1))) if mm else None
             if km:
                 pairs.append({"kind": "btc", "pm": m["slug"], "k": km["ticker"], "ke": kev, "label": f"BTC>={mm.group(1)} {kev}",
-                              "start": e.get("startTime") or iso(), "fee": series_fee.get(ks, 1.0), "pmtype": "btc_strike", "game": e["slug"]})
+                              "start": e.get("startTime") or iso(), "fee": series_fee.get(ks, 1.0), "pmtype": "btc_strike", "game": e["slug"],
+                              "settle": end.astimezone(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")})
     by_kind = collections.Counter(p["kind"] for p in pairs)
     print(f"  [xv] discovered {len(pairs)} pairs {dict(by_kind)} in {now_ts()-t0:.0f}s; skipped {dict(skipped)}")
     return pairs, dict(skipped)
@@ -547,7 +549,7 @@ def _lvl(x):
         return None, None
 
 
-def walk_depth(leg_k, leg_p, k_mult):
+def walk_depth(leg_k, leg_p, k_mult, pm_fee=None):
     """Walk both books together.  leg_k / leg_p = [(price, qty), ...] sorted cheapest
     first (the ask you would pay on each venue).  Keep buying while the MARGINAL
     contract is still profitable after both fees.  Returns (contracts, total_profit_usd).
@@ -558,7 +560,7 @@ def walk_depth(leg_k, leg_p, k_mult):
     total_q = total_pnl = 0.0
     while i < len(leg_k) and j < len(leg_p):
         x, y = leg_k[i][0], leg_p[j][0]
-        net = 1 - x - y - k_fee(x, k_mult) - pm_fee_net(y)
+        net = 1 - x - y - k_fee(x, k_mult) - (pm_fee or pm_fee_net)(y)
         if net <= 0:
             break
         q = min(qk, qp)
@@ -605,6 +607,8 @@ def books_and_size(p, direction):
             leg_k = [(round(1 - px, 4), q) for px, q in k_yes_bids]      # Kalshi NO ask = 1 - YES bid
         qty, pnl = walk_depth(leg_k, leg_p, p["fee"])
         out["exec_contracts"], out["exec_profit_usd"] = qty, pnl
+        # same walk with Polymarket's FULL taker fee (no 70% rebate): the number to trust
+        out["exec_contracts_full"], out["exec_profit_full_usd"] = walk_depth(leg_k, leg_p, p["fee"], pm_fee_full)
     except Exception as ex:  # noqa: BLE001
         out["walk_err"] = str(ex)[:80]
     return out
@@ -644,6 +648,7 @@ class State:
         self.last_sig = {}      # (pair,dir) -> quote signature, so near-miss rows log only on change
         self.episodes = {}      # (pair,dir) -> open, CONFIRMED gap
         self.checked = {}       # (pair,dir) -> ts of last confirmation attempt (cooldown)
+        self.fail = {}          # (pair,dir) -> consecutive failed re-quotes of an open episode
         self.sweep_n = 0
 
     def set_pairs(self, pairs, skipped):
@@ -651,6 +656,18 @@ class State:
             p["id"] = p["pm"] + "|" + p["k"]
         self.pairs, self.skipped = pairs, skipped
         self.pmap = {p["id"]: p for p in pairs}
+        # Episodes whose pair vanished from the map (game over / market delisted) can never be
+        # re-quoted again.  Close them, or the hot loop raises KeyError on them every cycle.
+        for key in [k for k in self.episodes if k[0] not in self.pmap]:
+            self.close_episode(key, "pair_dropped")
+
+    def close_episode(self, key, reason, label=""):
+        ep = self.episodes.pop(key, None)
+        self.fail.pop(key, None)
+        if ep:
+            wlog("hits", {"ts": iso(), "kind": "episode_end", "pair": key[0], "label": label or key[0][:60], "dir": key[1],
+                          "t0": iso(ep["t0"]), "duration_s_lower_bound": round(ep["tlast"] - ep["t0"], 1), "obs": ep["n"],
+                          "max_net_rebate": ep["max"], "res_s": XV_HOT_SEC, "end_reason": reason})
 
 
 def confirm(st, p, direction, snap_ev, snap_q, summary):
@@ -668,13 +685,20 @@ def confirm(st, p, direction, snap_ev, snap_q, summary):
            "snapshot": {**snap_ev, "q": {k: snap_q[k] for k in QK}, "age_s": round(t1 - min(snap_q["tk"], snap_q["tp"]), 1),
                         "venue_skew_s": round(abs(snap_q["tk"] - snap_q["tp"]), 1)},
            "confirmed": ok, "confirm_latency_s": round(now_ts() - t1, 2)}
+    if p.get("settle"):
+        sd = parse_ts(p["settle"])
+        if sd:
+            row["min_to_settle"] = round((sd - dt.datetime.now(dt.timezone.utc)).total_seconds() / 60, 1)
     if fev:
         row["fresh"] = {**fev, "q": {k: fq[k] for k in QK}, "venue_skew_s": round(abs(fq["tk"] - fq["tp"]), 2),
                         "pm_state": fq.get("pm_state"), "k_status": fq.get("k_status")}
     if ok:
         row["books"] = books_and_size(p, direction)
         row["exec_contracts"] = row["books"].get("exec_contracts")
+        row["exec_contracts_full"] = row["books"].get("exec_contracts_full")
         row["exec_profit_usd"] = row["books"].get("exec_profit_usd")
+        row["exec_profit_full_usd"] = row["books"].get("exec_profit_full_usd")
+        row["depth_suspect"] = (row["exec_contracts_full"] or row["exec_contracts"] or 0) > XV_DEPTH_SUSPECT
         st.episodes[(p["id"], direction)] = {"t0": fq["tk"], "tlast": fq["tk"], "max": fev["net_rebate"], "n": 1}
         summary["confirmed"] += 1
     wlog("hits", row)
@@ -714,15 +738,27 @@ def hot_tick(st, pids):
     """Fresh re-quote of the pairs closest to profitable + every open episode, so a gap's
     life (open -> close) is measured at ~XV_HOT_SEC resolution."""
     for pid in pids:
-        p = st.pmap[pid]
+        p = st.pmap.get(pid)
+        if p is None:                       # pair dropped by a re-discovery: close its episodes, never KeyError
+            for d in ("K_YES+PM_NO", "PM_YES+K_NO"):
+                st.close_episode((pid, d), "pair_dropped")
+            continue
         try:
             fq = fresh_requote(p)
         except Exception:  # noqa: BLE001
+            for d in ("K_YES+PM_NO", "PM_YES+K_NO"):    # a market that keeps failing (closed/settled) must not pin an episode open
+                k2 = (pid, d)
+                if k2 in st.episodes:
+                    st.fail[k2] = st.fail.get(k2, 0) + 1
+                    if st.fail[k2] >= 6:
+                        st.close_episode(k2, "requote_failing", p["label"])
             continue
         evs = {e["dir"]: e for e in evaluate(fq, p["fee"])}
         for d in ("K_YES+PM_NO", "PM_YES+K_NO"):
             key, ev = (pid, d), evs.get(d)
             ep = st.episodes.get(key)
+            if ep:
+                st.fail.pop(key, None)
             if ev and ev["net_rebate"] > 0:
                 if ep:
                     ep["tlast"], ep["max"], ep["n"] = fq["tk"], max(ep["max"], ev["net_rebate"]), ep["n"] + 1
@@ -730,15 +766,14 @@ def hot_tick(st, pids):
                     st.checked[key] = now_ts()
                     confirm(st, p, d, ev, fq, {"confirmed": 0})
             elif ep:
-                st.episodes.pop(key)
-                wlog("hits", {"ts": iso(), "kind": "episode_end", "pair": pid, "label": p["label"], "dir": d, "t0": iso(ep["t0"]),
-                              "duration_s_lower_bound": round(ep["tlast"] - ep["t0"], 1), "obs": ep["n"],
-                              "max_net_rebate": ep["max"], "res_s": XV_HOT_SEC})
+                st.close_episode(key, "gap_closed", p["label"])
 
 
 def hot_ids(st, quotes):
     scored = []
     for pid, q in quotes.items():
+        if pid not in st.pmap:
+            continue
         evs = evaluate(q, st.pmap[pid]["fee"])
         if evs:
             scored.append((max(e["net_rebate"] for e in evs), pid))
@@ -842,9 +877,29 @@ def report(days=7):
         for r in sorted(conf, key=lambda r: -r["fresh"]["net_rebate"])[:10]:
             print(f"  {r['ts'][:19]} {r['pkind']:6} {r['label'][:44]:44} {r['dir']} net {r['fresh']['net_rebate']:+.4f} "
                   f"(full-fee {r['fresh']['net_full']:+.4f}) size {r.get('exec_contracts')} ${r.get('exec_profit_usd')}")
-    money = [r for r in conf if (r.get("exec_profit_usd") or 0) >= 1.0]
-    print(f"confirmed AND >= $1 executable (depth-walked, after fees): {len(money)} | total executable profit seen: "
-          f"${sum((r.get('exec_profit_usd') or 0) for r in conf):,.2f}")
+    # Trust the FULL-fee walk (no Polymarket rebate); fall back to the rebate figure for old records.
+    def _full(r):
+        v = r.get("exec_profit_full_usd")
+        return v if v is not None else (r.get("exec_profit_usd") or 0)
+    sus = [r for r in conf if r.get("depth_suspect") or (r.get("exec_contracts") or 0) > XV_DEPTH_SUSPECT]
+    ok_ = [r for r in conf if r not in sus]
+    money = [r for r in ok_ if _full(r) >= 1.0]
+    print(f"confirmed AND >= $1 executable at FULL fee, depth <= {XV_DEPTH_SUSPECT:,.0f} contracts: {len(money)} "
+          f"(${sum(_full(r) for r in money):,.2f}) | flagged suspicious depth (>{XV_DEPTH_SUSPECT:,.0f}): {len(sus)} "
+          f"(${sum(_full(r) for r in sus):,.2f} -- do NOT count)")
+    print(f"(old rebate-basis figure for reference: {sum(1 for r in conf if (r.get('exec_profit_usd') or 0) >= 1.0)} hits, "
+          f"${sum((r.get('exec_profit_usd') or 0) for r in conf):,.2f})")
+    bt = [r for r in money if r["pkind"] == "btc" and r.get("min_to_settle") is not None]
+    if bt:
+        m = sorted(r["min_to_settle"] for r in bt)
+        print(f"BTC money-hits minutes-to-settlement: n={len(m)} min {m[0]:.0f} median {m[len(m)//2]:.0f} max {m[-1]:.0f} "
+              f"| within 15 min of settle: {sum(1 for x in m if 0 <= x <= 15)}")
+    if any(r.get("exec_profit_full_usd") is None for r in conf):
+        print(f"  (note: {sum(1 for r in conf if r.get('exec_profit_full_usd') is None)} older records predate the full-fee walk; "
+              f"for those the figure above is the rebate basis)")
+    reasons = collections.Counter(r.get("end_reason", "legacy") for r in ends)
+    if ends:
+        print("episode end reasons:", dict(reasons))
     by = collections.Counter(r["pkind"] for r in conf)
     print("confirmed by kind:", dict(by) or "none")
     print(f"near-miss rows (within 1c of break-even): {len(near)}")

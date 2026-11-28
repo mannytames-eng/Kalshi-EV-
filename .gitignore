@@ -19,3 +19,4 @@ venv/
 
 # Cross-venue logger output (xvenue_logger.py)
 xvenue/
+.pin_backfill_cache/

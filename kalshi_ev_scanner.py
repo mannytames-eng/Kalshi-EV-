@@ -4319,13 +4319,19 @@ def scan_player_props(
         # even after the edge has closed.
         _snap_ticker = kp.get("ticker", "")
         if _snap_ticker:
+            # pin_line / pin_over: Pinnacle's posted line and de-vigged P(over) at THIS scan.
+            # The UI records them on open NBA-prop bets so the last pre-tip scan becomes the
+            # bet's Pinnacle closing line (see _record_nba_prop_pin_close). Extra keys only.
+            _pin_over = matched.get("over_prob")
+            _pin_extra = {"pin_line": pin_line,
+                          "pin_over": round(_pin_over, 4) if isinstance(_pin_over, (int, float)) else None}
             prop_snapshot[f"{_snap_ticker}|YES"] = {
                 "adj_edge": round(yes_adj, 4), "kalshi": round(yes_ask, 4),
-                "fair": round(fair_over, 4),   "edge_pct": round(yes_adj * 100, 1),
+                "fair": round(fair_over, 4),   "edge_pct": round(yes_adj * 100, 1), **_pin_extra,
             }
             prop_snapshot[f"{_snap_ticker}|NO"] = {
                 "adj_edge": round(no_adj, 4), "kalshi": round(1 - yes_bid, 4),
-                "fair": round(fair_under, 4), "edge_pct": round(no_adj * 100, 1),
+                "fair": round(fair_under, 4), "edge_pct": round(no_adj * 100, 1), **_pin_extra,
             }
 
         # TB NO-side experiment: let a slight UNDER edge through even below the
